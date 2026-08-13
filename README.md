@@ -137,12 +137,24 @@ an empty one**. Beyond that:
 telepager cannot run commands, read your files, or touch your machine. It only
 sends and receives Telegram messages.
 
+## How it runs
+
+Telegram only allows one poller per bot, so telepager doesn't put one in every
+client. The first client to start launches a **daemon** in the background, which
+owns the Telegram connection; every client after that is a thin shim that
+forwards tool calls to it over a loopback socket, authenticated with a token
+kept in a `0600` file. Messages are labelled with the project directory they
+came from, so you can tell which agent is talking.
+
+Run as many clients as you like. The daemon starts on demand — there's nothing
+to install as a service and nothing to babysit.
+
 ## Known limits
 
-- Two MCP clients running telepager at once will fight over the Telegram update
-  stream — Telegram allows one poller per bot. One client at a time for now.
 - `ask_question` can outlive your MCP client's own tool-call timeout. If your
   client gives up first, lower `ask_timeout_seconds` to match.
+- The daemon keeps running once started. `pkill -f "telepager daemon"` stops it;
+  the next client starts a fresh one.
 
 ## License
 
