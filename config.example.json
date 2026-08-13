@@ -1,0 +1,6 @@
+{
+  "bot_token": "PASTE_BOTFATHER_TOKEN_HERE",
+  "allowed_user_ids": [123456789],
+  "chat_id": null,
+  "ask_timeout_seconds": 300
+}
