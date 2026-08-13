@@ -16,6 +16,8 @@ const POLL_SECONDS: u64 = 25;
 pub struct Telegram {
     http: reqwest::Client,
     base: String,
+    //kept so errors can be scrubbed of it before they escape this module
+    token: String,
 }
 
 //the envelope every bot api response comes wrapped in
@@ -60,12 +62,33 @@ impl Telegram {
         Ok(Self {
             http,
             base: format!("https://api.telegram.org/bot{token}"),
+            token: token.to_string(),
         })
+    }
+
+    //the bot token sits in the url path, and reqwest prints the url in its
+    //error text. every error leaving this client goes through here first, or a
+    //single network blip would write the token into a log line and into the mcp
+    //tool result the model reads back.
+    fn scrub(&self, e: anyhow::Error) -> anyhow::Error {
+        let text = format!("{e:#}");
+        if !text.contains(&self.token) {
+            return e;
+        }
+        anyhow::anyhow!(text.replace(&self.token, "<redacted>"))
     }
 
     //post a json body to a bot api method and unwrap the envelope. the error
     //carries telegram's own description, which is usually the useful part.
     async fn call<T: for<'de> Deserialize<'de>>(&self, method: &str, body: Value) -> Result<T> {
+        self.call_inner(method, body).await.map_err(|e| self.scrub(e))
+    }
+
+    async fn call_inner<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        body: Value,
+    ) -> Result<T> {
         let resp = self
             .http
             .post(format!("{}/{method}", self.base))
@@ -245,6 +268,16 @@ mod tests {
         let text = format!("{}\n{}", "a".repeat(80), "b".repeat(80));
         let chunks = chunk_text(&text, 100);
         assert_eq!(chunks[0], format!("{}\n", "a".repeat(80)));
+    }
+
+    #[test]
+    fn errors_never_carry_the_token() {
+        let tg = Telegram::new("123456:SECRET-TOKEN").unwrap();
+        let leaky = anyhow::anyhow!("calling sendMessage")
+            .context("error sending request for url (https://api.telegram.org/bot123456:SECRET-TOKEN/sendMessage)");
+        let scrubbed = format!("{:#}", tg.scrub(leaky));
+        assert!(!scrubbed.contains("SECRET-TOKEN"));
+        assert!(scrubbed.contains("<redacted>"));
     }
 
     #[test]
