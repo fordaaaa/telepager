@@ -21,12 +21,15 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
+            # cross compiled from the arm runner, so it can't run its own tests
+            skip_tests: true
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross_linker: gcc-aarch64-linux-gnu
+            skip_tests: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             ext: .exe
@@ -56,7 +59,7 @@ jobs:
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
       - name: Test
-        if: matrix.cross_linker == ''
+        if: matrix.skip_tests != true
         run: cargo test --target ${{ matrix.target }}
 
       - name: Build
