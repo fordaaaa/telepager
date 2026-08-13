@@ -86,13 +86,19 @@ Your client starts and stops the server itself — there's no daemon to babysit.
 
 ## Install
 
-Build it:
+```bash
+npm install -g telepager
+```
+
+The postinstall step downloads the prebuilt binary for your platform (macOS
+arm64/x64, Linux arm64/x64, Windows x64) from GitHub Releases and checks it
+against the published sha256 before installing it.
+
+Or build it yourself:
 
 ```bash
 cargo build --release   # -> target/release/telepager
 ```
-
-Then put it somewhere on your PATH, or point your MCP client at the full path.
 
 ## Security
 
