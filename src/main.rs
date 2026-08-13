@@ -1,4 +1,5 @@
 mod config;
+mod daemon;
 mod ipc;
 mod mcp;
 mod telegram;
@@ -10,6 +11,10 @@ const USAGE: &str = "\
 telepager — page a telegram user from an mcp client
 
 usage: telepager [--config PATH]
+       telepager daemon [--config PATH]
+
+  daemon          run the background process that owns the telegram
+                  connection. started automatically when needed.
 
   --config PATH   config file to use, instead of the default lookup
                   (./telepager.config.json, then telepager/config.json
@@ -19,9 +24,8 @@ usage: telepager [--config PATH]
 ";
 
 fn main() -> ExitCode {
-    let config = match parse_args() {
-        Ok(Action::Run(c)) => c,
-        Ok(Action::Exit) => return ExitCode::SUCCESS,
+    let action = match parse_args() {
+        Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}");
             eprint!("\n{USAGE}");
@@ -29,11 +33,23 @@ fn main() -> ExitCode {
         }
     };
 
-    // stdout is the mcp transport so logs have to go to stderr
-    if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-    env_logger::init();
+    let config = match action {
+        Action::Run(c) => c,
+        Action::Daemon(c) => {
+            init_logging();
+            return match daemon::run(c) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    ipc::clear_endpoint();
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Action::Exit => return ExitCode::SUCCESS,
+    };
+
+    init_logging();
 
     match mcp::run(config) {
         Ok(()) => ExitCode::SUCCESS,
@@ -44,13 +60,23 @@ fn main() -> ExitCode {
     }
 }
 
+// stdout is the mcp transport so logs have to go to stderr
+fn init_logging() {
+    if std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+    let _ = env_logger::try_init();
+}
+
 enum Action {
     Run(Option<PathBuf>),
+    Daemon(Option<PathBuf>),
     Exit,
 }
 
 fn parse_args() -> Result<Action, String> {
     let mut config = None;
+    let mut daemon = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -63,6 +89,7 @@ fn parse_args() -> Result<Action, String> {
                 println!("telepager {}", env!("CARGO_PKG_VERSION"));
                 return Ok(Action::Exit);
             }
+            "daemon" => daemon = true,
             "--config" => {
                 let path = args.next().ok_or("--config needs a path")?;
                 config = Some(PathBuf::from(path));
@@ -71,5 +98,8 @@ fn parse_args() -> Result<Action, String> {
         }
     }
 
+    if daemon {
+        return Ok(Action::Daemon(config));
+    }
     Ok(Action::Run(config))
 }
