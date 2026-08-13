@@ -1,0 +1,16 @@
+#build out
+/target/
+/dist/
+
+#secrets
+telepager.config.json
+config.json
+.env
+.env.*
+
+#editor and os junk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
