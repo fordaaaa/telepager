@@ -13,8 +13,15 @@ use crate::telegram::Telegram;
 
 const MAX_OPTIONS: usize = 20;
 
-// a question waiting on a tap, keyed by the message the buttons are attached to
-type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<usize>>>>;
+// how a question got answered
+#[derive(Debug)]
+pub enum Answer {
+    Tapped(usize),
+    Typed(String),
+}
+
+// a question waiting on an answer, keyed by the message the buttons are on
+type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Answer>>>>;
 
 struct Daemon {
     cfg: Config,
@@ -78,6 +85,11 @@ async fn poll_updates(d: Arc<Daemon>) {
         for update in updates {
             offset = update.update_id + 1;
 
+            if let Some(msg) = update.message {
+                handle_message(&d, msg).await;
+                continue;
+            }
+
             let Some(query) = update.callback_query else {
                 continue;
             };
@@ -97,9 +109,37 @@ async fn poll_updates(d: Arc<Daemon>) {
             }
 
             if let Some(waiter) = d.pending.lock().await.remove(&msg_id) {
-                let _ = waiter.send(index);
+                let _ = waiter.send(Answer::Tapped(index));
             }
         }
+    }
+}
+
+// a typed reply answers a question: whichever one it replies to, or the only
+// one waiting if it replies to nothing
+async fn handle_message(d: &Arc<Daemon>, msg: crate::telegram::IncomingMessage) {
+    let Some(from) = msg.from else { return };
+    if !d.cfg.allowed_user_ids.contains(&from.id) {
+        log::warn!("ignoring a message from {}", from.id);
+        return;
+    }
+    let Some(text) = msg.text else { return };
+
+    let mut pending = d.pending.lock().await;
+    let target = match msg.reply_to_message {
+        Some(r) if pending.contains_key(&r.message_id) => Some(r.message_id),
+        Some(_) => None,
+        // no reply and exactly one question waiting is unambiguous enough
+        None if pending.len() == 1 => pending.keys().next().copied(),
+        None => None,
+    };
+
+    let Some(msg_id) = target else {
+        log::debug!("nothing to route a typed reply to");
+        return;
+    };
+    if let Some(waiter) = pending.remove(&msg_id) {
+        let _ = waiter.send(Answer::Typed(text));
     }
 }
 
@@ -185,7 +225,8 @@ async fn serve(d: Arc<Daemon>, stream: TcpStream, token: String) -> Result<()> {
 async fn ask(d: &Daemon, label: &str, question: &str, options: &[String]) -> Result<String> {
     let chat = d.cfg.chat_id;
     let text = decorate(label, question);
-    let msg_id = d.tg.send_with_buttons(chat, &text, options).await?;
+    let prompt = format!("{text}\n\n(or reply to this message with your own answer)");
+    let msg_id = d.tg.send_with_buttons(chat, &prompt, options).await?;
 
     let (tx, rx) = oneshot::channel();
     d.pending.lock().await.insert(msg_id, tx);
@@ -197,7 +238,7 @@ async fn ask(d: &Daemon, label: &str, question: &str, options: &[String]) -> Res
     d.pending.lock().await.remove(&msg_id);
 
     match picked {
-        Ok(Ok(index)) => {
+        Ok(Ok(Answer::Tapped(index))) => {
             let answer = options
                 .get(index)
                 .cloned()
@@ -207,6 +248,13 @@ async fn ask(d: &Daemon, label: &str, question: &str, options: &[String]) -> Res
                 log::debug!("could not clear the keyboard: {e:#}");
             }
             Ok(answer)
+        }
+        Ok(Ok(Answer::Typed(typed))) => {
+            let settled = format!("{text}\n\n✅ {typed}");
+            if let Err(e) = d.tg.edit_message(chat, msg_id, &settled).await {
+                log::debug!("could not clear the keyboard: {e:#}");
+            }
+            Ok(typed)
         }
         // the sender was dropped, which shouldn't happen but isn't fatal
         Ok(Err(_)) => Ok("no answer — the question was cancelled".into()),

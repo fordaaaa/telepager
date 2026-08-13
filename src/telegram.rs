@@ -28,6 +28,14 @@ pub struct SentMessage {
 pub struct Update {
     pub update_id: i64,
     pub callback_query: Option<CallbackQuery>,
+    pub message: Option<IncomingMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IncomingMessage {
+    pub from: Option<User>,
+    pub text: Option<String>,
+    pub reply_to_message: Option<SentMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,7 +178,7 @@ impl Telegram {
             json!({
                 "offset": offset,
                 "timeout": POLL_SECONDS,
-                "allowed_updates": ["callback_query"],
+                "allowed_updates": ["callback_query", "message"],
             }),
         )
         .await
