@@ -11,8 +11,8 @@ telepager — page a telegram user from an mcp client
 usage: telepager [--config PATH]
 
   --config PATH   config file to use, instead of the default lookup
-                  (./telepager.config.json, then
-                  ~/.config/telepager/config.json)
+                  (./telepager.config.json, then telepager/config.json
+                  in your user config dir)
   -h, --help      show this
   -V, --version   show the version
 ";

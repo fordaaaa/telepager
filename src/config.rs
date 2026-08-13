@@ -20,10 +20,26 @@ pub struct Config {
     pub ask_timeout_seconds: u64,
 }
 
-fn home_config() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/telepager/config.json")
+// %APPDATA%\telepager on windows, ~/Library/Application Support on mac,
+// $XDG_CONFIG_HOME or ~/.config on linux. ~/.config stays as a fallback
+// everywhere unix since that's what the readme has always said.
+fn config_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+
+    if let Some(dir) = dirs::config_dir() {
+        out.push(dir.join("telepager").join("config.json"));
+    }
+
+    if !cfg!(windows) {
+        if let Some(home) = dirs::home_dir() {
+            let p = home.join(".config").join("telepager").join("config.json");
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+
+    out
 }
 
 fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
@@ -36,8 +52,7 @@ fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
         return Some(cwd);
     }
 
-    let home = home_config();
-    home.exists().then_some(home)
+    config_candidates().into_iter().find(|p| p.exists())
 }
 
 pub fn load(explicit: Option<&Path>) -> Result<Config> {
@@ -58,9 +73,13 @@ pub fn load(explicit: Option<&Path>) -> Result<Config> {
         _ => raw.bot_token.clone().unwrap_or_default(),
     };
     if token.trim().is_empty() {
+        let where_to_put_it = config_candidates()
+            .first()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "telepager.config.json".into());
         bail!(
             "No bot token found. Set TELEGRAM_BOT_TOKEN or put bot_token in the \
-             config file (~/.config/telepager/config.json)."
+             config file ({where_to_put_it})."
         );
     }
 
@@ -122,6 +141,20 @@ mod tests {
     #[test]
     fn parse_ids_rejects_non_integer() {
         assert!(parse_allowed_ids("1,x,2").is_err());
+    }
+
+    #[test]
+    fn candidates_point_at_telepager() {
+        let c = config_candidates();
+        assert!(!c.is_empty());
+        assert!(c.iter().all(|p| p.ends_with("telepager/config.json")));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn dot_config_is_a_candidate_on_unix() {
+        let c = config_candidates();
+        assert!(c.iter().any(|p| p.to_string_lossy().contains(".config/telepager")));
     }
 
     #[test]

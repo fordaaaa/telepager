@@ -38,7 +38,14 @@ replies with your numeric ID.
 
 **3. Send your bot a message** so a chat exists — a bot can't open one with you.
 
-**4. Write the config** at `~/.config/telepager/config.json`:
+**4. Write the config.** Where it goes depends on the platform:
+
+| Platform | Path |
+| --- | --- |
+| Linux | `~/.config/telepager/config.json` (or `$XDG_CONFIG_HOME`) |
+| macOS | `~/Library/Application Support/telepager/config.json`, or `~/.config/telepager/config.json` |
+| Windows | `%APPDATA%\telepager\config.json` |
+
 
 ```json
 {
