@@ -90,9 +90,9 @@ impl Server {
         let chat = self.st.cfg.chat_id;
         let mut slot = self.st.thinking.lock().await;
 
-        //edit the live status line if there is one. an edit fails when the text
-        //hasn't changed or the message is gone, and neither is worth an error —
-        //fall through and start a new one.
+        //edit the live status line if there is one. re-sending the same text is
+        //not a failure (the client treats it as a no-op); a real failure means
+        //the message is gone, so fall through and start a new one.
         if let Some(id) = *slot {
             match self.st.tg.edit_message(chat, id, &text).await {
                 Ok(()) => return "updated".into(),

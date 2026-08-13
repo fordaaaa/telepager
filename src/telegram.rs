@@ -135,8 +135,14 @@ impl Telegram {
             "text": truncate(text, MAX_MESSAGE_LEN),
         });
         //the result is the edited message, which we don't need
-        let _: Value = self.call("editMessageText", body).await?;
-        Ok(())
+        match self.call::<Value>("editMessageText", body).await {
+            Ok(_) => Ok(()),
+            //telegram calls it an error to edit a message into the text it
+            //already has. the message reads the way we wanted either way, so
+            //this is a success as far as callers are concerned.
+            Err(e) if is_unmodified(&e) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     //send a message with numbered buttons under it. the callback data of each
@@ -196,6 +202,12 @@ impl Telegram {
         )
         .await
     }
+}
+
+//telegram's wording for "the edit would change nothing", matched loosely
+//because the description carries a longer suffix
+fn is_unmodified(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("message is not modified")
 }
 
 fn truncate(s: &str, limit: usize) -> String {
@@ -278,6 +290,15 @@ mod tests {
         let scrubbed = format!("{:#}", tg.scrub(leaky));
         assert!(!scrubbed.contains("SECRET-TOKEN"));
         assert!(scrubbed.contains("<redacted>"));
+    }
+
+    #[test]
+    fn unmodified_edits_are_recognised() {
+        let e = anyhow::anyhow!(
+            "telegram rejected editMessageText: Bad Request: message is not modified: ..."
+        );
+        assert!(is_unmodified(&e));
+        assert!(!is_unmodified(&anyhow::anyhow!("telegram rejected editMessageText: Bad Request: chat not found")));
     }
 
     #[test]
