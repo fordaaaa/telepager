@@ -1,18 +1,29 @@
+<div align="center">
+
 # telepager
 
-**A pager for your coding agent.** An MCP server that lets Claude Code (or any
-MCP client) reach you on Telegram: send you a message, keep a status line
-updated while it works, and — the useful one — ask you a question with buttons
-and *wait* for your answer.
+**A pager for your coding agent.**
 
-It speaks MCP over stdio and the Telegram Bot API over HTTPS. No webhook, no
-public URL, no port forwarding; it runs on your machine and dials out.
+Your agent can message you, keep you posted while it works, and — the useful one —
+ask you a question with buttons and *wait* for your answer.
+
+[![npm](https://img.shields.io/npm/v/telepager?color=cb3837&logo=npm)](https://www.npmjs.com/package/telepager)
+[![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
+[![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#install)
+
+</div>
+
+---
 
 ```
 Claude Code  ──stdio──▶  telepager  ──https──▶  Telegram  ──▶  your phone
                             ▲                                      │
                             └──────────── your button tap ─────────┘
 ```
+
+An MCP server that lets Claude Code (or any MCP client) reach you on Telegram.
+It speaks MCP over stdio and the Telegram Bot API over HTTPS. No webhook, no
+public URL, no port forwarding; it runs on your machine and dials out.
 
 ## Tools
 
@@ -22,16 +33,32 @@ Claude Code  ──stdio──▶  telepager  ──https──▶  Telegram  �
 | `send_thinking(text)` | Shows a `💭 …` status line, **edited in place** on each call instead of spamming the chat. |
 | `ask_question(question, options[])` | Sends the question with the options as numbered buttons, blocks until you tap one, and returns the option you picked. |
 
-`ask_question` is the point of the whole thing: the agent stops and waits for a
-real answer instead of guessing, so you can unblock a long task from your phone.
-When you tap, the message rewrites itself to `✅ 2. <your answer>` and the
-buttons disappear.
+`ask_question` is the point of the whole thing. The tool call doesn't return, so
+your agent is genuinely parked until you answer — it stops and waits instead of
+guessing, and you unblock a long task from your phone. When you tap, the message
+rewrites itself to `✅ 2. <your answer>` and the buttons disappear.
+
+## Install
+
+```bash
+npm install -g telepager
+```
+
+The postinstall step downloads the prebuilt binary for your platform (macOS
+arm64/x64, Linux arm64/x64, Windows x64) from GitHub Releases and verifies it
+against the published sha256 before installing.
+
+Or build it yourself:
+
+```bash
+cargo build --release   # -> target/release/telepager
+```
 
 ## Setup
 
 **1. Make a bot.** Message [@BotFather](https://t.me/BotFather), send `/newbot`,
-follow the prompts, and keep the token it gives you. (BotFather is only used
-this once — after that, telepager talks to `api.telegram.org` directly.)
+follow the prompts, and keep the token it gives you. BotFather is only used this
+once — after that, telepager talks to `api.telegram.org` directly.
 
 **2. Get your user ID.** Message [@userinfobot](https://t.me/userinfobot); it
 replies with your numeric ID.
@@ -45,7 +72,6 @@ replies with your numeric ID.
 | Linux | `~/.config/telepager/config.json` (or `$XDG_CONFIG_HOME`) |
 | macOS | `~/Library/Application Support/telepager/config.json`, or `~/.config/telepager/config.json` |
 | Windows | `%APPDATA%\telepager\config.json` |
-
 
 ```json
 {
@@ -64,13 +90,14 @@ replies with your numeric ID.
 Also looked for at `./telepager.config.json`; `--config PATH` overrides the
 lookup entirely.
 
-**5. Register it with your MCP client.** For Claude Code:
+**5. Register it with your MCP client.**
 
 ```bash
-claude mcp add telepager -- telepager
+claude mcp add --scope user telepager -- telepager
 ```
 
-Or by hand:
+<details>
+<summary>By hand, or for another client</summary>
 
 ```json
 {
@@ -82,37 +109,43 @@ Or by hand:
 }
 ```
 
-Your client starts and stops the server itself — there's no daemon to babysit.
+Cursor reads `~/.cursor/mcp.json`, Claude Code reads `~/.claude.json`. Your
+client starts and stops the server itself — there's no daemon to babysit.
 
-## Install
+</details>
 
-```bash
-npm install -g telepager
-```
+**6. Tell your agent to use it.** Nothing forces an agent to page you, so add a
+line to your `CLAUDE.md`:
 
-The postinstall step downloads the prebuilt binary for your platform (macOS
-arm64/x64, Linux arm64/x64, Windows x64) from GitHub Releases and checks it
-against the published sha256 before installing it.
-
-Or build it yourself:
-
-```bash
-cargo build --release   # -> target/release/telepager
-```
+> When you hit a decision you'd otherwise guess at during a long task, use
+> telepager's `ask_question` to ask me instead. Page me with `send_message`
+> when a long task finishes.
 
 ## Security
 
-The allowlist is the entire security model, so telepager **refuses to start
-with an empty one**. Beyond that:
+The allowlist is the entire security model, so telepager **refuses to start with
+an empty one**. Beyond that:
 
 - **The token is a secret.** Anyone holding it can act as your bot. Prefer
   `TELEGRAM_BOT_TOKEN` over the plaintext file; the config file is gitignored.
 - **Telegram is not end-to-end encrypted.** Its servers can see the traffic —
   don't have your agent page you with real secrets.
+- **Errors never carry the token.** The bot token sits in the request URL, so
+  every error leaving the client is scrubbed before it reaches a log or your
+  agent's context.
 
 telepager cannot run commands, read your files, or touch your machine. It only
 sends and receives Telegram messages.
 
+## Known limits
+
+- Two MCP clients running telepager at once will fight over the Telegram update
+  stream — Telegram allows one poller per bot. One client at a time for now.
+- `ask_question` can outlive your MCP client's own tool-call timeout. If your
+  client gives up first, lower `ask_timeout_seconds` to match.
+
 ## License
 
-MIT
+[AGPL-3.0](LICENSE). If you modify telepager and distribute it — or run a
+modified version as a service — you have to publish your source under the same
+license.

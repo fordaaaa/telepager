@@ -2,7 +2,7 @@
 name = "telepager"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-only"
 authors = ["fordaaaa"]
 description = "An MCP server that pages you on Telegram — your agent can message you, show progress, and ask you questions with buttons."
 repository = "https://github.com/fordaaaa/telepager"
