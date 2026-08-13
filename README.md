@@ -86,8 +86,6 @@ cargo build --release   # -> target/release/telepager
 ```
 
 Then put it somewhere on your PATH, or point your MCP client at the full path.
-Prebuilt binaries for macOS and Linux (arm64/x64) are attached to each
-[release](https://github.com/fordaaaa/telepager/releases).
 
 ## Security
 
