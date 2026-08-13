@@ -1,4 +1,5 @@
 mod config;
+mod ipc;
 mod mcp;
 mod telegram;
 
