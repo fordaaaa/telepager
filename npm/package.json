@@ -1,0 +1,44 @@
+{
+  "name": "telepager",
+  "version": "0.1.0",
+  "description": "An MCP server that pages you on Telegram — your agent can message you, show progress, and ask you questions with buttons",
+  "keywords": [
+    "mcp",
+    "telegram",
+    "claude",
+    "cursor",
+    "bot",
+    "notifications",
+    "agent"
+  ],
+  "license": "MIT",
+  "author": "fordaaaa",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fordaaaa/telepager.git"
+  },
+  "homepage": "https://github.com/fordaaaa/telepager",
+  "bin": {
+    "telepager": "bin/telepager.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "install.js",
+    "bin/telepager.js",
+    "README.md"
+  ],
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}

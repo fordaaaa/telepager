@@ -14,3 +14,11 @@ config.json
 .vscode/
 *.swp
 *~
+
+#npm wrapper
+node_modules/
+npm/bin/telepager
+npm/bin/telepager.exe
+npm/README.md
+*.tgz
+.npmrc
