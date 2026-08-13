@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -10,17 +9,8 @@ use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use tokio::sync::Mutex;
 
-use crate::config::Config;
-use crate::telegram::Telegram;
-
-const MAX_OPTIONS: usize = 20;
-
-struct State {
-    cfg: Config,
-    tg: Telegram,
-    thinking: Mutex<Option<i64>>,
-    offset: Mutex<i64>,
-}
+use crate::client::Client;
+use crate::ipc::Request;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct MessageRequest {
@@ -44,31 +34,35 @@ struct AskRequest {
 
 #[derive(Clone)]
 struct Server {
-    st: Arc<State>,
-    // the tool_handler macro reads this, the lint just can't see it
+    // one connection to the daemon, tool calls take turns on it
+    client: Arc<Mutex<Client>>,
+    // read by the tool_handler macro, the lint just can't see it
     #[allow(dead_code)]
     tool_router: ToolRouter<Server>,
 }
 
 #[tool_router]
 impl Server {
-    fn new(st: Arc<State>) -> Self {
+    fn new(client: Arc<Mutex<Client>>) -> Self {
         Self {
-            st,
+            client,
             tool_router: Self::tool_router(),
         }
     }
 
+    // the daemon does the work, this carries the request over and waits.
+    // block_in_place keeps the blocking socket read off the async executor.
+    async fn forward(&self, req: Request) -> String {
+        let mut guard = self.client.lock().await;
+        tokio::task::block_in_place(|| match guard.call(&req) {
+            Ok(result) => result,
+            Err(e) => format!("could not reach the telepager daemon: {e:#}"),
+        })
+    }
+
     #[tool(description = "send a message to the telegram user")]
     async fn send_message(&self, Parameters(req): Parameters<MessageRequest>) -> String {
-        match self.st.tg.send_message(self.st.cfg.chat_id, &req.text).await {
-            Ok(_) => {
-                // the status line is above this now, so the next one starts fresh at the bottom
-                *self.st.thinking.lock().await = None;
-                "sent".into()
-            }
-            Err(e) => format!("could not send: {e:#}"),
-        }
+        self.forward(Request::Send { text: req.text }).await
     }
 
     #[tool(
@@ -77,25 +71,7 @@ impl Server {
                        posted during long work."
     )]
     async fn send_thinking(&self, Parameters(req): Parameters<ThinkingRequest>) -> String {
-        let text = format!("💭 {}", req.text);
-        let chat = self.st.cfg.chat_id;
-        let mut slot = self.st.thinking.lock().await;
-
-        // an edit only really fails if the message is gone, so start a new one
-        if let Some(id) = *slot {
-            match self.st.tg.edit_message(chat, id, &text).await {
-                Ok(()) => return "updated".into(),
-                Err(e) => log::debug!("status edit failed, sending a new one: {e:#}"),
-            }
-        }
-
-        match self.st.tg.send_message(chat, &text).await {
-            Ok(id) => {
-                *slot = Some(id);
-                "sent".into()
-            }
-            Err(e) => format!("could not send: {e:#}"),
-        }
+        self.forward(Request::Thinking { text: req.text }).await
     }
 
     #[tool(
@@ -103,88 +79,11 @@ impl Server {
                        wait for their answer. returns the option they picked."
     )]
     async fn ask_question(&self, Parameters(req): Parameters<AskRequest>) -> String {
-        if req.options.is_empty() {
-            return "need at least one option".into();
-        }
-        if req.options.len() > MAX_OPTIONS {
-            return format!("too many options — {MAX_OPTIONS} at most");
-        }
-
-        match self.ask(&req.question, &req.options).await {
-            Ok(answer) => answer,
-            Err(e) => format!("could not ask: {e:#}"),
-        }
-    }
-}
-
-impl Server {
-    async fn ask(&self, question: &str, options: &[String]) -> Result<String> {
-        let chat = self.st.cfg.chat_id;
-        let tg = &self.st.tg;
-
-        let msg_id = tg.send_with_buttons(chat, question, options).await?;
-
-        // holding the offset for the whole wait keeps a second question from eating this answer
-        let mut offset = self.st.offset.lock().await;
-        let deadline = Instant::now() + Duration::from_secs(self.st.cfg.ask_timeout_seconds);
-
-        while Instant::now() < deadline {
-            let updates = match tg.get_updates(*offset).await {
-                Ok(u) => u,
-                Err(e) => {
-                    log::debug!("getUpdates failed, retrying: {e:#}");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            };
-
-            for update in updates {
-                // ack everything, even what we ignore, or telegram keeps handing it back
-                *offset = update.update_id + 1;
-
-                let Some(query) = update.callback_query else {
-                    continue;
-                };
-                if query.message.as_ref().map(|m| m.message_id) != Some(msg_id) {
-                    continue;
-                }
-                if !self.st.cfg.allowed_user_ids.contains(&query.from.id) {
-                    log::warn!("ignoring a button tap from {}", query.from.id);
-                    continue;
-                }
-
-                let Some((index, answer)) = query
-                    .data
-                    .as_deref()
-                    .and_then(|d| d.parse::<usize>().ok())
-                    .and_then(|i| options.get(i).map(|o| (i, o.clone())))
-                else {
-                    continue;
-                };
-
-                if let Err(e) = tg.answer_callback(&query.id).await {
-                    log::debug!("answerCallbackQuery failed: {e:#}");
-                }
-                let settled = format!("{question}\n\n✅ {}. {answer}", index + 1);
-                if let Err(e) = tg.edit_message(chat, msg_id, &settled).await {
-                    log::debug!("could not clear the keyboard: {e:#}");
-                }
-
-                return Ok(answer);
-            }
-        }
-
-        let timed_out = format!(
-            "{question}\n\n⏱ no answer after {}s",
-            self.st.cfg.ask_timeout_seconds
-        );
-        if let Err(e) = tg.edit_message(chat, msg_id, &timed_out).await {
-            log::debug!("could not clear the keyboard: {e:#}");
-        }
-        Ok(format!(
-            "no answer — the user did not pick an option within {}s",
-            self.st.cfg.ask_timeout_seconds
-        ))
+        self.forward(Request::Ask {
+            question: req.question,
+            options: req.options,
+        })
+        .await
     }
 }
 
@@ -207,18 +106,14 @@ impl ServerHandler for Server {
 }
 
 pub fn run(config: Option<PathBuf>) -> Result<()> {
-    let cfg = crate::config::load(config.as_deref())?;
-    let tg = Telegram::new(&cfg.token)?;
-    let st = Arc::new(State {
-        cfg,
-        tg,
-        thinking: Mutex::new(None),
-        offset: Mutex::new(0),
-    });
+    // fail here rather than on the first tool call, so a bad config shows up
+    // when the client starts us
+    crate::config::load(config.as_deref())?;
+    let client = Arc::new(Mutex::new(Client::connect(config.as_ref())?));
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
-        let service = Server::new(st).serve(stdio()).await?;
+        let service = Server::new(client).serve(stdio()).await?;
         service.waiting().await?;
         Ok(())
     })
