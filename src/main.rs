@@ -1,7 +1,3 @@
-//telepager: an mcp server that pages you on telegram. it speaks mcp over stdio
-//and the telegram bot api over https — no webhook, no public url, no port
-//forwarding.
-
 mod config;
 mod mcp;
 mod telegram;
@@ -32,8 +28,7 @@ fn main() -> ExitCode {
         }
     };
 
-    //logs go to stderr, which matters here: stdout is the mcp transport and
-    //anything else written there would corrupt the protocol
+    // stdout is the mcp transport so logs have to go to stderr
     if std::env::var_os("RUST_LOG").is_none() {
         std::env::set_var("RUST_LOG", "info");
     }
@@ -50,7 +45,6 @@ fn main() -> ExitCode {
 
 enum Action {
     Run(Option<PathBuf>),
-    //--help and --version print and stop
     Exit,
 }
 

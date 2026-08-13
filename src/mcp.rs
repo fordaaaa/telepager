@@ -1,7 +1,3 @@
-//the mcp server. three tools, all of them ways of paging one telegram user:
-//say something, show a status line that updates in place, and ask a question
-//with numbered buttons and wait for the tap.
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,16 +13,12 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::telegram::Telegram;
 
-//more buttons than this is a menu, not a question
 const MAX_OPTIONS: usize = 20;
 
 struct State {
     cfg: Config,
     tg: Telegram,
-    //the status message being edited in place, if one is live
     thinking: Mutex<Option<i64>>,
-    //next getUpdates offset, and the lock that keeps two questions from
-    //polling at once and stealing each other's answers
     offset: Mutex<i64>,
 }
 
@@ -53,7 +45,7 @@ struct AskRequest {
 #[derive(Clone)]
 struct Server {
     st: Arc<State>,
-    //read by the tool_handler macro's generated code, the lint just can't see it
+    // the tool_handler macro reads this, the lint just can't see it
     #[allow(dead_code)]
     tool_router: ToolRouter<Server>,
 }
@@ -71,8 +63,7 @@ impl Server {
     async fn send_message(&self, Parameters(req): Parameters<MessageRequest>) -> String {
         match self.st.tg.send_message(self.st.cfg.chat_id, &req.text).await {
             Ok(_) => {
-                //the status line belongs above this message now, so the next
-                //update starts a fresh one at the bottom of the chat
+                // the status line is above this now, so the next one starts fresh at the bottom
                 *self.st.thinking.lock().await = None;
                 "sent".into()
             }
@@ -90,9 +81,7 @@ impl Server {
         let chat = self.st.cfg.chat_id;
         let mut slot = self.st.thinking.lock().await;
 
-        //edit the live status line if there is one. re-sending the same text is
-        //not a failure (the client treats it as a no-op); a real failure means
-        //the message is gone, so fall through and start a new one.
+        // an edit only really fails if the message is gone, so start a new one
         if let Some(id) = *slot {
             match self.st.tg.edit_message(chat, id, &text).await {
                 Ok(()) => return "updated".into(),
@@ -129,23 +118,19 @@ impl Server {
 }
 
 impl Server {
-    //post the question, then poll until the right person taps one of its
-    //buttons or we run out of patience
     async fn ask(&self, question: &str, options: &[String]) -> Result<String> {
         let chat = self.st.cfg.chat_id;
         let tg = &self.st.tg;
 
         let msg_id = tg.send_with_buttons(chat, question, options).await?;
 
-        //polling holds the offset for the whole wait, so a second question
-        //queues behind this one instead of consuming its answer
+        // holding the offset for the whole wait keeps a second question from eating this answer
         let mut offset = self.st.offset.lock().await;
         let deadline = Instant::now() + Duration::from_secs(self.st.cfg.ask_timeout_seconds);
 
         while Instant::now() < deadline {
             let updates = match tg.get_updates(*offset).await {
                 Ok(u) => u,
-                //a dropped long poll is routine; wait a beat and try again
                 Err(e) => {
                     log::debug!("getUpdates failed, retrying: {e:#}");
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -154,14 +139,12 @@ impl Server {
             };
 
             for update in updates {
-                //acknowledge every update we see, even ones we ignore, or
-                //telegram would hand them back forever
+                // ack everything, even what we ignore, or telegram keeps handing it back
                 *offset = update.update_id + 1;
 
                 let Some(query) = update.callback_query else {
                     continue;
                 };
-                //a tap on an older question, or from someone not on the list
                 if query.message.as_ref().map(|m| m.message_id) != Some(msg_id) {
                     continue;
                 }
@@ -179,8 +162,6 @@ impl Server {
                     continue;
                 };
 
-                //stop the button's spinner, then rewrite the question to show
-                //what was picked, which also clears the keyboard
                 if let Err(e) = tg.answer_callback(&query.id).await {
                     log::debug!("answerCallbackQuery failed: {e:#}");
                 }
@@ -207,12 +188,10 @@ impl Server {
     }
 }
 
-//the tool_handler macro wires call_tool/list_tools to the router. get_info just
-//names the server and gives the client a short hint.
 #[tool_handler]
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerInfo {
-        //these structs are non-exhaustive, so tweak a default instead of a literal
+        // these structs are non exhaustive so you can't just write a literal
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info.name = "telepager".into();
@@ -239,7 +218,6 @@ pub fn run(config: Option<PathBuf>) -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
-        //stdio transport: the mcp client speaks to us over stdin/stdout
         let service = Server::new(st).serve(stdio()).await?;
         service.waiting().await?;
         Ok(())

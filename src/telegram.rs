@@ -1,26 +1,17 @@
-//a thin telegram bot api client. just the handful of calls this server needs:
-//send a message, edit one in place, attach an inline keyboard, acknowledge a
-//button tap, and long-poll for updates. no framework, just json over https.
-
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-//telegram rejects messages over 4096 characters
 pub const MAX_MESSAGE_LEN: usize = 4096;
-
-//how long getUpdates holds the connection open waiting for something to happen
 const POLL_SECONDS: u64 = 25;
 
 pub struct Telegram {
     http: reqwest::Client,
     base: String,
-    //kept so errors can be scrubbed of it before they escape this module
     token: String,
 }
 
-//the envelope every bot api response comes wrapped in
 #[derive(Deserialize)]
 struct ApiResponse<T> {
     ok: bool,
@@ -54,7 +45,7 @@ pub struct User {
 
 impl Telegram {
     pub fn new(token: &str) -> Result<Self> {
-        //the timeout has to outlast a long poll or every poll would be an error
+        // has to outlast a long poll or every poll is an error
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(POLL_SECONDS + 15))
             .build()
@@ -66,10 +57,7 @@ impl Telegram {
         })
     }
 
-    //the bot token sits in the url path, and reqwest prints the url in its
-    //error text. every error leaving this client goes through here first, or a
-    //single network blip would write the token into a log line and into the mcp
-    //tool result the model reads back.
+    // reqwest prints the request url in its errors and the token is in the url
     fn scrub(&self, e: anyhow::Error) -> anyhow::Error {
         let text = format!("{e:#}");
         if !text.contains(&self.token) {
@@ -78,8 +66,6 @@ impl Telegram {
         anyhow::anyhow!(text.replace(&self.token, "<redacted>"))
     }
 
-    //post a json body to a bot api method and unwrap the envelope. the error
-    //carries telegram's own description, which is usually the useful part.
     async fn call<T: for<'de> Deserialize<'de>>(&self, method: &str, body: Value) -> Result<T> {
         self.call_inner(method, body).await.map_err(|e| self.scrub(e))
     }
@@ -113,8 +99,6 @@ impl Telegram {
             .ok_or_else(|| anyhow::anyhow!("{method} returned ok with no result"))
     }
 
-    //send one message. long text is split across several, and the id of the
-    //last one comes back so a caller can keep editing it.
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64> {
         let mut last = None;
         for part in chunk_text(text, MAX_MESSAGE_LEN) {
@@ -126,27 +110,21 @@ impl Telegram {
         last.ok_or_else(|| anyhow::anyhow!("nothing to send"))
     }
 
-    //replace the text of a message already in the chat. omitting reply_markup
-    //also strips any inline keyboard it had.
+    // leaving out reply_markup also clears any keyboard the message had
     pub async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
         let body = json!({
             "chat_id": chat_id,
             "message_id": message_id,
             "text": truncate(text, MAX_MESSAGE_LEN),
         });
-        //the result is the edited message, which we don't need
         match self.call::<Value>("editMessageText", body).await {
             Ok(_) => Ok(()),
-            //telegram calls it an error to edit a message into the text it
-            //already has. the message reads the way we wanted either way, so
-            //this is a success as far as callers are concerned.
+            // editing a message into the text it already has isn't a real failure
             Err(e) if is_unmodified(&e) => Ok(()),
             Err(e) => Err(e),
         }
     }
 
-    //send a message with numbered buttons under it. the callback data of each
-    //button is its index, so the answer maps straight back to the options list.
     pub async fn send_with_buttons(
         &self,
         chat_id: i64,
@@ -164,7 +142,6 @@ impl Telegram {
             })
             .collect();
 
-        //three to a row keeps short labels side by side without crowding
         let rows: Vec<Vec<Value>> = buttons.chunks(3).map(|c| c.to_vec()).collect();
 
         let sent: SentMessage = self
@@ -180,8 +157,6 @@ impl Telegram {
         Ok(sent.message_id)
     }
 
-    //clears the spinner telegram shows on a tapped button. best effort — a
-    //failure here doesn't change the answer we already have.
     pub async fn answer_callback(&self, callback_id: &str) -> Result<()> {
         let _: Value = self
             .call("answerCallbackQuery", json!({ "callback_query_id": callback_id }))
@@ -189,8 +164,6 @@ impl Telegram {
         Ok(())
     }
 
-    //long-poll for updates past `offset`. only button taps are asked for, so
-    //ordinary chat messages never accumulate on telegram's side.
     pub async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
         self.call(
             "getUpdates",
@@ -204,8 +177,6 @@ impl Telegram {
     }
 }
 
-//telegram's wording for "the edit would change nothing", matched loosely
-//because the description carries a longer suffix
 fn is_unmodified(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("message is not modified")
 }
@@ -217,8 +188,6 @@ fn truncate(s: &str, limit: usize) -> String {
     s.chars().take(limit).collect()
 }
 
-//split text into telegram-sized pieces, preferring to break on a newline near
-//the end of a chunk so code and lists don't get cut mid-line.
 pub fn chunk_text(text: &str, limit: usize) -> Vec<String> {
     if text.is_empty() {
         return vec!["(empty)".to_string()];
@@ -233,14 +202,13 @@ pub fn chunk_text(text: &str, limit: usize) -> Vec<String> {
             break;
         }
 
-        //byte index of the limit-th character, so we never split a codepoint
         let cut = rest
             .char_indices()
             .nth(limit)
             .map(|(i, _)| i)
             .unwrap_or(rest.len());
 
-        //back up to the last newline, but only if it isn't miles away
+        // back up to the last newline so lines don't get cut in half, unless it's miles away
         let split = match rest[..cut].rfind('\n') {
             Some(nl) if nl > cut / 2 => nl + 1,
             _ => cut,

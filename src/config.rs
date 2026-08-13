@@ -1,14 +1,8 @@
-//config loading. lookup order: --config path, then ./telepager.config.json,
-//then ~/.config/telepager/config.json. first one that exists wins.
-//the token can also come from TELEGRAM_BOT_TOKEN, which beats the file.
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-//straight from the json file, every field optional so a missing key just falls
-//back to a default below
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawConfig {
@@ -18,15 +12,11 @@ struct RawConfig {
     ask_timeout_seconds: Option<u64>,
 }
 
-//the finished config the server runs on
 #[derive(Debug, Clone)]
 pub struct Config {
     pub token: String,
-    //whose button taps count. anyone else's are ignored.
     pub allowed_user_ids: Vec<i64>,
-    //where messages go. a private chat's id is the user's own id.
     pub chat_id: i64,
-    //how long ask_question waits for a tap before giving up
     pub ask_timeout_seconds: u64,
 }
 
@@ -36,7 +26,6 @@ fn home_config() -> PathBuf {
         .join(".config/telepager/config.json")
 }
 
-//work out which config file to read, if any
 fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(p.to_path_buf());
@@ -51,9 +40,6 @@ fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     home.exists().then_some(home)
 }
 
-//read the file (if there is one), layer the env override on top, fill in
-//defaults. bails without a token or with an empty allowlist — the allowlist is
-//the whole security model, so an empty one is never what someone meant.
 pub fn load(explicit: Option<&Path>) -> Result<Config> {
     let file = resolve_config_path(explicit);
 
@@ -90,7 +76,7 @@ pub fn load(explicit: Option<&Path>) -> Result<Config> {
         );
     }
 
-    //with one allowed user, their id is also the private chat to talk in
+    // in a private chat the chat id is just the user id
     let chat_id = raw
         .chat_id
         .unwrap_or_else(|| *allowed_user_ids.iter().min().unwrap());
@@ -103,8 +89,6 @@ pub fn load(explicit: Option<&Path>) -> Result<Config> {
     })
 }
 
-//parse the comma-separated TELEGRAM_ALLOWED_IDS value, erroring on any
-//non-integer piece rather than silently dropping it. blanks are skipped.
 fn parse_allowed_ids(s: &str) -> Result<Vec<i64>> {
     let mut ids = Vec::new();
     for part in s.split(',') {
