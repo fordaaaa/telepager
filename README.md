@@ -40,15 +40,40 @@ rewrites itself to `✅ 2. <your answer>` and the buttons disappear.
 
 ## Install
 
+**Nothing to install** — point your MCP client at `npx` and it fetches
+telepager itself:
+
+```bash
+claude mcp add --scope user telepager -- npx -y telepager mcp
+```
+
+**Or install the binary**, if you'd rather have a real command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fordaaaa/telepager/main/install.sh | sh
+```
+
+Downloads the binary for your platform from GitHub Releases, checks it against
+the published sha256, and puts it in `~/.local/bin`.
+
+**Or with npm:**
+
 ```bash
 npm install -g telepager
 ```
 
-The postinstall step downloads the prebuilt binary for your platform (macOS
-arm64/x64, Linux arm64/x64, Windows x64) from GitHub Releases and verifies it
-against the published sha256 before installing.
+If that fails with `EACCES` on `/usr/local/lib/node_modules`, npm is trying to
+write somewhere you don't own. Point it at your home directory instead — this
+fixes every global npm package, not just this one:
 
-Or build it yourself:
+```bash
+npm config set prefix ~/.local
+```
+
+Don't reach for `sudo`: the install step downloads an executable, and running
+that as root is a bad trade.
+
+**Or build it:**
 
 ```bash
 cargo build --release   # -> target/release/telepager
@@ -94,6 +119,12 @@ lookup entirely.
 
 ```bash
 claude mcp add --scope user telepager -- telepager mcp
+```
+
+Or without installing anything:
+
+```bash
+claude mcp add --scope user telepager -- npx -y telepager mcp
 ```
 
 <details>
