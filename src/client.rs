@@ -10,12 +10,14 @@ use crate::ipc::{self, Request, Response};
 pub struct Client {
     write: TcpStream,
     read: BufReader<TcpStream>,
+    // kept so a reconnect can start a daemon the same way we first did
+    config: Option<PathBuf>,
 }
 
 impl Client {
     // connect to a running daemon, or start one and wait for it to come up
     pub fn connect(config: Option<&PathBuf>) -> Result<Self> {
-        if let Some(c) = Self::try_connect() {
+        if let Some(c) = Self::try_connect(config) {
             return Ok(c);
         }
 
@@ -24,18 +26,22 @@ impl Client {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(200));
-            if let Some(c) = Self::try_connect() {
+            if let Some(c) = Self::try_connect(config) {
                 return Ok(c);
             }
         }
         bail!("the daemon did not come up within 10s")
     }
 
-    fn try_connect() -> Option<Self> {
+    fn try_connect(config: Option<&PathBuf>) -> Option<Self> {
         let ep = ipc::read_endpoint()?;
         let stream = TcpStream::connect(("127.0.0.1", ep.port)).ok()?;
         let read = BufReader::new(stream.try_clone().ok()?);
-        let mut c = Client { write: stream, read };
+        let mut c = Client {
+            write: stream,
+            read,
+            config: config.cloned(),
+        };
         c.send(&Request::Hello {
             token: ep.token,
             label: ipc::session_label(),
@@ -52,8 +58,19 @@ impl Client {
         Ok(())
     }
 
-    // hello gets no reply, everything else does
+    // the daemon can restart under us — an upgrade, a kill, a laptop waking up.
+    // one silent reconnect beats making the user restart their editor.
     pub fn call(&mut self, req: &Request) -> Result<String> {
+        match self.call_once(req) {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                self.reconnect()?;
+                self.call_once(req)
+            }
+        }
+    }
+
+    fn call_once(&mut self, req: &Request) -> Result<String> {
         self.send(req)?;
         let mut line = String::new();
         let n = self.read.read_line(&mut line).context("reading the reply")?;
@@ -62,6 +79,12 @@ impl Client {
         }
         let resp: Response = serde_json::from_str(line.trim()).context("bad reply")?;
         Ok(resp.result)
+    }
+
+    fn reconnect(&mut self) -> Result<()> {
+        let fresh = Self::connect(self.config.as_ref()).context("reconnecting to the daemon")?;
+        *self = fresh;
+        Ok(())
     }
 }
 
