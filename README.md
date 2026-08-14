@@ -93,7 +93,7 @@ lookup entirely.
 **5. Register it with your MCP client.**
 
 ```bash
-claude mcp add --scope user telepager -- telepager
+claude mcp add --scope user telepager -- telepager mcp
 ```
 
 <details>
@@ -103,7 +103,8 @@ claude mcp add --scope user telepager -- telepager
 {
   "mcpServers": {
     "telepager": {
-      "command": "telepager"
+      "command": "telepager",
+      "args": ["mcp"]
     }
   }
 }
