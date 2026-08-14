@@ -9,13 +9,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-telepager — page a telegram user from an mcp client
+telepager — page yourself on telegram from a coding agent
 
-usage: telepager [--config PATH]
+usage: telepager mcp [--config PATH]
        telepager daemon [--config PATH]
 
-  daemon          run the background process that owns the telegram
-                  connection. started automatically when needed.
+  mcp             the stdio server an mcp client starts. this is what you
+                  register with claude code, cursor and friends.
+  daemon          the background process that owns the telegram connection.
+                  started automatically when a client needs it.
 
   --config PATH   config file to use, instead of the default lookup
                   (./telepager.config.json, then telepager/config.json
@@ -35,7 +37,7 @@ fn main() -> ExitCode {
     };
 
     let config = match action {
-        Action::Run(c) => c,
+        Action::Mcp(c) => c,
         Action::Daemon(c) => {
             init_logging();
             return match daemon::run(c) {
@@ -70,14 +72,14 @@ fn init_logging() {
 }
 
 enum Action {
-    Run(Option<PathBuf>),
+    Mcp(Option<PathBuf>),
     Daemon(Option<PathBuf>),
     Exit,
 }
 
 fn parse_args() -> Result<Action, String> {
     let mut config = None;
-    let mut daemon = false;
+    let mut mode = None;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -90,7 +92,7 @@ fn parse_args() -> Result<Action, String> {
                 println!("telepager {}", env!("CARGO_PKG_VERSION"));
                 return Ok(Action::Exit);
             }
-            "daemon" => daemon = true,
+            "mcp" | "daemon" => mode = Some(arg),
             "--config" => {
                 let path = args.next().ok_or("--config needs a path")?;
                 config = Some(PathBuf::from(path));
@@ -99,8 +101,14 @@ fn parse_args() -> Result<Action, String> {
         }
     }
 
-    if daemon {
-        return Ok(Action::Daemon(config));
+    match mode.as_deref() {
+        Some("daemon") => Ok(Action::Daemon(config)),
+        Some("mcp") => Ok(Action::Mcp(config)),
+        // registrations from before the subcommand existed
+        _ => {
+            eprintln!("telepager: no subcommand given, assuming 'mcp'. update your");
+            eprintln!("registration to `telepager mcp` — the bare form goes away later.");
+            Ok(Action::Mcp(config))
+        }
     }
-    Ok(Action::Run(config))
 }
