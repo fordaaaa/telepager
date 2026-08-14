@@ -1,7 +1,9 @@
 name: release
 
-# Build the binaries, checksum them and attach them to the release. Only runs
-# on tags like `v0.1.0`. The npm package is published by hand.
+# Build the binaries, checksum them, attach them to the release, then publish
+# the npm wrapper. Only runs on tags like `v0.1.0`. Publishing uses npm trusted
+# publishing (oidc), so there's no token stored anywhere — it has to be set up
+# once on the package's settings page on npmjs.com.
 on:
   push:
     tags:
@@ -9,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build:
@@ -101,3 +104,33 @@ jobs:
           files: |
             dist/telepager-*
 
+  publish-npm:
+    name: publish to npm
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # trusted publishing needs a recent npm
+      - run: npm install -g npm@latest
+
+      - name: Verify package version matches the tag
+        working-directory: npm
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$PKG_VERSION" != "$TAG_VERSION" ]]; then
+            echo "npm/package.json version ($PKG_VERSION) != tag ($TAG_VERSION)" >&2
+            exit 1
+          fi
+
+      - name: Publish
+        working-directory: npm
+        run: |
+          cp ../README.md .
+          npm publish --access public --provenance
