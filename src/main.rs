@@ -3,6 +3,7 @@ mod config;
 mod daemon;
 mod ipc;
 mod mcp;
+mod status;
 mod telegram;
 
 use std::path::PathBuf;
@@ -11,9 +12,12 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 telepager — page yourself on telegram from a coding agent
 
-usage: telepager mcp [--config PATH]
+usage: telepager [--config PATH]
+       telepager mcp [--config PATH]
        telepager daemon [--config PATH]
 
+  status          show whether it's set up and running. this is also what
+                  plain `telepager` does.
   mcp             the stdio server an mcp client starts. this is what you
                   register with claude code, cursor and friends.
   daemon          the background process that owns the telegram connection.
@@ -37,6 +41,10 @@ fn main() -> ExitCode {
     };
 
     let config = match action {
+        Action::Status(c) => {
+            status::print(c);
+            return ExitCode::SUCCESS;
+        }
         Action::Mcp(c) => c,
         Action::Daemon(c) => {
             init_logging();
@@ -72,6 +80,7 @@ fn init_logging() {
 }
 
 enum Action {
+    Status(Option<PathBuf>),
     Mcp(Option<PathBuf>),
     Daemon(Option<PathBuf>),
     Exit,
@@ -92,7 +101,7 @@ fn parse_args() -> Result<Action, String> {
                 println!("telepager {}", env!("CARGO_PKG_VERSION"));
                 return Ok(Action::Exit);
             }
-            "mcp" | "daemon" => mode = Some(arg),
+            "mcp" | "daemon" | "status" => mode = Some(arg),
             "--config" => {
                 let path = args.next().ok_or("--config needs a path")?;
                 config = Some(PathBuf::from(path));
@@ -104,7 +113,10 @@ fn parse_args() -> Result<Action, String> {
     match mode.as_deref() {
         Some("daemon") => Ok(Action::Daemon(config)),
         Some("mcp") => Ok(Action::Mcp(config)),
-        // registrations from before the subcommand existed
+        Some("status") => Ok(Action::Status(config)),
+        // a person typing `telepager` wants to see something. a client piping
+        // json at us is an old registration, so keep serving those.
+        _ if status::started_by_a_person() => Ok(Action::Status(config)),
         _ => {
             eprintln!("telepager: no subcommand given, assuming 'mcp'. update your");
             eprintln!("registration to `telepager mcp` — the bare form goes away later.");

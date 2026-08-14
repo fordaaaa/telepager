@@ -96,6 +96,23 @@ phone gets the same tabs as the browser.
 download with per-platform optional dependencies so `ignore-scripts` installs
 still work. Ship the wizard.
 
+## The master agent
+
+Not a router. Routing an answer back to the session that asked is a hashmap
+lookup and should stay one — putting a model in that path adds latency and a new
+way to be wrong.
+
+The master agent is the thing you *talk to*. You message it in telegram or the ui
+without addressing any particular session, and it decides what to do: spawn a
+worker in some directory, summarise what the running sessions are doing, kill one
+that's stuck, answer a question on your behalf if you've told it how.
+
+That makes it a client of core like everything else — it holds the conversation,
+calls the same spawn and status apis the ui does, and has no privileges the ui
+doesn't. Which also means it can be added last, and telepager works without it.
+
+Lands with phase 4, since it has nothing to orchestrate until spawning exists.
+
 ## Decisions needed
 
 - **Which agent CLIs.** `claude -p` first. The spawn command should be

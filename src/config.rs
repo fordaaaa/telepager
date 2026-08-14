@@ -42,6 +42,13 @@ fn config_candidates() -> Vec<PathBuf> {
     out
 }
 
+pub fn first_candidate() -> String {
+    config_candidates()
+        .first()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "telepager.config.json".into())
+}
+
 fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(p.to_path_buf());
@@ -73,10 +80,7 @@ pub fn load(explicit: Option<&Path>) -> Result<Config> {
         _ => raw.bot_token.clone().unwrap_or_default(),
     };
     if token.trim().is_empty() {
-        let where_to_put_it = config_candidates()
-            .first()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "telepager.config.json".into());
+        let where_to_put_it = first_candidate();
         bail!(
             "No bot token found. Set TELEGRAM_BOT_TOKEN or put bot_token in the \
              config file ({where_to_put_it})."

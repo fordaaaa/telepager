@@ -50,6 +50,11 @@ pub fn write_endpoint(e: &Endpoint) -> Result<()> {
     Ok(())
 }
 
+// the path to tell someone to write their config to
+pub fn config_hint() -> String {
+    crate::config::first_candidate()
+}
+
 pub fn read_endpoint() -> Option<Endpoint> {
     let text = std::fs::read_to_string(state_path()).ok()?;
     serde_json::from_str(&text).ok()
