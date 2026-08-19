@@ -18,8 +18,9 @@ pub fn print(config: Option<PathBuf>) {
             println!("  config    not set up yet");
             println!("            {e}");
             println!();
-            println!("  make a bot with @BotFather, get your id from @userinfobot,");
-            println!("  then write bot_token and allowed_user_ids to");
+            println!("  run `telepager setup` and it'll walk you through it in a");
+            println!("  browser. or make a bot with @BotFather, get your id from");
+            println!("  @userinfobot, and write bot_token and allowed_user_ids to");
             println!("  {}", ipc::config_hint());
             return;
         }

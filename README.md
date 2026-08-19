@@ -85,12 +85,32 @@ cargo build --release   # -> target/release/telepager
 follow the prompts, and keep the token it gives you. BotFather is only used this
 once — after that, telepager talks to `api.telegram.org` directly.
 
-**2. Get your user ID.** Message [@userinfobot](https://t.me/userinfobot); it
+**2. Run the setup page.**
+
+```bash
+telepager setup      # or: npx -y telepager setup
+```
+
+It serves a small page on `127.0.0.1` and opens your browser. Paste the token,
+then hit **Wait for me to message the bot** and send your bot anything —
+telepager reads your user ID off that message, so you never have to go looking
+for it. It writes the config file, then turns into a status page with a
+send-a-test-message button.
+
+The page is local only: a random port, a one-off key in the URL, and requests
+from any host other than localhost are refused. `--port N` pins the port and
+`--no-open` skips launching a browser; the URL is printed either way, which is
+what you want over SSH. Ctrl-C when you're done.
+
+<details>
+<summary>Or set it up by hand</summary>
+
+**Get your user ID.** Message [@userinfobot](https://t.me/userinfobot); it
 replies with your numeric ID.
 
-**3. Send your bot a message** so a chat exists — a bot can't open one with you.
+**Send your bot a message** so a chat exists — a bot can't open one with you.
 
-**4. Write the config.** Where it goes depends on the platform:
+**Write the config.** Where it goes depends on the platform:
 
 | Platform | Path |
 | --- | --- |
@@ -115,7 +135,11 @@ replies with your numeric ID.
 Also looked for at `./telepager.config.json`; `--config PATH` overrides the
 lookup entirely.
 
-**5. Register it with your MCP client.**
+</details>
+
+Either way, `telepager` on its own prints whether it's set up and running.
+
+**3. Register it with your MCP client.**
 
 ```bash
 claude mcp add --scope user telepager -- telepager mcp
@@ -146,7 +170,7 @@ client starts and stops the server itself — there's no daemon to babysit.
 
 </details>
 
-**6. Tell your agent to use it.** Nothing forces an agent to page you, so add a
+**4. Tell your agent to use it.** Nothing forces an agent to page you, so add a
 line to your `CLAUDE.md`:
 
 > When you hit a decision you'd otherwise guess at during a long task, use
@@ -159,7 +183,8 @@ The allowlist is the entire security model, so telepager **refuses to start with
 an empty one**. Beyond that:
 
 - **The token is a secret.** Anyone holding it can act as your bot. Prefer
-  `TELEGRAM_BOT_TOKEN` over the plaintext file; the config file is gitignored.
+  `TELEGRAM_BOT_TOKEN` over the plaintext file; the config file is gitignored,
+  and `telepager setup` writes it `0600`.
 - **Telegram is not end-to-end encrypted.** Its servers can see the traffic —
   don't have your agent page you with real secrets.
 - **Errors never carry the token.** The bot token sits in the request URL, so

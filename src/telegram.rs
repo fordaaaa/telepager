@@ -49,6 +49,18 @@ pub struct CallbackQuery {
 #[derive(Debug, Deserialize)]
 pub struct User {
     pub id: i64,
+    pub username: Option<String>,
+    pub first_name: Option<String>,
+}
+
+impl User {
+    // something to show next to the id in the setup page
+    pub fn display_name(&self) -> String {
+        if let Some(u) = &self.username {
+            return format!("@{u}");
+        }
+        self.first_name.clone().unwrap_or_else(|| self.id.to_string())
+    }
 }
 
 impl Telegram {
@@ -105,6 +117,11 @@ impl Telegram {
         parsed
             .result
             .ok_or_else(|| anyhow::anyhow!("{method} returned ok with no result"))
+    }
+
+    // the cheapest way to find out whether a token is real
+    pub async fn get_me(&self) -> Result<User> {
+        self.call("getMe", json!({})).await
     }
 
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64> {
@@ -173,11 +190,15 @@ impl Telegram {
     }
 
     pub async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
+        self.get_updates_for(offset, POLL_SECONDS).await
+    }
+
+    pub async fn get_updates_for(&self, offset: i64, timeout: u64) -> Result<Vec<Update>> {
         self.call(
             "getUpdates",
             json!({
                 "offset": offset,
-                "timeout": POLL_SECONDS,
+                "timeout": timeout,
                 "allowed_updates": ["callback_query", "message"],
             }),
         )

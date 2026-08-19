@@ -62,6 +62,57 @@ fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     config_candidates().into_iter().find(|p| p.exists())
 }
 
+// the config file we'd read right now, if there is one. an explicit --config
+// that doesn't exist yet is a file we're about to write, not one we have.
+pub fn existing_path(explicit: Option<&Path>) -> Option<PathBuf> {
+    resolve_config_path(explicit).filter(|p| p.exists())
+}
+
+// where a fresh config should be written
+pub fn target_path(explicit: Option<&Path>) -> PathBuf {
+    resolve_config_path(explicit).unwrap_or_else(|| {
+        config_candidates()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| PathBuf::from("telepager.config.json"))
+    })
+}
+
+// write bot_token and allowed_user_ids without stomping on anything else
+// the file already had (ask_timeout_seconds, chat_id, comments are lost but
+// those are the only keys we've ever documented)
+pub fn save(explicit: Option<&Path>, token: &str, ids: &[i64]) -> Result<PathBuf> {
+    let path = target_path(explicit);
+
+    let mut doc = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .with_context(|| format!("{} is not valid JSON", path.display()))?,
+        Err(_) => serde_json::json!({}),
+    };
+    let obj = doc
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+
+    obj.insert("bot_token".into(), serde_json::json!(token));
+    obj.insert("allowed_user_ids".into(), serde_json::json!(ids));
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&doc)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+
+    // the token is a credential, so don't leave it world readable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(path)
+}
+
 pub fn load(explicit: Option<&Path>) -> Result<Config> {
     let file = resolve_config_path(explicit);
 
@@ -159,6 +210,37 @@ mod tests {
     fn dot_config_is_a_candidate_on_unix() {
         let c = config_candidates();
         assert!(c.iter().any(|p| p.to_string_lossy().contains(".config/telepager")));
+    }
+
+    #[test]
+    fn save_keeps_other_keys() {
+        let dir = std::env::temp_dir().join(format!("telepager-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"ask_timeout_seconds": 900, "bot_token": "old"}"#).unwrap();
+
+        save(Some(&path), "new", &[7, 8]).unwrap();
+
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["bot_token"], "new");
+        assert_eq!(back["allowed_user_ids"], serde_json::json!([7, 8]));
+        assert_eq!(back["ask_timeout_seconds"], 900);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_creates_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!("telepager-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("config.json");
+
+        save(Some(&path), "tok", &[1]).unwrap();
+
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["bot_token"], "tok");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>telepager setup</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --ink: #16181d;
+    --muted: #6b7280;
+    --line: #e3e6ea;
+    --accent: #2aabee;
+    --accent-ink: #ffffff;
+    --ok: #1a7f45;
+    --bad: #b3261e;
+    --code-bg: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101216;
+      --card: #191c22;
+      --ink: #e8eaed;
+      --muted: #9aa1ac;
+      --line: #2a2f38;
+      --accent: #2aabee;
+      --accent-ink: #06121a;
+      --ok: #4ade80;
+      --bad: #f87171;
+      --code-bg: #11141a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 40px 20px 80px;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 28px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .card h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); margin: 0 0 12px; font-weight: 600;
+  }
+  label { display: block; font-weight: 500; margin-bottom: 6px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+  .hint a { color: var(--accent); }
+  input[type=text] {
+    width: 100%; padding: 10px 12px; font: inherit;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+    background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
+  button {
+    font: inherit; font-weight: 500; padding: 9px 16px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink);
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .note { margin-top: 10px; font-size: 14px; }
+  .note.ok { color: var(--ok); }
+  .note.bad { color: var(--bad); }
+  .note.wait { color: var(--muted); }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px; overflow-x: auto; margin: 12px 0 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+  }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; word-break: break-all; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+  .dot.on { background: var(--ok); }
+  .dot.off { background: var(--muted); }
+  .quiet { background: none; border: none; color: var(--muted); text-decoration: underline; padding: 0; font-size: 13px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>telepager</h1>
+  <p class="sub" id="sub">pages you on telegram from a coding agent</p>
+
+  <!-- setup -->
+  <section id="setup">
+    <div class="card">
+      <h2>Step 1 — bot token</h2>
+      <label for="token">Token from @BotFather</label>
+      <input id="token" type="text" spellcheck="false" autocomplete="off"
+             placeholder="123456789:AAExampleTokenFromBotFather">
+      <p class="hint">Open <a href="https://t.me/BotFather" target="_blank" rel="noreferrer">@BotFather</a>,
+        send <code>/newbot</code>, and paste what it gives you back.</p>
+      <div class="row">
+        <button id="check">Check token</button>
+      </div>
+      <p class="note" id="tokenNote"></p>
+    </div>
+
+    <div class="card">
+      <h2>Step 2 — your user id</h2>
+      <p class="hint" style="margin-top:0">Only these ids can talk to the bot. That allowlist is the whole
+        security model, so it's just you unless you mean otherwise.</p>
+      <div class="row">
+        <button id="detect">Wait for me to message the bot</button>
+        <button class="quiet" id="manualToggle">or type it in</button>
+      </div>
+      <p class="note" id="detectNote"></p>
+      <div id="manual" hidden style="margin-top:12px">
+        <label for="ids">User id(s), comma separated</label>
+        <input id="ids" type="text" spellcheck="false" autocomplete="off" placeholder="123456789">
+        <p class="hint">Message <a href="https://t.me/userinfobot" target="_blank" rel="noreferrer">@userinfobot</a>
+          and it replies with your id.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Step 3 — save</h2>
+      <div class="row">
+        <button class="primary" id="save">Write config</button>
+      </div>
+      <p class="note" id="saveNote"></p>
+    </div>
+  </section>
+
+  <!-- status -->
+  <section id="status" hidden>
+    <div class="card">
+      <h2>Status</h2>
+      <dl>
+        <dt>config</dt><dd id="sPath"></dd>
+        <dt>allowed</dt><dd id="sIds"></dd>
+        <dt>daemon</dt><dd id="sDaemon"></dd>
+      </dl>
+      <div class="row">
+        <button class="primary" id="test">Send a test message</button>
+        <button id="reconfigure">Reconfigure</button>
+      </div>
+      <p class="note" id="statusNote"></p>
+    </div>
+
+    <div class="card">
+      <h2>Register it with your agent</h2>
+      <pre id="cmd"></pre>
+      <div class="row">
+        <button id="copy">Copy</button>
+        <button class="quiet" id="quit">I'm done — close setup</button>
+      </div>
+      <p class="note" id="quitNote"></p>
+    </div>
+  </section>
+</main>
+
+<script>
+const key = new URLSearchParams(location.search).get("k") || "";
+const $ = (id) => document.getElementById(id);
+const note = (el, text, kind) => { el.textContent = text; el.className = "note " + (kind || ""); };
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-telepager-key": key },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await res.json().catch(() => ({ error: "the server said something unparseable" }));
+  if (!res.ok) throw new Error(data.error || "request failed");
+  return data;
+}
+
+let forceSetup = false;
+
+async function refresh() {
+  const s = await api("/api/state");
+  $("sub").textContent = "v" + s.version + " — pages you on telegram from a coding agent";
+  const showSetup = forceSetup || !s.configured;
+
+  $("setup").hidden = !showSetup;
+  $("status").hidden = showSetup;
+
+  if (s.problem) note($("saveNote"), s.problem, "bad");
+
+  $("sPath").textContent = s.config_path;
+  $("sIds").textContent = s.allowed_user_ids.join(", ") || "none";
+  $("sDaemon").innerHTML = s.daemon_running
+    ? '<span class="dot on"></span>running'
+    : '<span class="dot off"></span>not running (starts on its own)';
+  $("cmd").textContent = s.register_command;
+}
+
+$("check").onclick = async (e) => {
+  const btn = e.target;
+  btn.disabled = true;
+  note($("tokenNote"), "asking telegram…", "wait");
+  try {
+    const r = await api("/api/check", { token: $("token").value.trim() });
+    note($("tokenNote"), "that's " + r.bot + " — looks good", "ok");
+  } catch (err) {
+    note($("tokenNote"), err.message, "bad");
+  }
+  btn.disabled = false;
+};
+
+$("manualToggle").onclick = () => { $("manual").hidden = !$("manual").hidden; };
+
+$("detect").onclick = async (e) => {
+  const btn = e.target;
+  const token = $("token").value.trim();
+  if (!token) return note($("detectNote"), "paste the bot token first", "bad");
+
+  btn.disabled = true;
+  // telegram long-polls, so a couple of rounds covers the time it takes
+  // someone to switch apps and hit send
+  for (let round = 0; round < 4; round++) {
+    note($("detectNote"), "open your bot in telegram and send it anything… (listening)", "wait");
+    try {
+      const r = await api("/api/detect", { token });
+      if (r.found) {
+        $("manual").hidden = false;
+        $("ids").value = String(r.user.id);
+        note($("detectNote"), "got it — " + r.user.name + ", id " + r.user.id, "ok");
+        btn.disabled = false;
+        return;
+      }
+    } catch (err) {
+      note($("detectNote"), err.message, "bad");
+      btn.disabled = false;
+      return;
+    }
+  }
+  note($("detectNote"), "nothing came through. try again, or type your id in.", "bad");
+  btn.disabled = false;
+};
+
+$("save").onclick = async (e) => {
+  const btn = e.target;
+  const ids = $("ids").value.split(",").map((s) => s.trim()).filter(Boolean);
+  if (!ids.length) return note($("saveNote"), "no user id yet — detect one or type it in above", "bad");
+  if (ids.some((s) => !/^-?\d+$/.test(s))) return note($("saveNote"), "user ids are plain numbers", "bad");
+
+  btn.disabled = true;
+  note($("saveNote"), "saving…", "wait");
+  try {
+    const r = await api("/api/save", { token: $("token").value.trim(), user_ids: ids.map(Number) });
+    note($("saveNote"), "saved to " + r.config_path, "ok");
+    forceSetup = false;
+    await refresh();
+    note($("statusNote"), "all set. send yourself a test message to be sure.", "ok");
+  } catch (err) {
+    note($("saveNote"), err.message, "bad");
+  }
+  btn.disabled = false;
+};
+
+$("test").onclick = async (e) => {
+  const btn = e.target;
+  btn.disabled = true;
+  note($("statusNote"), "sending…", "wait");
+  try {
+    await api("/api/test");
+    note($("statusNote"), "sent — check telegram", "ok");
+  } catch (err) {
+    note($("statusNote"), err.message, "bad");
+  }
+  btn.disabled = false;
+};
+
+$("reconfigure").onclick = async () => { forceSetup = true; await refresh(); };
+
+$("copy").onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($("cmd").textContent);
+    note($("quitNote"), "copied", "ok");
+  } catch {
+    note($("quitNote"), "couldn't reach the clipboard — select it by hand", "bad");
+  }
+};
+
+$("quit").onclick = async () => {
+  try { await api("/api/quit"); } catch {}
+  note($("quitNote"), "setup closed. you can shut this tab.", "ok");
+};
+
+// the setup form is already on screen, so a failure here just needs saying
+refresh().catch((err) => { note($("saveNote"), err.message, "bad"); });
+</script>
+</body>
+</html>
