@@ -839,12 +839,17 @@ mod tests {
     #[test]
     fn the_key_source_never_reveals_the_key() {
         let master = MasterConfig {
+            provider: Provider::Anthropic,
             api_key: Some("sk-secret".into()),
             ..MasterConfig::default()
         };
         let source = master_key_source(&master).unwrap();
         assert_eq!(source, "the config file");
         assert!(!source.contains("sk-secret"));
+
+        // a cli backend has no key to reveal in the first place
+        let cli = MasterConfig::default();
+        assert_eq!(master_key_source(&cli).unwrap(), "the claude cli's own login");
     }
 
     #[tokio::test]

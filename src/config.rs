@@ -167,7 +167,9 @@ pub struct MasterConfig {
 impl Default for MasterConfig {
     fn default() -> Self {
         Self {
-            provider: Provider::Anthropic,
+            // the one that needs no api key, and that most people running a
+            // coding agent already have installed
+            provider: Provider::ClaudeCode,
             model: String::new(),
             api_key: None,
             api_key_env: None,
@@ -695,6 +697,32 @@ mod tests {
         assert_eq!(p, Provider::Gemini);
         let p: Provider = serde_json::from_str(r#""openai-compatible""#).unwrap();
         assert_eq!(p, Provider::Openai);
+    }
+
+    #[test]
+    fn the_default_master_needs_no_api_key() {
+        let m = MasterConfig::default();
+        assert_eq!(m.provider, Provider::ClaudeCode);
+        assert!(!m.provider.needs_key());
+        assert!(m.provider.is_cli());
+        assert_eq!(m.cli_command().as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn a_cli_master_is_usable_only_when_its_command_exists() {
+        let missing = MasterConfig {
+            provider: Provider::ClaudeCode,
+            command: Some("telepager-not-a-real-cli".into()),
+            ..MasterConfig::default()
+        };
+        assert!(!missing.is_usable());
+
+        let present = MasterConfig {
+            provider: Provider::ClaudeCode,
+            command: Some("sh".into()),
+            ..MasterConfig::default()
+        };
+        assert_eq!(present.is_usable(), crate::agents::which("sh").is_some());
     }
 
     #[test]
