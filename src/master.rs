@@ -37,11 +37,31 @@ impl Origin {
     fn is_telegram(self) -> bool {
         matches!(self, Origin::Telegram)
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Ui => "ui",
+            Origin::Telegram => "telegram",
+        }
+    }
+
+    /// Only an explicit "ui" is treated as local. Telegram is the gated
+    /// surface, so it's the safe thing to assume when the origin is missing
+    /// or malformed — the callers that are genuinely local always say so.
+    pub fn parse(s: &str) -> Origin {
+        match s {
+            "ui" => Origin::Ui,
+            _ => Origin::Telegram,
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct Conversation {
     pub history: Vec<Msg>,
+    /// A CLI backend keeps the real conversation itself; this is the id we
+    /// resume it by. `history` is then only what the console draws.
+    pub cli_session: Option<String>,
 }
 
 impl Conversation {
@@ -59,6 +79,8 @@ impl Conversation {
 
     pub fn clear(&mut self) {
         self.history.clear();
+        // a new conversation means a new cli session, not a resumed one
+        self.cli_session = None;
     }
 
     /// The conversation as the UI draws it.
@@ -88,7 +110,7 @@ impl Conversation {
     }
 }
 
-fn system_prompt(extra: Option<&str>) -> String {
+pub(crate) fn system_prompt(extra: Option<&str>) -> String {
     let mut prompt = String::from(
         "You are the master agent inside telepager. The person you're talking to is \
          reaching you from their phone over Telegram, or from a small web console on \
@@ -122,7 +144,7 @@ fn system_prompt(extra: Option<&str>) -> String {
     prompt
 }
 
-fn tools() -> Vec<ToolDef> {
+pub(crate) fn tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "list_sessions".into(),
@@ -206,6 +228,13 @@ fn tools() -> Vec<ToolDef> {
 /// Handle one message to the master agent and return what to say back.
 pub async fn reply(core: &Arc<Core>, text: &str, origin: Origin) -> Result<String> {
     let cfg = core.config().await.context("telepager isn't set up yet")?;
+
+    // a cli backend (claude code, opencode) runs its own agent loop and reaches
+    // our tools over mcp, so there's nothing for the http loop to do here
+    if cfg.master.provider.is_cli() {
+        return crate::cli_master::reply(core, &cfg, text, origin).await;
+    }
+
     if !cfg.master.is_usable() {
         anyhow::bail!(
             "the master agent has no api key. set {} in your environment, or pick a \
@@ -277,7 +306,7 @@ pub async fn reply(core: &Arc<Core>, text: &str, origin: Origin) -> Result<Strin
 
 /// Run one tool call and describe the outcome in a line or two of plain text,
 /// which is what models act on most reliably.
-async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) -> String {
+pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) -> String {
     let args = &call.args;
     match call.name.as_str() {
         "list_sessions" => {
@@ -462,6 +491,18 @@ mod tests {
         c.push(Msg::User("hi".into()));
         c.clear();
         assert!(c.transcript().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_origin_falls_back_to_the_gated_one() {
+        assert_eq!(Origin::parse("ui"), Origin::Ui);
+        assert_eq!(Origin::parse("telegram"), Origin::Telegram);
+        // anything else is assumed remote rather than trusted
+        assert_eq!(Origin::parse(""), Origin::Telegram);
+        assert_eq!(Origin::parse("nonsense"), Origin::Telegram);
+        // and it round trips
+        assert_eq!(Origin::parse(Origin::Ui.as_str()), Origin::Ui);
+        assert_eq!(Origin::parse(Origin::Telegram.as_str()), Origin::Telegram);
     }
 
     #[tokio::test]

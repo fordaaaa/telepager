@@ -204,6 +204,9 @@ async fn route(core: &Arc<Core>, path: &str, body: Value) -> Result<Value> {
         }
         "/api/dirs" => save_dirs(core, &body).await,
 
+        // the bridge a cli-backed master agent calls its tools through
+        "/api/tool" => run_tool(core, &body).await,
+
         other => anyhow::bail!("no such endpoint {other}"),
     }
 }
@@ -254,6 +257,9 @@ async fn state(core: &Arc<Core>) -> Result<Value> {
                 "default_model": p.default_model(),
                 "key_env": p.default_key_env(),
                 "needs_key": p.needs_key(),
+                "is_cli": p.is_cli(),
+                "blurb": p.blurb(),
+                "installed": p.cli_command().map(|c| agents::which(c).is_some()),
                 "has_key_in_env": std::env::var(p.default_key_env()).map(|v| !v.trim().is_empty()).unwrap_or(false)
                     || p.fallback_key_envs().iter().any(|n| std::env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false)),
             })).collect::<Vec<_>>(),
@@ -282,6 +288,12 @@ async fn sessions_with_liveness(core: &Arc<Core>) -> Vec<Value> {
 /// Where the master agent's key is coming from, so the UI can say so without
 /// ever showing the key itself.
 fn master_key_source(master: &MasterConfig) -> Option<String> {
+    if master.provider.is_cli() {
+        return Some(format!(
+            "the {} cli's own login",
+            master.cli_command().unwrap_or_default()
+        ));
+    }
     if master.api_key.as_deref().map(str::trim).is_some_and(|k| !k.is_empty()) {
         return Some("the config file".into());
     }
@@ -402,20 +414,45 @@ async fn save_master(core: &Arc<Core>, body: &Value) -> Result<Value> {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32)
             .unwrap_or(existing.max_tokens),
+        command: optional("command").or(existing.command),
+        args: existing.args,
     };
 
+    let switched = master.provider != existing.provider;
     config::save_master(core.config_path.as_deref(), &master)?;
     core.reload_config().await;
 
+    if switched {
+        // a cli session id means nothing to another backend, and tool results
+        // left behind by one would confuse the next
+        core.master.lock().await.clear();
+    }
+
     let ready = master.is_usable();
+    let problem = (!ready).then(|| {
+        if provider.is_cli() {
+            format!(
+                "the {} cli isn't installed, or isn't on telepager's PATH",
+                master.cli_command().unwrap_or_default()
+            )
+        } else {
+            format!(
+                "no api key yet — set {} in the environment telepager runs in, or paste one above",
+                provider.default_key_env()
+            )
+        }
+    });
+
     Ok(json!({
         "ok": true,
         "ready": ready,
-        "model": master.model_or_default(),
-        "problem": (!ready).then(|| format!(
-            "no api key yet — set {} in the environment telepager runs in, or paste one above",
-            provider.default_key_env()
-        )),
+        "switched": switched,
+        "model": if provider.is_cli() && master.model.trim().is_empty() {
+            format!("{}'s default model", provider.as_str())
+        } else {
+            master.model_or_default()
+        },
+        "problem": problem,
     }))
 }
 
@@ -435,6 +472,40 @@ async fn spawn(core: &Arc<Core>, body: &Value) -> Result<Value> {
     let task = str_field(body, "task")?;
     let id = core.spawn_agent(agent, dir, task, false).await?;
     Ok(json!({ "session": id }))
+}
+
+/// Run one master-agent tool and hand back its text.
+///
+/// This is how a CLI-backed master agent (Claude Code, opencode) reaches
+/// telepager: `telepager master-mcp` exposes these as MCP tools and proxies
+/// each call here, so there is still only one implementation of them.
+async fn run_tool(core: &Arc<Core>, body: &Value) -> Result<Value> {
+    let name = str_field(body, "name")?.to_string();
+    let args = body.get("args").cloned().unwrap_or_else(|| json!({}));
+    // a caller that doesn't say gets the gated treatment, not the trusted one
+    let origin = Origin::parse(body.get("origin").and_then(|v| v.as_str()).unwrap_or_default());
+
+    let call = crate::llm::ToolCall { id: String::new(), name: name.clone(), args };
+    let result = master::run_tool(core, &call, origin).await;
+
+    core.master.lock().await.push(crate::llm::Msg::ToolResult {
+        id: String::new(),
+        name: name.clone(),
+        content: result.clone(),
+    });
+
+    // so the console shows what a cli master is doing, the same way it shows
+    // the http one's tool calls
+    core.record(
+        None,
+        crate::session::EventKind::Chat {
+            role: "tool".into(),
+            text: format!("{name} → {}", result.lines().next().unwrap_or_default()),
+        },
+    )
+    .await;
+
+    Ok(json!({ "result": result }))
 }
 
 async fn save_dirs(core: &Arc<Core>, body: &Value) -> Result<Value> {
@@ -744,7 +815,12 @@ mod tests {
         assert_eq!(s["configured"], false);
         // the agent picker is still populated, so the console isn't empty
         assert!(s["agents"].as_array().unwrap().len() > 3);
-        assert_eq!(s["master"]["providers"].as_array().unwrap().len(), 4);
+        let providers = s["master"]["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), Provider::all().len());
+        // the cli backends are offered first, since they need no api key
+        assert_eq!(providers[0]["id"], "claude-code");
+        assert_eq!(providers[0]["is_cli"], true);
+        assert_eq!(providers[0]["needs_key"], false);
         assert!(s["sessions"].as_array().unwrap().is_empty());
     }
 
@@ -790,6 +866,24 @@ mod tests {
         let info = start(core(), false, taken).await.unwrap();
         assert_ne!(info.port, taken, "should have moved off the busy port");
         assert_ne!(info.port, 0);
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_lands_in_the_transcript() {
+        let c = core();
+        run_tool(&c, &json!({ "name": "list_sessions", "args": {} })).await.unwrap();
+
+        let transcript = c.master.lock().await.transcript();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0]["role"], "tool");
+        assert_eq!(transcript[0]["name"], "list_sessions");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_tool_is_reported_rather_than_failing_the_request() {
+        let c = core();
+        let out = run_tool(&c, &json!({ "name": "nonsense", "args": {} })).await.unwrap();
+        assert!(out["result"].as_str().unwrap().contains("no tool called"));
     }
 
     #[tokio::test]

@@ -17,9 +17,16 @@ struct RawConfig {
     ui_port: Option<u16>,
 }
 
-/// Which model backend the master agent talks to. The wire formats differ
-/// enough to be worth naming, but everything OpenAI-shaped (openrouter, groq,
-/// together, lm studio, vllm, ollama's /v1) is one variant with a base_url.
+/// Which backend the master agent runs on.
+///
+/// Most are HTTP APIs, where the wire formats differ enough to be worth naming
+/// — though everything OpenAI-shaped (openrouter, groq, together, lm studio,
+/// vllm, ollama's /v1) is one variant with a base_url.
+///
+/// The last two are different in kind: they drive a coding CLI that is already
+/// logged in, so they need no API key at all. `claude-code` uses your Claude
+/// Code subscription, `opencode` whatever opencode is configured with —
+/// including its free models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Provider {
@@ -29,6 +36,10 @@ pub enum Provider {
     #[serde(alias = "google")]
     Gemini,
     Ollama,
+    #[serde(alias = "claude", alias = "claudecode")]
+    ClaudeCode,
+    #[serde(alias = "opencode-cli")]
+    Opencode,
 }
 
 impl Provider {
@@ -39,6 +50,8 @@ impl Provider {
             Provider::Openai => "OPENAI_API_KEY",
             Provider::Gemini => "GEMINI_API_KEY",
             Provider::Ollama => "OLLAMA_API_KEY",
+            // these log in through their own CLI, not an env var
+            Provider::ClaudeCode | Provider::Opencode => "",
         }
     }
 
@@ -50,7 +63,7 @@ impl Provider {
             Provider::Anthropic => &["CLAUDE_API_KEY"],
             Provider::Openai => &["OPENROUTER_API_KEY", "GROQ_API_KEY", "TOGETHER_API_KEY"],
             Provider::Gemini => &["GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"],
-            Provider::Ollama => &[],
+            Provider::Ollama | Provider::ClaudeCode | Provider::Opencode => &[],
         }
     }
 
@@ -60,6 +73,7 @@ impl Provider {
             Provider::Openai => "https://api.openai.com/v1",
             Provider::Gemini => "https://generativelanguage.googleapis.com/v1beta",
             Provider::Ollama => "http://127.0.0.1:11434/v1",
+            Provider::ClaudeCode | Provider::Opencode => "",
         }
     }
 
@@ -69,12 +83,29 @@ impl Provider {
             Provider::Openai => "gpt-4o",
             Provider::Gemini => "gemini-2.0-flash",
             Provider::Ollama => "llama3.1",
+            // empty means "whatever the cli is already set to"
+            Provider::ClaudeCode | Provider::Opencode => "",
         }
     }
 
-    /// Ollama runs on your machine, so a missing key is normal there.
+    /// Whether this backend is a coding CLI rather than an HTTP API.
+    pub fn is_cli(self) -> bool {
+        matches!(self, Provider::ClaudeCode | Provider::Opencode)
+    }
+
+    /// The command a CLI backend runs.
+    pub fn cli_command(self) -> Option<&'static str> {
+        match self {
+            Provider::ClaudeCode => Some("claude"),
+            Provider::Opencode => Some("opencode"),
+            _ => None,
+        }
+    }
+
+    /// Ollama runs on your machine and the CLI backends carry their own login,
+    /// so a missing key is normal for all three.
     pub fn needs_key(self) -> bool {
-        !matches!(self, Provider::Ollama)
+        !matches!(self, Provider::Ollama | Provider::ClaudeCode | Provider::Opencode)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -83,11 +114,32 @@ impl Provider {
             Provider::Openai => "openai",
             Provider::Gemini => "gemini",
             Provider::Ollama => "ollama",
+            Provider::ClaudeCode => "claude-code",
+            Provider::Opencode => "opencode",
+        }
+    }
+
+    /// How the console describes this backend in the picker.
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "Anthropic API",
+            Provider::Openai => "OpenAI, or anything OpenAI-shaped",
+            Provider::Gemini => "Google Gemini API",
+            Provider::Ollama => "Ollama, running locally",
+            Provider::ClaudeCode => "your Claude Code login — no API key",
+            Provider::Opencode => "opencode's models, free ones included — no API key",
         }
     }
 
     pub fn all() -> &'static [Provider] {
-        &[Provider::Anthropic, Provider::Openai, Provider::Gemini, Provider::Ollama]
+        &[
+            Provider::ClaudeCode,
+            Provider::Opencode,
+            Provider::Anthropic,
+            Provider::Openai,
+            Provider::Gemini,
+            Provider::Ollama,
+        ]
     }
 }
 
@@ -105,6 +157,11 @@ pub struct MasterConfig {
     /// personal instructions can't accidentally delete the tool contract.
     pub system: Option<String>,
     pub max_tokens: u32,
+    /// Override the binary a CLI backend runs, if it isn't on PATH under the
+    /// usual name.
+    pub command: Option<String>,
+    /// Extra arguments appended to a CLI backend's command line.
+    pub args: Vec<String>,
 }
 
 impl Default for MasterConfig {
@@ -117,6 +174,8 @@ impl Default for MasterConfig {
             base_url: None,
             system: None,
             max_tokens: 4096,
+            command: None,
+            args: Vec::new(),
         }
     }
 }
@@ -155,7 +214,23 @@ impl MasterConfig {
         })
     }
 
+    /// The command a CLI backend runs, honouring an override in the config.
+    pub fn cli_command(&self) -> Option<String> {
+        let explicit = self.command.as_deref().map(str::trim).filter(|c| !c.is_empty());
+        match (explicit, self.provider.cli_command()) {
+            (Some(c), _) => Some(c.to_string()),
+            (None, Some(c)) => Some(c.to_string()),
+            (None, None) => None,
+        }
+    }
+
     pub fn is_usable(&self) -> bool {
+        if self.provider.is_cli() {
+            // logged in is the cli's problem; installed is ours
+            return self
+                .cli_command()
+                .is_some_and(|c| crate::agents::which(&c).is_some());
+        }
         !self.provider.needs_key() || self.resolve_key().is_some()
     }
 }

@@ -65,6 +65,7 @@
   label { display: block; font-weight: 500; margin-bottom: 6px; font-size: 14px; }
   .hint { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
   .hint a { color: var(--accent); }
+  .hint.bad { color: var(--bad); }
   .field { margin-bottom: 14px; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .grow { flex: 1; min-width: 0; }
@@ -354,12 +355,12 @@
       <label for="model">Model</label>
       <input type="text" class="mono" id="model" placeholder="leave blank for the default">
     </div>
-    <div class="field">
+    <div class="field" id="fieldKey">
       <label for="apiKey">API key</label>
       <input type="text" class="mono" id="apiKey" placeholder="leave blank to keep using the environment">
       <p class="hint" id="keyHint"></p>
     </div>
-    <div class="field">
+    <div class="field" id="fieldBaseUrl">
       <label for="baseUrl">Base URL <span class="muted">(optional)</span></label>
       <input type="text" class="mono" id="baseUrl" placeholder="e.g. https://openrouter.ai/api/v1">
     </div>
@@ -809,15 +810,30 @@ $("openSettings").onclick = () => {
   const sel = $("provider");
   sel.innerHTML = (m.providers || []).map((p) =>
     '<option value="' + p.id + '"' + (p.id === m.provider ? " selected" : "") + ">" +
-    p.id + "</option>").join("");
+    p.id + " — " + escapeHtml(p.blurb) + "</option>").join("");
 
   const describe = () => {
     const p = (m.providers || []).find((x) => x.id === sel.value);
     if (!p) return;
-    $("providerHint").textContent = p.needs_key
-      ? (p.has_key_in_env ? p.key_env + " is set in the environment." : "Needs " + p.key_env + ", or a key below.")
-      : "Runs locally, no key needed.";
-    $("model").placeholder = p.default_model;
+
+    /* a cli backend carries its own login, so the key and url fields are noise */
+    const cli = !!p.is_cli;
+    $("fieldKey").style.display = cli ? "none" : "";
+    $("fieldBaseUrl").style.display = cli ? "none" : "";
+
+    if (cli) {
+      $("providerHint").textContent = p.installed
+        ? "Uses the " + p.id + " CLI you're already logged into. No API key needed."
+        : "The " + p.id + " CLI isn't installed on this machine — install it, or pick another.";
+      $("providerHint").className = "hint" + (p.installed ? "" : " bad");
+      $("model").placeholder = "leave blank for whatever that CLI is set to";
+    } else {
+      $("providerHint").textContent = p.needs_key
+        ? (p.has_key_in_env ? p.key_env + " is set in the environment." : "Needs " + p.key_env + ", or a key below.")
+        : "Runs locally, no key needed.";
+      $("providerHint").className = "hint";
+      $("model").placeholder = p.default_model;
+    }
   };
   sel.onchange = describe;
   describe();
