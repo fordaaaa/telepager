@@ -34,7 +34,7 @@ pub async fn serve_all(core: Arc<Core>, open_browser: bool) -> Result<()> {
     let token = ipc::new_token();
 
     // the console comes up first so its url can go in the endpoint file
-    let ui = crate::web::start(core.clone(), open_browser).await?;
+    let ui = crate::web::start(core.clone(), open_browser, 0).await?;
     core.set_ui(ui.clone()).await;
 
     ipc::write_endpoint(&Endpoint {

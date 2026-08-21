@@ -29,8 +29,14 @@ const MAX_BODY: usize = 256 * 1024;
 const SNAPSHOT_EVENTS: usize = 400;
 
 /// Bind the console and start serving. Returns where it landed.
-pub async fn start(core: Arc<Core>, open_browser: bool) -> Result<UiInfo> {
-    let port = core.config().await.map(|c| c.ui_port).unwrap_or(0);
+///
+/// `port_override` is `--port`; 0 means "use the configured one, or any free
+/// port". A port that's taken never stops the app coming up.
+pub async fn start(core: Arc<Core>, open_browser: bool, port_override: u16) -> Result<UiInfo> {
+    let port = match port_override {
+        0 => core.config().await.map(|c| c.ui_port).unwrap_or(0),
+        explicit => explicit,
+    };
 
     // a configured port that's taken shouldn't stop the app coming up
     let listener = match TcpListener::bind(("127.0.0.1", port)).await {
@@ -91,12 +97,7 @@ pub fn run_standalone(config: Option<std::path::PathBuf>, port: u16, open: bool)
 
     rt.block_on(async move {
         let core = Core::new(config);
-        if port != 0 {
-            if let Some(mut cfg) = core.config().await {
-                cfg.ui_port = port;
-            }
-        }
-        let info = start(core.clone(), open).await?;
+        let info = start(core.clone(), open, port).await?;
         core.set_ui(info.clone()).await;
 
         println!("telepager console:");
@@ -768,6 +769,27 @@ mod tests {
         let source = master_key_source(&master).unwrap();
         assert_eq!(source, "the config file");
         assert!(!source.contains("sk-secret"));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_port_is_honoured() {
+        // 0 would mean "pick anything", which wouldn't prove the override
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let free = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let info = start(core(), false, free).await.unwrap();
+        assert_eq!(info.port, free);
+    }
+
+    #[tokio::test]
+    async fn a_taken_port_falls_back_instead_of_failing() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = held.local_addr().unwrap().port();
+
+        let info = start(core(), false, taken).await.unwrap();
+        assert_ne!(info.port, taken, "should have moved off the busy port");
+        assert_ne!(info.port, 0);
     }
 
     #[tokio::test]
