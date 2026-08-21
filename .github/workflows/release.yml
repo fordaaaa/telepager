@@ -104,6 +104,12 @@ jobs:
           files: |
             dist/telepager-*
 
+      # the npm job needs the binaries to build the per-platform packages
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
   publish-npm:
     name: publish to npm
     needs: release
@@ -119,17 +125,47 @@ jobs:
       # trusted publishing needs a recent npm
       - run: npm install -g npm@latest
 
-      - name: Verify package version matches the tag
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Verify versions match the tag
         working-directory: npm
+        shell: bash
         run: |
-          PKG_VERSION="$(node -p "require('./package.json').version")"
           TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
           if [[ "$PKG_VERSION" != "$TAG_VERSION" ]]; then
             echo "npm/package.json version ($PKG_VERSION) != tag ($TAG_VERSION)" >&2
             exit 1
           fi
+          # the optional dependencies pin an exact version, so a stale one here
+          # would install the previous release's binary alongside new js
+          BAD="$(node -p "
+            const d = require('./package.json').optionalDependencies || {};
+            Object.entries(d).filter(([, v]) => v !== '$TAG_VERSION')
+              .map(([k, v]) => k + '@' + v).join(' ')
+          ")"
+          if [[ -n "$BAD" ]]; then
+            echo "optionalDependencies not pinned to $TAG_VERSION: $BAD" >&2
+            exit 1
+          fi
 
-      - name: Publish
+      - name: Build the per-platform packages
+        run: node npm/scripts/build-platform-packages.js dist npm/platforms
+
+      # these go first: the main package's optionalDependencies point at them,
+      # so publishing it before they exist would break installs in between
+      - name: Publish the platform packages
+        working-directory: npm/platforms
+        run: |
+          for dir in */; do
+            echo "publishing ${dir%/}"
+            (cd "$dir" && npm publish --access public --provenance)
+          done
+
+      - name: Publish telepager
         working-directory: npm
         run: |
           cp ../README.md .

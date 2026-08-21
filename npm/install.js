@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 "use strict";
 
+// telepager ships as a prebuilt binary. The normal path is an optional
+// dependency per platform, which npm picks the right one of and which works
+// with --ignore-scripts. This script is the fallback for when that didn't
+// happen: it downloads the binary from GitHub Releases and checksums it.
+//
+// It is deliberately impossible for this to fail an install. If nothing works
+// here, `telepager` says so clearly the first time it's run.
+
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
@@ -10,9 +18,10 @@ const pkg = require("./package.json");
 const VERSION = pkg.version;
 const REPO = "fordaaaa/telepager";
 
-const BIN_DIR = path.join(__dirname, "bin");
 const IS_WINDOWS = process.platform === "win32";
-const OUT_PATH = path.join(BIN_DIR, IS_WINDOWS ? "telepager.exe" : "telepager");
+const BIN_NAME = IS_WINDOWS ? "telepager.exe" : "telepager";
+const BIN_DIR = path.join(__dirname, "bin");
+const FALLBACK_PATH = path.join(BIN_DIR, BIN_NAME);
 
 const TARGETS = {
   "darwin arm64": "aarch64-apple-darwin",
@@ -22,22 +31,42 @@ const TARGETS = {
   "win32 x64": "x86_64-pc-windows-msvc",
 };
 
-function fail(message) {
-  console.error("\n[telepager] " + message + "\n");
-  process.exit(1);
+const MISSING_MESSAGE =
+  "[telepager] no binary for this platform (" +
+  process.platform +
+  " " +
+  process.arch +
+  ").\n" +
+  "  Supported: " +
+  Object.keys(TARGETS).join(", ") +
+  "\n" +
+  "  If yours is on that list, the download may have been blocked. Try:\n" +
+  "    npm rebuild telepager\n" +
+  "  Or build from source with `cargo build --release` and put the binary on your PATH.";
+
+/** The per-platform package npm should have installed for this machine. */
+function platformPackage() {
+  return "telepager-" + process.platform + "-" + process.arch;
 }
 
-function assetName() {
-  const key = `${process.platform} ${process.arch}`;
-  const triple = TARGETS[key];
-  if (!triple) {
-    fail(
-      `Unsupported platform/arch: ${key}. ` +
-        `Supported: ${Object.keys(TARGETS).join(", ")}. ` +
-        `Build from source instead with \`cargo build --release\`.`
-    );
+/**
+ * Where the binary actually is, or null. Checks the optional dependency
+ * first, then anything a previous fallback download left behind.
+ */
+function resolveBinary() {
+  const override = process.env.TELEPAGER_BINARY;
+  if (override && fs.existsSync(override)) return override;
+
+  try {
+    const manifest = require.resolve(platformPackage() + "/package.json");
+    const candidate = path.join(path.dirname(manifest), "bin", BIN_NAME);
+    if (fs.existsSync(candidate)) return candidate;
+  } catch (_) {
+    // the optional dependency isn't installed, which is what the fallback is for
   }
-  return `telepager-${triple}` + (IS_WINDOWS ? ".exe" : "");
+
+  if (fs.existsSync(FALLBACK_PATH)) return FALLBACK_PATH;
+  return null;
 }
 
 function get(url, redirects) {
@@ -51,13 +80,9 @@ function get(url, redirects) {
           res.resume();
           return resolve(get(res.headers.location, redirects + 1));
         }
-        if (status === 404) {
-          res.resume();
-          return reject(Object.assign(new Error("not found (404)"), { code: 404 }));
-        }
         if (status !== 200) {
           res.resume();
-          return reject(new Error(`unexpected HTTP status ${status}`));
+          return reject(new Error("unexpected HTTP status " + status));
         }
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
@@ -68,47 +93,44 @@ function get(url, redirects) {
   });
 }
 
-async function main() {
-  fs.mkdirSync(BIN_DIR, { recursive: true });
+async function download() {
+  const triple = TARGETS[process.platform + " " + process.arch];
+  if (!triple) throw new Error("unsupported platform");
 
-  // for working on telepager itself, before any release exists
-  const override = process.env.TELEPAGER_BINARY;
-  if (override) {
-    if (!fs.existsSync(override)) fail(`TELEPAGER_BINARY set but nothing at ${override}`);
-    fs.copyFileSync(override, OUT_PATH);
-    if (!IS_WINDOWS) fs.chmodSync(OUT_PATH, 0o755);
-    console.log(`[telepager] using local binary from ${override}`);
-    return;
-  }
+  const name = "telepager-" + triple + (IS_WINDOWS ? ".exe" : "");
+  const base = "https://github.com/" + REPO + "/releases/download/v" + VERSION;
 
-  const name = assetName();
-  const base = `https://github.com/${REPO}/releases/download/v${VERSION}`;
-  console.log(`[telepager] downloading ${name}`);
-
-  let binary, expected;
-  try {
-    binary = await get(`${base}/${name}`);
-    expected = (await get(`${base}/${name}.sha256`)).toString("utf8").trim().split(/\s+/)[0];
-  } catch (err) {
-    if (err && err.code === 404) {
-      fail(
-        `No prebuilt binary for v${VERSION} on this platform.\n` +
-          `  The release may not be published yet: https://github.com/${REPO}/releases\n` +
-          `  You can build from source with \`cargo build --release\` and set\n` +
-          `  TELEPAGER_BINARY to the resulting path.`
-      );
-    }
-    fail(`download failed: ${err.message}`);
-  }
+  const binary = await get(base + "/" + name);
+  const expected = (await get(base + "/" + name + ".sha256"))
+    .toString("utf8")
+    .trim()
+    .split(/\s+/)[0];
 
   const actual = crypto.createHash("sha256").update(binary).digest("hex");
   if (actual !== expected) {
-    fail(`checksum mismatch, refusing to install\n  expected ${expected}\n  got      ${actual}`);
+    throw new Error("checksum mismatch, refusing to install");
   }
 
-  fs.writeFileSync(OUT_PATH, binary);
-  if (!IS_WINDOWS) fs.chmodSync(OUT_PATH, 0o755);
-  console.log(`[telepager] installed to ${OUT_PATH}`);
+  fs.mkdirSync(BIN_DIR, { recursive: true });
+  fs.writeFileSync(FALLBACK_PATH, binary);
+  if (!IS_WINDOWS) fs.chmodSync(FALLBACK_PATH, 0o755);
 }
 
-main().catch((err) => fail(err.message));
+async function main() {
+  if (resolveBinary()) return; // the optional dependency did its job
+
+  try {
+    await download();
+    console.log("[telepager] installed the binary for " + process.platform + " " + process.arch);
+  } catch (err) {
+    // never fail the install over this — the CLI explains itself when run
+    console.warn("[telepager] could not fetch a binary now (" + err.message + ").");
+    console.warn("[telepager] run `npm rebuild telepager` once you're online.");
+  }
+}
+
+module.exports = { resolveBinary, platformPackage, MISSING_MESSAGE };
+
+if (require.main === module) {
+  main();
+}

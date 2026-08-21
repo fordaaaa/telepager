@@ -1,15 +1,16 @@
 {
   "name": "telepager",
   "version": "0.1.1",
-  "description": "An MCP server that pages you on Telegram — your agent can message you, show progress, and ask you questions with buttons",
+  "description": "Run and watch coding agents from your phone. A Telegram pager and console for Claude Code, Codex, Gemini and friends.",
   "keywords": [
     "mcp",
     "telegram",
     "claude",
-    "cursor",
-    "bot",
+    "codex",
+    "gemini",
+    "agent",
     "notifications",
-    "agent"
+    "orchestration"
   ],
   "license": "AGPL-3.0-only",
   "author": "fordaaaa",
@@ -29,15 +30,13 @@
     "bin/telepager.js",
     "README.md"
   ],
-  "os": [
-    "darwin",
-    "linux",
-    "win32"
-  ],
-  "cpu": [
-    "x64",
-    "arm64"
-  ],
+  "optionalDependencies": {
+    "telepager-darwin-arm64": "0.1.1",
+    "telepager-darwin-x64": "0.1.1",
+    "telepager-linux-arm64": "0.1.1",
+    "telepager-linux-x64": "0.1.1",
+    "telepager-win32-x64": "0.1.1"
+  },
   "engines": {
     "node": ">=16"
   }

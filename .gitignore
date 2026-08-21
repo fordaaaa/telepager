@@ -22,3 +22,4 @@ npm/bin/telepager.exe
 npm/README.md
 *.tgz
 .npmrc
+npm/platforms/
