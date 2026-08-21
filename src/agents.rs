@@ -58,12 +58,18 @@ pub fn which(command: &str) -> Option<PathBuf> {
 
     let path = std::env::var_os("PATH")?;
     let extensions: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into())
-            .split(';')
-            .filter(|e| !e.is_empty())
-            .map(|e| e.to_lowercase())
-            .collect()
+        // the bare name comes first: a command configured as `claude.cmd`
+        // already carries its extension and would never be found if we only
+        // ever appended one
+        let mut all = vec![String::new()];
+        all.extend(
+            std::env::var("PATHEXT")
+                .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into())
+                .split(';')
+                .filter(|e| !e.is_empty())
+                .map(|e| e.to_lowercase()),
+        );
+        all
     } else {
         vec![String::new()]
     };
@@ -303,6 +309,33 @@ mod tests {
         let args = render_args(&["{task}".into()], r#"say "hi"; rm -rf /"#, Path::new("/tmp"));
         // no shell is involved, so this is one inert argument
         assert_eq!(args, vec![r#"say "hi"; rm -rf /"#]);
+    }
+
+    #[test]
+    fn a_name_that_already_has_its_extension_is_tried_as_given() {
+        // regression: on windows the candidate list was built purely by
+        // appending PATHEXT entries, so an exact name was never probed
+        let dir = std::env::temp_dir().join(format!("telepager-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("agent.cmd");
+        std::fs::write(&file, "echo hi").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // an explicit path always worked; this is the PATH-lookup branch
+        let previous = std::env::var_os("PATH");
+        std::env::set_var("PATH", &dir);
+        let found = which("agent.cmd");
+        match previous {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert_eq!(found.as_deref(), Some(file.as_path()));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
