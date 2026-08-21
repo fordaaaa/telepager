@@ -4,6 +4,7 @@ mod daemon;
 mod ipc;
 mod llm;
 mod mcp;
+mod session;
 mod status;
 mod telegram;
 mod web;
