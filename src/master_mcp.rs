@@ -122,7 +122,11 @@ pub fn run() -> Result<()> {
         http: reqwest::Client::new(),
         base: format!("http://127.0.0.1:{port}"),
         key,
-        origin: std::env::var(ORIGIN_ENV).unwrap_or_else(|_| "ui".into()),
+        // an absent origin means gated, matching Origin::parse. defaulting
+        // to the local surface here would quietly exempt a telegram-driven
+        // agent from allowed_dirs whenever the env var failed to arrive.
+        origin: std::env::var(ORIGIN_ENV)
+            .unwrap_or_else(|_| crate::master::Origin::Telegram.as_str().to_string()),
     };
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -136,6 +140,15 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_origin_is_the_gated_one() {
+        // the bridge and the parser have to agree, or the fallback silently
+        // becomes the permissive surface
+        let fallback = crate::master::Origin::Telegram.as_str().to_string();
+        assert_eq!(crate::master::Origin::parse(&fallback), crate::master::Origin::Telegram);
+        assert_eq!(crate::master::Origin::parse(""), crate::master::Origin::Telegram);
+    }
 
     #[test]
     fn every_master_tool_survives_the_conversion_to_mcp() {
