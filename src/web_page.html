@@ -478,8 +478,8 @@ function renderSessions() {
   box.innerHTML = list.map((s) => {
     const on = s.id === selected ? " on" : "";
     const meta = [s.agent || s.kind, s.detail || s.task || s.cwd || ""].filter(Boolean).join(" · ");
-    return '<div class="session' + on + '" data-id="' + s.id + '">' +
-      '<div class="name"><span class="dot ' + s.state + '"></span>' + escapeHtml(s.label) + '</div>' +
+    return '<div class="session' + on + '" data-id="' + escapeHtml(s.id) + '">' +
+      '<div class="name"><span class="dot ' + escapeHtml(s.state) + '"></span>' + escapeHtml(s.label) + '</div>' +
       '<div class="meta">' + escapeHtml(meta) + "</div></div>";
   }).join("");
 
@@ -538,7 +538,7 @@ function renderChat() {
         body = '<span class="muted">' + escapeHtml(t.calls.map((c) => c.name).join(", ")) + "…</span>";
       }
       if (t.role === "tool") body = escapeHtml((t.name ? t.name + ": " : "") + (t.text || ""));
-      return '<div class="turn ' + t.role + '"><div class="who">' + who +
+      return '<div class="turn ' + escapeHtml(t.role) + '"><div class="who">' + escapeHtml(who) +
         '</div><div class="what">' + body + "</div></div>";
     }).join("");
   }
@@ -768,8 +768,8 @@ $("openSpawn").onclick = () => {
   const sel = $("spawnAgent");
   const agents = state.agents || [];
   sel.innerHTML = agents.map((a) =>
-    '<option value="' + a.name + '"' + (a.installed ? "" : " disabled") + ">" +
-    a.name + (a.installed ? "" : " (not installed)") + "</option>").join("");
+    '<option value="' + escapeHtml(a.name) + '"' + (a.installed ? "" : " disabled") + ">" +
+    escapeHtml(a.name) + (a.installed ? "" : " (not installed)") + "</option>").join("");
 
   const describe = () => {
     const a = agents.find((x) => x.name === sel.value);
@@ -809,8 +809,8 @@ $("openSettings").onclick = () => {
   const m = state.master || {};
   const sel = $("provider");
   sel.innerHTML = (m.providers || []).map((p) =>
-    '<option value="' + p.id + '"' + (p.id === m.provider ? " selected" : "") + ">" +
-    p.id + " — " + escapeHtml(p.blurb) + "</option>").join("");
+    '<option value="' + escapeHtml(p.id) + '"' + (p.id === m.provider ? " selected" : "") + ">" +
+    escapeHtml(p.id) + " — " + escapeHtml(p.blurb) + "</option>").join("");
 
   const describe = () => {
     const p = (m.providers || []).find((x) => x.id === sel.value);
