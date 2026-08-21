@@ -311,6 +311,11 @@ fn encode_openai(
         match msg {
             Msg::User(text) => messages.push(json!({ "role": "user", "content": text })),
             Msg::Assistant { text, calls } => {
+                // openai requires content unless there are tool calls, so an
+                // entirely empty turn would make the request invalid
+                if text.trim().is_empty() && calls.is_empty() {
+                    continue;
+                }
                 let mut m = json!({ "role": "assistant" });
                 // content has to be present even when it's only tool calls
                 m["content"] = if text.trim().is_empty() { Value::Null } else { json!(text) };
@@ -610,6 +615,20 @@ mod tests {
         // the empty assistant turn is dropped, the two results share a message
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn openai_drops_an_entirely_empty_assistant_turn() {
+        let h = vec![
+            Msg::User("hi".into()),
+            // what a provider returns on a length cap or a filtered response
+            Msg::Assistant { text: String::new(), calls: vec![] },
+            Msg::User("still there?".into()),
+        ];
+        let body = encode_openai("m", 100, "", &h, &[]);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|m| m["role"] != "assistant"));
     }
 
     #[test]
