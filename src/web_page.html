@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>telepager setup</title>
+<title>telepager</title>
 <style>
   :root {
     --bg: #f6f7f9;
@@ -15,6 +15,7 @@
     --accent-ink: #ffffff;
     --ok: #1a7f45;
     --bad: #b3261e;
+    --warn: #b45309;
     --code-bg: #f0f2f5;
   }
   @media (prefers-color-scheme: dark) {
@@ -28,274 +29,847 @@
       --accent-ink: #06121a;
       --ok: #4ade80;
       --bad: #f87171;
+      --warn: #fbbf24;
       --code-bg: #11141a;
     }
   }
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     margin: 0;
-    padding: 40px 20px 80px;
     background: var(--bg);
     color: var(--ink);
     font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
   }
-  main { max-width: 560px; margin: 0 auto; }
-  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
-  .sub { color: var(--muted); margin: 0 0 28px; }
-  .card {
-    background: var(--card);
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 20px;
-    margin-bottom: 16px;
-  }
-  .card h2 {
-    font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em;
-    color: var(--muted); margin: 0 0 12px; font-weight: 600;
-  }
-  label { display: block; font-weight: 500; margin-bottom: 6px; }
-  .hint { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
-  .hint a { color: var(--accent); }
-  input[type=text] {
-    width: 100%; padding: 10px 12px; font: inherit;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
-    background: var(--bg); color: var(--ink);
-    border: 1px solid var(--line); border-radius: 8px;
-  }
-  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
   button {
-    font: inherit; font-weight: 500; padding: 9px 16px; border-radius: 8px;
+    font: inherit; font-weight: 500; padding: 8px 14px; border-radius: 8px;
     border: 1px solid var(--line); background: var(--card); color: var(--ink);
     cursor: pointer;
   }
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: 0.5; cursor: default; }
   button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button.danger { color: var(--bad); }
+  button.small { padding: 4px 10px; font-size: 13px; }
+  input[type=text], textarea, select {
+    width: 100%; padding: 9px 11px; font: inherit; font-size: 14px;
+    background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  input[type=text].mono, textarea.mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+  }
+  textarea { resize: vertical; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+  label { display: block; font-weight: 500; margin-bottom: 6px; font-size: 14px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+  .hint a { color: var(--accent); }
+  .field { margin-bottom: 14px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .grow { flex: 1; min-width: 0; }
   .note { margin-top: 10px; font-size: 14px; }
   .note.ok { color: var(--ok); }
   .note.bad { color: var(--bad); }
   .note.wait { color: var(--muted); }
-  pre {
-    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
-    padding: 12px; overflow-x: auto; margin: 12px 0 0;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+  .muted { color: var(--muted); }
+  pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  /* ---- header */
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px; border-bottom: 1px solid var(--line);
+    background: var(--card); flex-shrink: 0;
   }
-  dl { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; margin: 0; }
-  dt { color: var(--muted); }
-  dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; word-break: break-all; }
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
-  .dot.on { background: var(--ok); }
-  .dot.off { background: var(--muted); }
-  .quiet { background: none; border: none; color: var(--muted); text-decoration: underline; padding: 0; font-size: 13px; }
-  [hidden] { display: none !important; }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: -0.01em; }
+  header .spacer { flex: 1; }
+  .badge {
+    font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+  }
+  .badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+  .badge.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
+
+  /* ---- layout */
+  .view { display: none; flex: 1; min-height: 0; }
+  .view.on { display: flex; }
+  #setup { justify-content: center; overflow-y: auto; padding: 32px 20px 60px; }
+  #setup .inner { max-width: 560px; width: 100%; }
+  aside {
+    width: 260px; flex-shrink: 0; border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; background: var(--card);
+  }
+  aside .head {
+    padding: 10px 12px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 8px;
+  }
+  aside .head h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); margin: 0; font-weight: 600; flex: 1;
+  }
+  #sessions { overflow-y: auto; flex: 1; padding: 6px; }
+  .session {
+    padding: 8px 10px; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent; margin-bottom: 2px;
+  }
+  .session:hover { background: var(--bg); }
+  .session.on { background: var(--bg); border-color: var(--line); }
+  .session .name { font-weight: 500; font-size: 14px; display: flex; gap: 6px; align-items: center; }
+  .session .meta { font-size: 12px; color: var(--muted); margin-top: 2px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+  .dot.working { background: var(--accent); }
+  .dot.waiting { background: var(--warn); }
+  .dot.exited { background: var(--muted); opacity: 0.5; }
+  .dot.failed { background: var(--bad); }
+  .empty { color: var(--muted); font-size: 14px; padding: 16px 10px; text-align: center; }
+
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .tabs { display: flex; gap: 4px; padding: 8px 12px 0; border-bottom: 1px solid var(--line); }
+  .tab {
+    padding: 7px 14px; border-radius: 8px 8px 0 0; cursor: pointer; font-size: 14px;
+    border: 1px solid transparent; border-bottom: none; color: var(--muted);
+  }
+  .tab.on { background: var(--card); border-color: var(--line); color: var(--ink); font-weight: 500; }
+  .pane { display: none; flex: 1; min-height: 0; flex-direction: column; }
+  .pane.on { display: flex; }
+
+  /* ---- questions */
+  #questions { padding: 0 12px; }
+  .question {
+    background: var(--card); border: 1px solid var(--warn); border-radius: 10px;
+    padding: 12px 14px; margin-top: 10px;
+  }
+  .question .q { font-weight: 500; margin-bottom: 4px; }
+
+  /* ---- chat */
+  #chatlog { flex: 1; overflow-y: auto; padding: 16px; }
+  .turn { max-width: 720px; margin: 0 auto 14px; display: flex; gap: 10px; }
+  .turn .who {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); width: 52px; flex-shrink: 0; padding-top: 3px; font-weight: 600;
+  }
+  .turn .what { flex: 1; min-width: 0; white-space: pre-wrap; word-wrap: break-word; }
+  .turn.tool .what {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
+    color: var(--muted); background: var(--code-bg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 9px;
+  }
+  .composer { border-top: 1px solid var(--line); padding: 12px; background: var(--card); }
+  .composer .inner { max-width: 720px; margin: 0 auto; }
+
+  /* ---- session output */
+  .outhead {
+    padding: 10px 12px; border-bottom: 1px solid var(--line);
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  }
+  .outhead .title { font-weight: 500; }
+  #output {
+    flex: 1; overflow: auto; margin: 0; padding: 12px 14px;
+    font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+    background: var(--code-bg);
+  }
+  #output .stderr { color: var(--warn); }
+  #output .notice { color: var(--muted); }
+  #output .msg { color: var(--accent); }
+
+  /* ---- dialogs */
+  dialog {
+    border: 1px solid var(--line); border-radius: 12px; background: var(--card);
+    color: var(--ink); padding: 0; max-width: 520px; width: calc(100% - 32px);
+  }
+  dialog::backdrop { background: rgba(0,0,0,0.45); }
+  dialog .body { padding: 18px 20px; max-height: 75vh; overflow-y: auto; }
+  dialog h2 { font-size: 16px; margin: 0 0 14px; }
+  dialog .foot {
+    padding: 12px 20px; border-top: 1px solid var(--line);
+    display: flex; gap: 8px; justify-content: flex-end;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 20px; margin-bottom: 16px;
+  }
+  .card h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); margin: 0 0 12px; font-weight: 600;
+  }
+  .card.done { opacity: 0.6; }
+  pre.snippet {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; font-size: 12.5px; overflow-x: auto; margin: 10px 0 0;
+  }
+  .sep { height: 1px; background: var(--line); margin: 18px 0; }
+
+  @media (max-width: 700px) {
+    aside { width: 100%; position: absolute; inset: 45px 0 0 0; z-index: 5; display: none; }
+    aside.open { display: flex; }
+    #console { position: relative; }
+  }
 </style>
 </head>
 <body>
-<main>
+
+<header>
+  <button id="menu" class="small" style="display:none">☰</button>
   <h1>telepager</h1>
-  <p class="sub" id="sub">pages you on telegram from a coding agent</p>
+  <span id="tgBadge" class="badge">…</span>
+  <span id="modelBadge" class="badge">…</span>
+  <span class="spacer"></span>
+  <button id="openSettings" class="small">Settings</button>
+</header>
 
-  <!-- setup -->
-  <section id="setup">
-    <div class="card">
-      <h2>Step 1 — bot token</h2>
-      <label for="token">Token from @BotFather</label>
-      <input id="token" type="text" spellcheck="false" autocomplete="off"
-             placeholder="123456789:AAExampleTokenFromBotFather">
-      <p class="hint">Open <a href="https://t.me/BotFather" target="_blank" rel="noreferrer">@BotFather</a>,
-        send <code>/newbot</code>, and paste what it gives you back.</p>
-      <div class="row">
-        <button id="check">Check token</button>
+<!-- ============================ setup ============================ -->
+<div id="setup" class="view">
+  <div class="inner">
+    <h1 style="font-size:22px;margin:0 0 4px">Connect Telegram</h1>
+    <p class="muted" style="margin:0 0 24px">
+      telepager pages you through your own Telegram bot. This takes about a minute,
+      and nothing leaves your machine except messages to Telegram.
+    </p>
+
+    <div class="card" id="step1">
+      <h2>1 — bot token</h2>
+      <p class="hint" style="margin:0 0 10px">
+        Message <a href="https://t.me/BotFather" target="_blank" rel="noreferrer">@BotFather</a>,
+        send <code>/newbot</code>, and paste the token it gives you.
+      </p>
+      <input type="text" class="mono" id="token" placeholder="123456789:AAE…" autocomplete="off" spellcheck="false">
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="checkToken">Check token</button>
       </div>
-      <p class="note" id="tokenNote"></p>
+      <div class="note" id="tokenNote"></div>
     </div>
 
-    <div class="card">
-      <h2>Step 2 — your user id</h2>
-      <p class="hint" style="margin-top:0">Only these ids can talk to the bot. That allowlist is the whole
-        security model, so it's just you unless you mean otherwise.</p>
+    <div class="card" id="step2">
+      <h2>2 — your user id</h2>
+      <p class="hint" style="margin:0 0 10px">
+        Only these ids can talk to the bot. Open your bot in Telegram and send it
+        anything, then press Detect — or type your id in by hand.
+      </p>
       <div class="row">
-        <button id="detect">Wait for me to message the bot</button>
-        <button class="quiet" id="manualToggle">or type it in</button>
+        <input type="text" class="mono grow" id="userId" placeholder="123456789" autocomplete="off">
+        <button id="detect">Detect</button>
       </div>
-      <p class="note" id="detectNote"></p>
-      <div id="manual" hidden style="margin-top:12px">
-        <label for="ids">User id(s), comma separated</label>
-        <input id="ids" type="text" spellcheck="false" autocomplete="off" placeholder="123456789">
-        <p class="hint">Message <a href="https://t.me/userinfobot" target="_blank" rel="noreferrer">@userinfobot</a>
-          and it replies with your id.</p>
+      <div class="note" id="idNote"></div>
+    </div>
+
+    <div class="card" id="step3">
+      <h2>3 — save</h2>
+      <div class="row">
+        <button class="primary" id="save">Save and start</button>
+        <button id="sendTest">Send a test page</button>
+      </div>
+      <div class="note" id="saveNote"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================ console ============================ -->
+<div id="console" class="view">
+  <aside id="aside">
+    <div class="head">
+      <h2>Sessions</h2>
+      <button class="small primary" id="openSpawn">New agent</button>
+    </div>
+    <div id="sessions"></div>
+  </aside>
+
+  <main>
+    <div class="tabs">
+      <div class="tab on" data-pane="chat">Master agent</div>
+      <div class="tab" data-pane="session" id="sessionTab" style="display:none">Session</div>
+    </div>
+
+    <div id="questions"></div>
+
+    <div class="pane on" id="pane-chat">
+      <div id="chatlog"></div>
+      <div class="composer">
+        <div class="inner">
+          <div class="row">
+            <textarea id="chatInput" class="grow" rows="2"
+              placeholder="Ask it to start an agent, or what's running…"></textarea>
+            <button class="primary" id="chatSend">Send</button>
+          </div>
+          <p class="hint" id="chatHint">Enter to send, shift-enter for a new line.</p>
+        </div>
       </div>
     </div>
 
-    <div class="card">
-      <h2>Step 3 — save</h2>
-      <div class="row">
-        <button class="primary" id="save">Write config</button>
+    <div class="pane" id="pane-session">
+      <div class="outhead">
+        <span class="title" id="outTitle">—</span>
+        <span class="badge" id="outState"></span>
+        <span class="spacer grow"></span>
+        <button class="small" id="btnEof">Finish input</button>
+        <button class="small danger" id="btnKill">Kill</button>
+        <button class="small" id="btnForget">Clear</button>
       </div>
-      <p class="note" id="saveNote"></p>
+      <pre id="output"></pre>
+      <div class="composer">
+        <div class="inner row">
+          <input type="text" class="mono grow" id="sessionInput" placeholder="Type at this agent's stdin…">
+          <button id="sessionSend">Send</button>
+        </div>
+      </div>
     </div>
-  </section>
+  </main>
+</div>
 
-  <!-- status -->
-  <section id="status" hidden>
-    <div class="card">
-      <h2>Status</h2>
-      <dl>
-        <dt>config</dt><dd id="sPath"></dd>
-        <dt>allowed</dt><dd id="sIds"></dd>
-        <dt>daemon</dt><dd id="sDaemon"></dd>
-      </dl>
-      <div class="row">
-        <button class="primary" id="test">Send a test message</button>
-        <button id="reconfigure">Reconfigure</button>
-      </div>
-      <p class="note" id="statusNote"></p>
+<!-- ============================ dialogs ============================ -->
+<dialog id="spawnDialog">
+  <form method="dialog" class="body">
+    <h2>Start an agent</h2>
+    <div class="field">
+      <label for="spawnAgent">Agent</label>
+      <select id="spawnAgent"></select>
+      <p class="hint" id="spawnAgentHint"></p>
     </div>
+    <div class="field">
+      <label for="spawnDir">Directory</label>
+      <input type="text" class="mono" id="spawnDir" placeholder="~/code/project">
+    </div>
+    <div class="field">
+      <label for="spawnTask">Task</label>
+      <textarea id="spawnTask" rows="4" placeholder="What should it do? This is the whole prompt it gets."></textarea>
+    </div>
+    <div class="note" id="spawnNote"></div>
+  </form>
+  <div class="foot">
+    <button id="spawnCancel">Cancel</button>
+    <button class="primary" id="spawnGo">Start</button>
+  </div>
+</dialog>
 
-    <div class="card">
-      <h2>Register it with your agent</h2>
-      <pre id="cmd"></pre>
-      <div class="row">
-        <button id="copy">Copy</button>
-        <button class="quiet" id="quit">I'm done — close setup</button>
-      </div>
-      <p class="note" id="quitNote"></p>
+<dialog id="settingsDialog">
+  <div class="body">
+    <h2>Settings</h2>
+
+    <div class="field">
+      <label for="provider">Master agent model</label>
+      <select id="provider"></select>
+      <p class="hint" id="providerHint"></p>
     </div>
-  </section>
-</main>
+    <div class="field">
+      <label for="model">Model</label>
+      <input type="text" class="mono" id="model" placeholder="leave blank for the default">
+    </div>
+    <div class="field">
+      <label for="apiKey">API key</label>
+      <input type="text" class="mono" id="apiKey" placeholder="leave blank to keep using the environment">
+      <p class="hint" id="keyHint"></p>
+    </div>
+    <div class="field">
+      <label for="baseUrl">Base URL <span class="muted">(optional)</span></label>
+      <input type="text" class="mono" id="baseUrl" placeholder="e.g. https://openrouter.ai/api/v1">
+    </div>
+    <div class="field">
+      <label for="system">Extra instructions <span class="muted">(optional)</span></label>
+      <textarea id="system" rows="3" placeholder="Anything it should always keep in mind."></textarea>
+    </div>
+    <div class="note" id="masterNote"></div>
+
+    <div class="sep"></div>
+
+    <div class="field">
+      <label for="dirs">Directories Telegram may start agents in</label>
+      <textarea id="dirs" class="mono" rows="3" placeholder="/home/you/code&#10;one per line"></textarea>
+      <p class="hint">
+        Empty means Telegram can't start anything — the safe default. This console
+        isn't restricted, since opening it means being at the machine.
+      </p>
+    </div>
+    <div class="note" id="dirsNote"></div>
+
+    <div class="sep"></div>
+
+    <div class="field">
+      <label>Register with a coding agent</label>
+      <pre class="snippet" id="registerCmd"></pre>
+      <p class="hint">Config file: <code id="configPath"></code></p>
+    </div>
+  </div>
+  <div class="foot">
+    <button id="settingsClose">Close</button>
+    <button class="primary" id="settingsSave">Save</button>
+  </div>
+</dialog>
 
 <script>
-const key = new URLSearchParams(location.search).get("k") || "";
+"use strict";
+
+const KEY = new URLSearchParams(location.search).get("k") || "";
 const $ = (id) => document.getElementById(id);
-const note = (el, text, kind) => { el.textContent = text; el.className = "note " + (kind || ""); };
+
+/* the key stays in the url for reloads but shouldn't sit in the address bar */
+if (KEY) history.replaceState(null, "", location.pathname);
+
+let state = null;
+let selected = null;          // session id shown in the session pane
+const buffers = new Map();    // session id -> array of {cls, text}
+let transcript = [];
 
 async function api(path, body) {
   const res = await fetch(path, {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-telepager-key": key },
-    body: JSON.stringify(body || {}),
+    method: body === undefined ? "GET" : "POST",
+    headers: { "content-type": "application/json", "x-telepager-key": KEY },
+    body: body === undefined ? undefined : JSON.stringify(body || {}),
   });
-  const data = await res.json().catch(() => ({ error: "the server said something unparseable" }));
-  if (!res.ok) throw new Error(data.error || "request failed");
+  let data = {};
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok || data.error) throw new Error(data.error || ("http " + res.status));
   return data;
 }
 
-let forceSetup = false;
-
-async function refresh() {
-  const s = await api("/api/state");
-  $("sub").textContent = "v" + s.version + " — pages you on telegram from a coding agent";
-  const showSetup = forceSetup || !s.configured;
-
-  $("setup").hidden = !showSetup;
-  $("status").hidden = showSetup;
-
-  if (s.problem) note($("saveNote"), s.problem, "bad");
-
-  $("sPath").textContent = s.config_path;
-  $("sIds").textContent = s.allowed_user_ids.join(", ") || "none";
-  $("sDaemon").innerHTML = s.daemon_running
-    ? '<span class="dot on"></span>running'
-    : '<span class="dot off"></span>not running (starts on its own)';
-  $("cmd").textContent = s.register_command;
+function note(el, text, kind) {
+  el.textContent = text || "";
+  el.className = "note" + (kind ? " " + kind : "");
 }
 
-$("check").onclick = async (e) => {
-  const btn = e.target;
-  btn.disabled = true;
-  note($("tokenNote"), "asking telegram…", "wait");
-  try {
-    const r = await api("/api/check", { token: $("token").value.trim() });
-    note($("tokenNote"), "that's " + r.bot + " — looks good", "ok");
-  } catch (err) {
-    note($("tokenNote"), err.message, "bad");
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* ------------------------------------------------------------ state */
+
+async function refresh() {
+  state = await api("/api/state");
+  transcript = state.transcript || [];
+  render();
+}
+
+function render() {
+  if (!state) return;
+
+  const configured = state.configured;
+  $("setup").classList.toggle("on", !configured);
+  $("console").classList.toggle("on", configured);
+  $("menu").style.display = configured ? "" : "none";
+
+  const tg = $("tgBadge");
+  tg.textContent = configured ? "telegram connected" : "telegram not connected";
+  tg.className = "badge " + (configured ? "ok" : "bad");
+
+  const m = state.master || {};
+  const mb = $("modelBadge");
+  mb.textContent = m.ready ? (m.provider + " / " + m.model) : "no model key";
+  mb.className = "badge " + (m.ready ? "ok" : "bad");
+
+  $("chatHint").textContent = m.ready
+    ? "Enter to send, shift-enter for a new line."
+    : "The master agent needs an API key — open Settings to pick a model.";
+  $("chatSend").disabled = !m.ready;
+
+  renderSessions();
+  renderQuestions();
+  renderChat();
+  if (selected) renderSession();
+}
+
+function renderSessions() {
+  const box = $("sessions");
+  const list = state.sessions || [];
+  if (!list.length) {
+    box.innerHTML = '<div class="empty">Nothing running yet.<br>Ask the master agent, or press New agent.</div>';
+    return;
   }
-  btn.disabled = false;
-};
+  box.innerHTML = list.map((s) => {
+    const on = s.id === selected ? " on" : "";
+    const meta = [s.agent || s.kind, s.detail || s.task || s.cwd || ""].filter(Boolean).join(" · ");
+    return '<div class="session' + on + '" data-id="' + s.id + '">' +
+      '<div class="name"><span class="dot ' + s.state + '"></span>' + escapeHtml(s.label) + '</div>' +
+      '<div class="meta">' + escapeHtml(meta) + "</div></div>";
+  }).join("");
 
-$("manualToggle").onclick = () => { $("manual").hidden = !$("manual").hidden; };
+  box.querySelectorAll(".session").forEach((el) => {
+    el.onclick = () => selectSession(el.dataset.id);
+  });
+}
 
-$("detect").onclick = async (e) => {
-  const btn = e.target;
-  const token = $("token").value.trim();
-  if (!token) return note($("detectNote"), "paste the bot token first", "bad");
+function renderQuestions() {
+  const box = $("questions");
+  const list = state.questions || [];
+  if (!list.length) { box.innerHTML = ""; return; }
 
-  btn.disabled = true;
-  // telegram long-polls, so a couple of rounds covers the time it takes
-  // someone to switch apps and hit send
-  for (let round = 0; round < 4; round++) {
-    note($("detectNote"), "open your bot in telegram and send it anything… (listening)", "wait");
-    try {
-      const r = await api("/api/detect", { token });
-      if (r.found) {
-        $("manual").hidden = false;
-        $("ids").value = String(r.user.id);
-        note($("detectNote"), "got it — " + r.user.name + ", id " + r.user.id, "ok");
-        btn.disabled = false;
-        return;
+  box.innerHTML = list.map((q, i) => {
+    const options = (q.options || []).map((o, j) =>
+      '<button class="small" data-q="' + i + '" data-opt="' + escapeHtml(o) + '">' +
+      (j + 1) + ". " + escapeHtml(o) + "</button>").join(" ");
+    return '<div class="question"><div class="q">' + escapeHtml(q.question) + "</div>" +
+      '<div class="muted" style="font-size:13px;margin-bottom:8px">' + escapeHtml(q.session) + "</div>" +
+      '<div class="row">' + options +
+      '<input type="text" class="grow" data-typed="' + i + '" placeholder="or type an answer…"></div></div>';
+  }).join("");
+
+  box.querySelectorAll("button[data-q]").forEach((b) => {
+    b.onclick = () => answer(list[+b.dataset.q].id, b.dataset.opt);
+  });
+  box.querySelectorAll("input[data-typed]").forEach((input) => {
+    input.onkeydown = (e) => {
+      if (e.key === "Enter" && input.value.trim()) {
+        answer(list[+input.dataset.typed].id, input.value.trim());
       }
-    } catch (err) {
-      note($("detectNote"), err.message, "bad");
-      btn.disabled = false;
-      return;
-    }
+    };
+  });
+}
+
+async function answer(id, text) {
+  try {
+    await api("/api/answer", { question_id: id, answer: text });
+    await refresh();
+  } catch (e) { alert(e.message); }
+}
+
+function renderChat() {
+  const log = $("chatlog");
+  const stuck = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+
+  if (!transcript.length) {
+    log.innerHTML = '<div class="empty" style="margin-top:40px">' +
+      "Tell it what you want done.<br><span class=\"muted\">" +
+      "“start claude in ~/code/api and make the tests pass”</span></div>";
+  } else {
+    log.innerHTML = transcript.map((t) => {
+      const who = t.role === "master" ? "agent" : t.role;
+      let body = escapeHtml(t.text || "");
+      if (t.role === "master" && t.calls && t.calls.length && !t.text) {
+        body = '<span class="muted">' + escapeHtml(t.calls.map((c) => c.name).join(", ")) + "…</span>";
+      }
+      if (t.role === "tool") body = escapeHtml((t.name ? t.name + ": " : "") + (t.text || ""));
+      return '<div class="turn ' + t.role + '"><div class="who">' + who +
+        '</div><div class="what">' + body + "</div></div>";
+    }).join("");
   }
-  note($("detectNote"), "nothing came through. try again, or type your id in.", "bad");
-  btn.disabled = false;
+  if (stuck) log.scrollTop = log.scrollHeight;
+}
+
+/* --------------------------------------------------------- sessions */
+
+function selectSession(id) {
+  selected = id;
+  $("sessionTab").style.display = "";
+  showPane("session");
+  $("aside").classList.remove("open");
+  renderSessions();
+  renderSession();
+}
+
+function sessionById(id) {
+  return (state.sessions || []).find((s) => s.id === id);
+}
+
+function renderSession() {
+  const s = sessionById(selected);
+  $("outTitle").textContent = s ? (s.label + "  ·  " + s.id) : selected;
+  const badge = $("outState");
+  badge.textContent = s ? (s.detail ? s.state + " (" + s.detail + ")" : s.state) : "gone";
+  badge.className = "badge " + (s && s.state === "failed" ? "bad" : s && s.state === "working" ? "ok" : "");
+
+  /* only spawned agents we still hold a process for can be typed at */
+  const running = !!(s && s.running);
+  $("btnKill").disabled = !running;
+  $("btnEof").disabled = !running;
+  $("sessionSend").disabled = !running;
+  $("sessionInput").disabled = !running;
+
+  const lines = buffers.get(selected) || [];
+  const out = $("output");
+  const stuck = out.scrollHeight - out.scrollTop - out.clientHeight < 60;
+  out.innerHTML = lines.map((l) =>
+    '<span class="' + l.cls + '">' + escapeHtml(l.text) + "</span>").join("\n");
+  if (stuck) out.scrollTop = out.scrollHeight;
+}
+
+function showPane(name) {
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t.dataset.pane === name));
+  document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("on", p.id === "pane-" + name));
+}
+
+/* ----------------------------------------------------------- events */
+
+function bufferEvent(ev) {
+  if (!ev.session) return;
+  if (!buffers.has(ev.session)) buffers.set(ev.session, []);
+  const buf = buffers.get(ev.session);
+
+  const push = (cls, text) => {
+    buf.push({ cls, text });
+    if (buf.length > 4000) buf.splice(0, buf.length - 4000);
+  };
+
+  switch (ev.type) {
+    case "output": push(ev.stream === "stderr" ? "stderr" : "stdout", ev.line); break;
+    case "notice": push("notice", ev.text); break;
+    case "message": push("msg", "→ telegram: " + ev.text); break;
+    case "thinking": push("notice", "💭 " + ev.text); break;
+    case "question": push("notice", "? " + ev.question + "  [" + (ev.options || []).join(" | ") + "]"); break;
+    case "answer": push("msg", "✓ " + ev.answer); break;
+    case "started": push("notice", "started " + ev.agent); break;
+    case "ended": push("notice", "ended" + (ev.code === null || ev.code === undefined ? "" : " (exit " + ev.code + ")")); break;
+  }
+}
+
+function connect() {
+  const es = new EventSource("/api/events?k=" + encodeURIComponent(KEY));
+  let dirty = false;
+
+  es.onmessage = (msg) => {
+    let ev;
+    try { ev = JSON.parse(msg.data); } catch (_) { return; }
+
+    bufferEvent(ev);
+
+    /* chat turns arrive on the stream too, so telegram shows up here live */
+    if (ev.type === "chat") {
+      const role = ev.role === "master" ? "master" : ev.role;
+      transcript.push({ role, text: ev.text });
+      renderChat();
+    }
+
+    /* anything that changes a session's shape means refetching state */
+    if (["started", "ended", "state_changed", "question", "answer"].includes(ev.type)) {
+      dirty = true;
+    }
+    if (ev.session === selected) renderSession();
+  };
+
+  es.addEventListener("ready", () => { if (selected) renderSession(); });
+  es.onerror = () => { /* EventSource retries on its own */ };
+
+  /* batched so a chatty agent doesn't cause a refetch per line */
+  setInterval(() => {
+    if (!dirty) return;
+    dirty = false;
+    refresh().catch(() => {});
+  }, 700);
+}
+
+/* ------------------------------------------------------------ setup */
+
+$("checkToken").onclick = async () => {
+  const token = $("token").value.trim();
+  if (!token) return note($("tokenNote"), "Paste the token first.", "bad");
+  note($("tokenNote"), "checking…", "wait");
+  try {
+    const r = await api("/api/check", { token });
+    note($("tokenNote"), "That's " + r.bot + ". Now open it in Telegram and say something.", "ok");
+    $("step1").classList.add("done");
+  } catch (e) { note($("tokenNote"), e.message, "bad"); }
 };
 
-$("save").onclick = async (e) => {
-  const btn = e.target;
-  const ids = $("ids").value.split(",").map((s) => s.trim()).filter(Boolean);
-  if (!ids.length) return note($("saveNote"), "no user id yet — detect one or type it in above", "bad");
-  if (ids.some((s) => !/^-?\d+$/.test(s))) return note($("saveNote"), "user ids are plain numbers", "bad");
+$("detect").onclick = async () => {
+  const token = $("token").value.trim();
+  if (!token) return note($("idNote"), "Paste the token first.", "bad");
+  note($("idNote"), "listening — send your bot a message now…", "wait");
+  try {
+    const r = await api("/api/detect", { token });
+    if (r.found) {
+      $("userId").value = r.user.id;
+      note($("idNote"), "That's you: " + r.user.name + " (" + r.user.id + ")", "ok");
+      $("step2").classList.add("done");
+    } else {
+      note($("idNote"), "Nothing arrived. Send your bot a message, then press Detect again.", "bad");
+    }
+  } catch (e) { note($("idNote"), e.message, "bad"); }
+};
 
-  btn.disabled = true;
+$("save").onclick = async () => {
+  const token = $("token").value.trim();
+  const ids = $("userId").value.split(",").map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite);
+  if (!token) return note($("saveNote"), "Paste the token first.", "bad");
+  if (!ids.length) return note($("saveNote"), "Need at least one user id.", "bad");
+
   note($("saveNote"), "saving…", "wait");
   try {
-    const r = await api("/api/save", { token: $("token").value.trim(), user_ids: ids.map(Number) });
-    note($("saveNote"), "saved to " + r.config_path, "ok");
-    forceSetup = false;
+    const r = await api("/api/save", { token, user_ids: ids });
+    note($("saveNote"), "Saved to " + r.config_path + ". Starting…", "ok");
     await refresh();
-    note($("statusNote"), "all set. send yourself a test message to be sure.", "ok");
-  } catch (err) {
-    note($("saveNote"), err.message, "bad");
-  }
-  btn.disabled = false;
+  } catch (e) { note($("saveNote"), e.message, "bad"); }
 };
 
-$("test").onclick = async (e) => {
-  const btn = e.target;
-  btn.disabled = true;
-  note($("statusNote"), "sending…", "wait");
+$("sendTest").onclick = async () => {
+  note($("saveNote"), "sending…", "wait");
   try {
-    await api("/api/test");
-    note($("statusNote"), "sent — check telegram", "ok");
-  } catch (err) {
-    note($("statusNote"), err.message, "bad");
-  }
-  btn.disabled = false;
+    await api("/api/test", {});
+    note($("saveNote"), "Sent — check Telegram.", "ok");
+  } catch (e) { note($("saveNote"), e.message, "bad"); }
 };
 
-$("reconfigure").onclick = async () => { forceSetup = true; await refresh(); };
+/* ------------------------------------------------------------- chat */
 
-$("copy").onclick = async () => {
+async function sendChat() {
+  const input = $("chatInput");
+  const text = input.value.trim();
+  if (!text) return;
+
+  input.value = "";
+  transcript.push({ role: "user", text });
+  renderChat();
+
+  $("chatSend").disabled = true;
   try {
-    await navigator.clipboard.writeText($("cmd").textContent);
-    note($("quitNote"), "copied", "ok");
-  } catch {
-    note($("quitNote"), "couldn't reach the clipboard — select it by hand", "bad");
+    await api("/api/master/send", { text });
+  } catch (e) {
+    transcript.push({ role: "tool", text: e.message });
+  } finally {
+    $("chatSend").disabled = false;
+    await refresh().catch(() => {});
+    $("chatInput").focus();
   }
+}
+
+$("chatSend").onclick = sendChat;
+$("chatInput").onkeydown = (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
 };
 
-$("quit").onclick = async () => {
-  try { await api("/api/quit"); } catch {}
-  note($("quitNote"), "setup closed. you can shut this tab.", "ok");
+document.querySelectorAll(".tab").forEach((t) => {
+  t.onclick = () => showPane(t.dataset.pane);
+});
+
+/* -------------------------------------------------- session actions */
+
+$("sessionSend").onclick = async () => {
+  const text = $("sessionInput").value;
+  if (!text.trim()) return;
+  $("sessionInput").value = "";
+  try { await api("/api/session/input", { session: selected, text }); }
+  catch (e) { alert(e.message); }
+};
+$("sessionInput").onkeydown = (e) => { if (e.key === "Enter") $("sessionSend").onclick(); };
+
+$("btnKill").onclick = async () => {
+  if (!confirm("Kill this agent and everything it started?")) return;
+  try { await api("/api/session/kill", { session: selected }); await refresh(); }
+  catch (e) { alert(e.message); }
 };
 
-// the setup form is already on screen, so a failure here just needs saying
-refresh().catch((err) => { note($("saveNote"), err.message, "bad"); });
+$("btnEof").onclick = async () => {
+  try { await api("/api/session/eof", { session: selected }); }
+  catch (e) { alert(e.message); }
+};
+
+$("btnForget").onclick = async () => {
+  try {
+    await api("/api/session/forget", { session: selected });
+    buffers.delete(selected);
+    selected = null;
+    $("sessionTab").style.display = "none";
+    showPane("chat");
+    await refresh();
+  } catch (e) { alert(e.message); }
+};
+
+/* ------------------------------------------------------------ spawn */
+
+$("openSpawn").onclick = () => {
+  const sel = $("spawnAgent");
+  const agents = state.agents || [];
+  sel.innerHTML = agents.map((a) =>
+    '<option value="' + a.name + '"' + (a.installed ? "" : " disabled") + ">" +
+    a.name + (a.installed ? "" : " (not installed)") + "</option>").join("");
+
+  const describe = () => {
+    const a = agents.find((x) => x.name === sel.value);
+    $("spawnAgentHint").textContent = a ? (a.description || a.command) : "";
+  };
+  sel.onchange = describe;
+  describe();
+
+  if (!$("spawnDir").value) $("spawnDir").value = state.cwd || state.home || "";
+  note($("spawnNote"), "");
+  $("spawnDialog").showModal();
+};
+
+$("spawnCancel").onclick = () => $("spawnDialog").close();
+
+$("spawnGo").onclick = async () => {
+  const agent = $("spawnAgent").value;
+  const dir = $("spawnDir").value.trim();
+  const task = $("spawnTask").value.trim();
+  if (!agent) return note($("spawnNote"), "Pick an agent — none are installed?", "bad");
+  if (!dir) return note($("spawnNote"), "Which directory?", "bad");
+  if (!task) return note($("spawnNote"), "Give it a task.", "bad");
+
+  note($("spawnNote"), "starting…", "wait");
+  try {
+    const r = await api("/api/spawn", { agent, dir, task });
+    $("spawnTask").value = "";
+    $("spawnDialog").close();
+    await refresh();
+    selectSession(r.session);
+  } catch (e) { note($("spawnNote"), e.message, "bad"); }
+};
+
+/* --------------------------------------------------------- settings */
+
+$("openSettings").onclick = () => {
+  const m = state.master || {};
+  const sel = $("provider");
+  sel.innerHTML = (m.providers || []).map((p) =>
+    '<option value="' + p.id + '"' + (p.id === m.provider ? " selected" : "") + ">" +
+    p.id + "</option>").join("");
+
+  const describe = () => {
+    const p = (m.providers || []).find((x) => x.id === sel.value);
+    if (!p) return;
+    $("providerHint").textContent = p.needs_key
+      ? (p.has_key_in_env ? p.key_env + " is set in the environment." : "Needs " + p.key_env + ", or a key below.")
+      : "Runs locally, no key needed.";
+    $("model").placeholder = p.default_model;
+  };
+  sel.onchange = describe;
+  describe();
+
+  $("model").value = m.model || "";
+  $("baseUrl").value = m.base_url || "";
+  $("system").value = m.system || "";
+  $("apiKey").value = "";
+  $("keyHint").textContent = m.key_source
+    ? "Currently using a key from " + m.key_source + "."
+    : "No key found yet.";
+  $("dirs").value = (state.allowed_dirs || []).join("\n");
+  $("registerCmd").textContent = state.register_command || "";
+  $("configPath").textContent = state.config_path || "";
+  note($("masterNote"), "");
+  note($("dirsNote"), "");
+  $("settingsDialog").showModal();
+};
+
+$("settingsClose").onclick = () => $("settingsDialog").close();
+
+$("settingsSave").onclick = async () => {
+  note($("masterNote"), "saving…", "wait");
+  try {
+    const r = await api("/api/master/config", {
+      provider: $("provider").value,
+      model: $("model").value,
+      api_key: $("apiKey").value,
+      base_url: $("baseUrl").value,
+      system: $("system").value,
+    });
+    note($("masterNote"), r.ready ? "Using " + r.model + "." : (r.problem || "Saved."), r.ready ? "ok" : "bad");
+
+    const dirs = $("dirs").value.split("\n").map((s) => s.trim()).filter(Boolean);
+    const d = await api("/api/dirs", { dirs });
+    note($("dirsNote"), d.count
+      ? d.count + " director" + (d.count === 1 ? "y" : "ies") + " allowed from Telegram."
+      : "Telegram can't start agents.", "ok");
+
+    await refresh();
+  } catch (e) { note($("masterNote"), e.message, "bad"); }
+};
+
+$("menu").onclick = () => $("aside").classList.toggle("open");
+
+/* ------------------------------------------------------------- boot */
+
+refresh().then(connect).catch((e) => {
+  document.body.innerHTML =
+    '<div class="empty" style="margin-top:60px">Could not reach telepager: ' +
+    escapeHtml(e.message) + "<br><br>Open the link printed in your terminal.</div>";
+});
 </script>
 </body>
 </html>

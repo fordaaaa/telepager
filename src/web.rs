@@ -231,7 +231,8 @@ async fn state(core: &Arc<Core>) -> Result<Value> {
         "problem": problem,
         "version": env!("CARGO_PKG_VERSION"),
         "register_command": "claude mcp add --scope user telepager -- telepager mcp",
-        "sessions": core.sessions().await,
+        "sessions": sessions_with_liveness(core).await,
+        "live": core.live_count().await,
         "questions": core.pending_questions().await,
         "agents": agent_list,
         "allowed_dirs": cfg
@@ -258,6 +259,23 @@ async fn state(core: &Arc<Core>) -> Result<Value> {
         },
         "transcript": core.master.lock().await.transcript(),
     }))
+}
+
+/// The session list, each marked with whether telepager still holds a live
+/// process for it — which is what decides if "kill" and stdin are offered.
+async fn sessions_with_liveness(core: &Arc<Core>) -> Vec<Value> {
+    let mut out = Vec::new();
+    for mut summary in core.sessions().await {
+        let running = match summary["id"].as_str() {
+            Some(id) => core.is_running(id).await,
+            None => false,
+        };
+        if let Some(obj) = summary.as_object_mut() {
+            obj.insert("running".into(), json!(running));
+        }
+        out.push(summary);
+    }
+    out
 }
 
 /// Where the master agent's key is coming from, so the UI can say so without
