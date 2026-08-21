@@ -4,17 +4,29 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 // where the daemon writes its port and token so clients can find it
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Endpoint {
     pub port: u16,
     pub token: String,
     pub pid: u32,
+    /// Where the web console is, so `telepager webui` can just open it.
+    pub ui_port: Option<u16>,
+    pub ui_key: Option<String>,
+}
+
+impl Endpoint {
+    pub fn ui_url(&self) -> Option<String> {
+        let port = self.ui_port?;
+        let key = self.ui_key.as_deref()?;
+        Some(format!("http://127.0.0.1:{port}/?k={key}"))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    Hello { token: String, label: String },
+    Hello { token: String, label: String, #[serde(default)] cwd: Option<PathBuf> },
     Send { text: String },
     Thinking { text: String },
     Ask { question: String, options: Vec<String> },

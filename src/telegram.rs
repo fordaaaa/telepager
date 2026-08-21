@@ -150,11 +150,14 @@ impl Telegram {
         }
     }
 
+    /// `question_id` rides along in the callback data so a tap identifies the
+    /// question it answers, rather than relying on the message being unique.
     pub async fn send_with_buttons(
         &self,
         chat_id: i64,
         text: &str,
         options: &[String],
+        question_id: &str,
     ) -> Result<i64> {
         let buttons: Vec<Value> = options
             .iter()
@@ -162,7 +165,8 @@ impl Telegram {
             .map(|(i, label)| {
                 json!({
                     "text": truncate(&format!("{}. {label}", i + 1), 64),
-                    "callback_data": i.to_string(),
+                    // telegram caps callback_data at 64 bytes
+                    "callback_data": truncate(&format!("{question_id}:{i}"), 64),
                 })
             })
             .collect();

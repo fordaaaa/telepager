@@ -45,6 +45,7 @@ impl Client {
         c.send(&Request::Hello {
             token: ep.token,
             label: ipc::session_label(),
+            cwd: std::env::current_dir().ok(),
         })
         .ok()?;
         Some(c)
@@ -86,6 +87,35 @@ impl Client {
         *self = fresh;
         Ok(())
     }
+}
+
+/// Make sure a daemon is up, starting one if it isn't, and hand back where it
+/// is. This is what turns `telepager` and `telepager webui` into one command:
+/// whichever you run first brings the app up, the rest just attach.
+pub fn ensure_daemon(config: Option<&PathBuf>) -> Result<ipc::Endpoint> {
+    if let Some(ep) = running_endpoint() {
+        return Ok(ep);
+    }
+
+    spawn_daemon(config)?;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Some(ep) = running_endpoint() {
+            return Ok(ep);
+        }
+    }
+    bail!("the telepager daemon did not come up within 15s")
+}
+
+/// The endpoint file only means something if the daemon it describes answers.
+pub fn running_endpoint() -> Option<ipc::Endpoint> {
+    let ep = ipc::read_endpoint()?;
+    let addr = format!("127.0.0.1:{}", ep.port).parse().ok()?;
+    let sock = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
+    let _ = sock.shutdown(std::net::Shutdown::Both);
+    Some(ep)
 }
 
 fn spawn_daemon(config: Option<&PathBuf>) -> Result<()> {

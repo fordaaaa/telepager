@@ -1,9 +1,11 @@
 mod agents;
 mod client;
 mod config;
+mod core;
 mod daemon;
 mod ipc;
 mod llm;
+mod master;
 mod mcp;
 mod session;
 mod status;
@@ -14,27 +16,32 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-telepager — page yourself on telegram from a coding agent
+telepager — run and watch coding agents from your phone
 
 usage: telepager [--config PATH]
+       telepager webui [--no-open] [--config PATH]
        telepager setup [--port N] [--no-open] [--config PATH]
+       telepager status [--config PATH]
        telepager mcp [--config PATH]
-       telepager daemon [--config PATH]
+       telepager daemon [--no-open] [--config PATH]
+       telepager stop
 
-  status          show whether it's set up and running. this is also what
-                  plain `telepager` does.
-  setup           open a little page in your browser to paste a bot token
-                  and pick up your telegram user id. shows status after.
+  (no command)    start the app and open the console in your browser. runs
+                  setup first if it isn't configured yet.
+  webui           the same thing, said out loud. opens the console, starting
+                  the app first if it isn't already up.
+  setup           connect a telegram bot: paste a token, pick up your user id.
+  status          show whether it's set up and running.
   mcp             the stdio server an mcp client starts. this is what you
                   register with claude code, cursor and friends.
-  daemon          the background process that owns the telegram connection.
-                  started automatically when a client needs it.
+  daemon          run the app in the foreground without opening a browser.
+  stop            stop the background app.
 
   --config PATH   config file to use, instead of the default lookup
                   (./telepager.config.json, then telepager/config.json
                   in your user config dir)
-  --port N        port for `setup` to listen on (default: any free one)
-  --no-open       don't try to launch a browser for `setup`
+  --port N        port for the console (default: any free one)
+  --no-open       don't try to launch a browser
   -h, --help      show this
   -V, --version   show the version
 ";
@@ -54,20 +61,19 @@ fn main() -> ExitCode {
             status::print(c);
             return ExitCode::SUCCESS;
         }
+        Action::Stop => return finish(status::stop()),
+        Action::App { config, open } => {
+            init_logging();
+            return finish(status::open_console(config, open));
+        }
         Action::Setup { config, port, open } => {
             init_logging();
-            return match web::run(config, port, open) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e:#}");
-                    ExitCode::FAILURE
-                }
-            };
+            return finish(web::run_standalone(config, port, open));
         }
         Action::Mcp(c) => c,
-        Action::Daemon(c) => {
+        Action::Daemon { config, open } => {
             init_logging();
-            return match daemon::run(c) {
+            return match daemon::run(config, open) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e:#}");
@@ -90,6 +96,16 @@ fn main() -> ExitCode {
     }
 }
 
+fn finish(result: anyhow::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 // stdout is the mcp transport so logs have to go to stderr
 fn init_logging() {
     if std::env::var_os("RUST_LOG").is_none() {
@@ -99,14 +115,13 @@ fn init_logging() {
 }
 
 enum Action {
+    /// Bring the app up and open the console.
+    App { config: Option<PathBuf>, open: bool },
+    Setup { config: Option<PathBuf>, port: u16, open: bool },
     Status(Option<PathBuf>),
-    Setup {
-        config: Option<PathBuf>,
-        port: u16,
-        open: bool,
-    },
     Mcp(Option<PathBuf>),
-    Daemon(Option<PathBuf>),
+    Daemon { config: Option<PathBuf>, open: bool },
+    Stop,
     Exit,
 }
 
@@ -127,7 +142,7 @@ fn parse_args() -> Result<Action, String> {
                 println!("telepager {}", env!("CARGO_PKG_VERSION"));
                 return Ok(Action::Exit);
             }
-            "mcp" | "daemon" | "status" | "setup" => mode = Some(arg),
+            "mcp" | "daemon" | "status" | "setup" | "webui" | "ui" | "stop" => mode = Some(arg),
             "--port" => {
                 let value = args.next().ok_or("--port needs a number")?;
                 port = value
@@ -145,16 +160,27 @@ fn parse_args() -> Result<Action, String> {
 
     match mode.as_deref() {
         Some("setup") => Ok(Action::Setup { config, port, open }),
-        Some("daemon") => Ok(Action::Daemon(config)),
+        Some("webui") | Some("ui") => Ok(Action::App { config, open }),
+        Some("daemon") => Ok(Action::Daemon { config, open: false }),
         Some("mcp") => Ok(Action::Mcp(config)),
         Some("status") => Ok(Action::Status(config)),
-        // a person typing `telepager` wants to see something. a client piping
-        // json at us is an old registration, so keep serving those.
-        _ if status::started_by_a_person() => Ok(Action::Status(config)),
-        _ => {
-            eprintln!("telepager: no subcommand given, assuming 'mcp'. update your");
-            eprintln!("registration to `telepager mcp` — the bare form goes away later.");
-            Ok(Action::Mcp(config))
+        Some("stop") => Ok(Action::Stop),
+        // a person typing `telepager` wants the app. a client piping json at
+        // us is an mcp registration, and those keep working.
+        _ if status::started_by_a_person() => Ok(Action::App { config, open }),
+        _ => Ok(Action::Mcp(config)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_usage_documents_every_command() {
+        for command in ["webui", "setup", "status", "mcp", "daemon", "stop"] {
+            assert!(
+                super::USAGE.contains(command),
+                "usage doesn't mention {command}"
+            );
         }
     }
 }
