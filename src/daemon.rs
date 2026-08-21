@@ -18,6 +18,9 @@ use crate::master::{self, Origin};
 use crate::session::{Kind, State};
 use crate::telegram::{IncomingMessage, Telegram};
 
+/// How long a freshly connected client has to introduce itself.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub fn run(config: Option<std::path::PathBuf>, open_browser: bool) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -65,15 +68,22 @@ pub async fn serve_all(core: Arc<Core>, open_browser: bool) -> Result<()> {
 /// without anyone restarting anything.
 async fn telegram_loop(core: Arc<Core>) {
     loop {
+        // register for the next config change *before* looking at the current
+        // config. notify_waiters wakes only already-registered waiters and
+        // stores no permit, so checking first would let a token saved in the
+        // gap go unnoticed and leave this loop asleep forever.
+        let changed = core.config_changed.notified();
+        tokio::pin!(changed);
+
         let Some(tg) = core.telegram().await else {
             // nothing to poll yet; wait for setup to write a token
-            core.config_changed.notified().await;
+            changed.await;
             continue;
         };
 
         tokio::select! {
             _ = poll_updates(core.clone(), tg) => {}
-            _ = core.config_changed.notified() => {
+            _ = changed => {
                 log::info!("config changed, restarting the telegram poller");
             }
         }
@@ -282,8 +292,13 @@ async fn serve_client(core: Arc<Core>, stream: TcpStream, token: String) -> Resu
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
 
-    // first line has to be a hello with the right token
-    let first = lines.next_line().await?.context("client sent nothing")?;
+    // an unauthenticated peer that says nothing would otherwise pin a task and
+    // a file descriptor for as long as the daemon lives
+    let first = tokio::time::timeout(HELLO_TIMEOUT, lines.next_line())
+        .await
+        .context("client sent no hello in time")?
+        .context("reading the hello")?
+        .context("client sent nothing")?;
     let (label, cwd) = match serde_json::from_str::<Request>(&first)? {
         Request::Hello { token: t, label, cwd } if t == token => (label, cwd),
         Request::Hello { .. } => anyhow::bail!("bad token"),
@@ -295,6 +310,24 @@ async fn serve_client(core: Arc<Core>, stream: TcpStream, token: String) -> Resu
         .await;
     log::info!("session connected: {label} ({session})");
 
+    // whatever happens from here — a clean goodbye, a killed client, a write
+    // that fails mid-reply — the session has to be marked finished, or it
+    // stays live forever and prune() will never collect it
+    let result = serve_requests(&core, &session, &mut lines, &mut write).await;
+
+    log::info!("session gone: {label} ({session})");
+    core.close_session(&session, None).await;
+    result
+}
+
+/// The request loop, split out so its caller can close the session on every
+/// exit path including the error ones.
+async fn serve_requests(
+    core: &Arc<Core>,
+    session: &str,
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    write: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Result<()> {
     // the status line this session is editing, if any
     let mut thinking: Option<i64> = None;
 
@@ -312,17 +345,17 @@ async fn serve_client(core: Arc<Core>, stream: TcpStream, token: String) -> Resu
             Request::Hello { .. } => "already connected".to_string(),
             Request::Send { text } => {
                 thinking = None;
-                core.set_state(&session, State::Working).await;
-                core.send(Some(&session), &text).await
+                core.set_state(session, State::Working).await;
+                core.send(Some(session), &text).await
             }
             Request::Thinking { text } => {
-                core.set_state(&session, State::Working).await;
-                let (result, id) = core.thinking(Some(&session), &text, thinking).await;
+                core.set_state(session, State::Working).await;
+                let (result, id) = core.thinking(Some(session), &text, thinking).await;
                 thinking = id;
                 result
             }
             Request::Ask { question, options } => {
-                core.ask(&session, &question, &options).await
+                core.ask(session, &question, &options).await
             }
         };
 
@@ -330,8 +363,6 @@ async fn serve_client(core: Arc<Core>, stream: TcpStream, token: String) -> Resu
         write.write_all(format!("{}\n", serde_json::to_string(&resp)?).as_bytes()).await?;
     }
 
-    log::info!("session gone: {label} ({session})");
-    core.close_session(&session, None).await;
     Ok(())
 }
 
