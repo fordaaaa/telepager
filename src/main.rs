@@ -2,6 +2,7 @@ mod client;
 mod config;
 mod daemon;
 mod ipc;
+mod llm;
 mod mcp;
 mod status;
 mod telegram;
