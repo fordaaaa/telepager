@@ -1,3 +1,4 @@
+mod agents;
 mod client;
 mod config;
 mod daemon;
