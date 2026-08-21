@@ -66,33 +66,43 @@ directory. That needs to become a real record:
 Both the ui and telegram topics render the same session list. One model, two
 front ends.
 
+## Status
+
+Phases 0–7 are done. telepager is the app described above: one background
+process owning Telegram, the session registry, the spawned agents and the
+console, with the MCP shim as one client of it. The master agent landed with
+phase 4 and runs on any of four model providers.
+
+What's left from the original sketch: Telegram topics (phase 6) is unbuilt —
+the phone gets one chat and `/status` rather than a thread per session.
+
 ## Phases
 
-**0. Ship 0.1.0.** Fix the `macos-13` runner in the release matrix by
+**0. Ship 0.1.0.** ✅ Fix the `macos-13` runner in the release matrix by
 cross-compiling the intel mac binary from the arm runner. Finish the npm
 publish. Do not start the refactor on top of an unreleased tree.
 
-**1. Command restructure.** Subcommands as above, `telepager mcp` added with the
+**1. Command restructure.** ✅ Subcommands as above, `telepager mcp` added with the
 bare form still working. Registration docs updated. No behaviour change.
 
-**2. Session model + event bus.** Sessions become records with ids and state.
+**2. Session model + event bus.** ✅ Sessions become records with ids and state.
 Core gains a broadcast channel of events. Nothing consumes it yet except
 `telepager status`.
 
-**3. Web ui, read only.** Loopback http server, session tabs, live event log via
+**3. Web ui, read only.** ✅ Loopback http server, session tabs, live event log via
 server-sent events, daemon health. Proves the plumbing with no new risk.
 
-**4. Agent spawning.** `@spawnagent <dir> <task>` from telegram, and a spawn
+**4. Agent spawning.** ✅ `@spawnagent <dir> <task>` from telegram, and a spawn
 button in the ui. Directory allowlist, confirm button before each spawn. Output
 streams to the ui terminal pane and, condensed, to telegram.
 
-**5. Interactive ui.** Answer questions from the browser, kill a spawned agent,
+**5. Interactive ui.** ✅ Answer questions from the browser, kill a spawned agent,
 re-run a task.
 
-**6. Telegram topics.** A supergroup with topics, one thread per session, so the
+**6. Telegram topics.** — not built. A supergroup with topics, one thread per session, so the
 phone gets the same tabs as the browser.
 
-**7. Packaging.** Embed the ui assets in the binary. Replace the npm postinstall
+**7. Packaging.** ✅ Embed the ui assets in the binary. Replace the npm postinstall
 download with per-platform optional dependencies so `ignore-scripts` installs
 still work. Ship the wizard.
 
@@ -113,22 +123,28 @@ doesn't. Which also means it can be added last, and telepager works without it.
 
 Lands with phase 4, since it has nothing to orchestrate until spawning exists.
 
-## Decisions needed
+## Decisions made
 
-- **Which agent CLIs.** `claude -p` first. The spawn command should be
-  configurable so opencode and others work without code changes.
-- **Does the app run headless by default?** If `telepager` always opens a
-  browser, servers and ssh sessions get awkward. Probably `telepager --no-ui`.
-- **Binary size.** Embedded assets will push it past 6mb. Fine, but it's a real
-  jump from the current 5.5mb.
+- **Which agent CLIs.** Ten are built in — claude, codex, gemini, opencode,
+  cursor-agent, amp, aider, crush, qwen, goose — and only the ones actually on
+  PATH are offered. Anything else is a config entry, no code change.
+- **Does the app run headless by default?** No: `telepager` opens a browser,
+  because that's what makes it one command. `--no-open` skips it and prints the
+  url instead, and `telepager daemon` never opens one. Both are what you want
+  over ssh.
+- **Binary size.** 6.2mb with the console embedded, up from 5.5mb. Fine.
+- **Which model runs the master agent.** Any of anthropic, openai-shaped,
+  gemini or ollama, picked in the console. Defaulting to one vendor would have
+  made the whole thing a Claude accessory.
 
 ## Risks
 
-**The security promise changes.** The readme currently says telepager cannot run
-commands or touch your machine. Phase 4 deletes that sentence: a bot token would
-become a way to run code here. The directory allowlist and the confirm button
-are what keep it honest, and an empty allowlist keeps the feature inert for
-anyone who hasn't opted in.
+**The security promise changed.** The readme used to say telepager cannot run
+commands or touch your machine. That sentence is gone: a bot token is now a way
+to run code here. What keeps it honest is the directory allowlist, which is
+empty by default — so Telegram cannot spawn anything until you opt in — and the
+split between the remote surface (Telegram, gated) and the local one (the
+console, not gated, because reaching it means being at the machine).
 
 **Scope.** Phases 0–3 are additive and safe. Phase 4 onward is a different
 product with a different maintenance burden. It's worth deciding at that point

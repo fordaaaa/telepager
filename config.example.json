@@ -1,6 +1,19 @@
 {
-  "bot_token": "PASTE_BOTFATHER_TOKEN_HERE",
+  "bot_token": "123456:ABC-DEF-your-token-from-BotFather",
   "allowed_user_ids": [123456789],
-  "chat_id": null,
-  "ask_timeout_seconds": 300
+
+  "master": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-5-20250929"
+  },
+
+  "allowed_dirs": [],
+
+  "agents": {
+    "mine": {
+      "command": "my-agent",
+      "args": ["--prompt", "{task}"],
+      "description": "shows up in the console's agent picker"
+    }
+  }
 }
