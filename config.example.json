@@ -3,8 +3,7 @@
   "allowed_user_ids": [123456789],
 
   "master": {
-    "provider": "anthropic",
-    "model": "claude-sonnet-4-5-20250929"
+    "provider": "claude-code"
   },
 
   "allowed_dirs": [],

@@ -49,6 +49,7 @@ done. The app keeps running in the background; `telepager stop` ends it.
 | `telepager status` | is it set up, is it running, which model |
 | `telepager stop` | stop the background app |
 | `telepager mcp` | the stdio server an MCP client spawns |
+| `telepager master-mcp` | the tools a CLI-backed master reaches telepager through (started by telepager, not you) |
 | `telepager daemon` | run in the foreground, no browser |
 
 <details>
@@ -100,18 +101,42 @@ It can start workers, summarise what they're doing, read their output, type
 follow-ups at them, kill stuck ones, and — when you've told it how — answer a
 question a worker is blocked on.
 
-### It isn't only Claude
+### No API key required
 
-The master agent runs on whichever model you point it at:
+The two easiest backends reuse a CLI you're already logged into, so there's no
+key to find and nothing extra to pay for:
+
+| Provider | What it uses |
+| --- | --- |
+| `claude-code` | your Claude Code login — the subscription you already have |
+| `opencode` | whatever opencode is set to, **including its free models** |
+
+```json
+{ "master": { "provider": "claude-code" } }
+```
+
+```json
+{ "master": { "provider": "opencode", "model": "opencode/nemotron-3.5-lightning-free" } }
+```
+
+telepager runs the CLI headlessly and hands it its own tools over MCP, so the
+agent loop happens inside Claude Code or opencode while the spawning, session
+list and questions stay telepager's. Conversations continue across messages —
+it resumes the CLI's own session rather than replaying history.
+
+It only gets telepager's tools, not the CLI's file editing or shell. The master
+orchestrates; the workers do the work.
+
+### Or a model API directly
 
 | Provider | Set | Notes |
 | --- | --- | --- |
-| `anthropic` | `ANTHROPIC_API_KEY` | the default |
+| `anthropic` | `ANTHROPIC_API_KEY` | |
 | `openai` | `OPENAI_API_KEY` | also OpenRouter, Groq, Together, LM Studio, vLLM — anything OpenAI-shaped, via `base_url` |
 | `gemini` | `GEMINI_API_KEY` | |
 | `ollama` | — | runs locally, no key |
 
-Pick one in the console under **Settings**, or write it yourself:
+Pick any of them in the console under **Settings**, or write it yourself:
 
 ```json
 {
@@ -217,7 +242,7 @@ Also read from `./telepager.config.json`; `--config PATH` overrides the lookup.
 | `allowed_user_ids` | — | Required, non-empty. `TELEGRAM_ALLOWED_IDS` (comma-separated) overrides it. |
 | `chat_id` | lowest allowed id | Where messages go. Rarely set. |
 | `ask_timeout_seconds` | `300` | How long `ask_question` waits before giving up. |
-| `master` | anthropic | The model the master agent runs on. See above. |
+| `master` | claude-code | What the master agent runs on: `claude-code`, `opencode`, `anthropic`, `openai`, `gemini` or `ollama`. See above. |
 | `agents` | the built-in list | Worker agent CLIs. Yours override built-ins of the same name. |
 | `allowed_dirs` | `[]` | Directories Telegram may start agents in. Empty disables it. |
 | `ui_port` | any free port | Pin the console's port. |
