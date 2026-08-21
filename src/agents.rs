@@ -57,22 +57,7 @@ pub fn which(command: &str) -> Option<PathBuf> {
     }
 
     let path = std::env::var_os("PATH")?;
-    let extensions: Vec<String> = if cfg!(windows) {
-        // the bare name comes first: a command configured as `claude.cmd`
-        // already carries its extension and would never be found if we only
-        // ever appended one
-        let mut all = vec![String::new()];
-        all.extend(
-            std::env::var("PATHEXT")
-                .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into())
-                .split(';')
-                .filter(|e| !e.is_empty())
-                .map(|e| e.to_lowercase()),
-        );
-        all
-    } else {
-        vec![String::new()]
-    };
+    let extensions = candidate_extensions(cfg!(windows), std::env::var("PATHEXT").ok());
 
     for dir in std::env::split_paths(&path) {
         for ext in &extensions {
@@ -83,6 +68,29 @@ pub fn which(command: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// The suffixes to try after a bare command name, in order.
+///
+/// Always starts with the empty string so the name is tried exactly as given:
+/// a command configured as `claude.cmd` already carries its extension and
+/// would never be found if we only ever appended one.
+///
+/// Takes its inputs as arguments rather than reading the environment, so the
+/// Windows branch is testable from any platform and no test has to mutate
+/// global state to reach it.
+fn candidate_extensions(windows: bool, pathext: Option<String>) -> Vec<String> {
+    let mut all = vec![String::new()];
+    if windows {
+        all.extend(
+            pathext
+                .unwrap_or_else(|| ".EXE;.CMD;.BAT;.COM".into())
+                .split(';')
+                .filter(|e| !e.is_empty())
+                .map(|e| e.to_lowercase()),
+        );
+    }
+    all
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -312,30 +320,18 @@ mod tests {
     }
 
     #[test]
-    fn a_name_that_already_has_its_extension_is_tried_as_given() {
-        // regression: on windows the candidate list was built purely by
-        // appending PATHEXT entries, so an exact name was never probed
-        let dir = std::env::temp_dir().join(format!("telepager-ext-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("agent.cmd");
-        std::fs::write(&file, "echo hi").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+    fn the_bare_name_is_always_tried_first() {
+        // regression: the windows list was built purely by appending PATHEXT
+        // entries, so a command like `claude.cmd` was never probed as given
+        let windows = candidate_extensions(true, Some(".EXE;.CMD".into()));
+        assert_eq!(windows, vec!["", ".exe", ".cmd"]);
 
-        // an explicit path always worked; this is the PATH-lookup branch
-        let previous = std::env::var_os("PATH");
-        std::env::set_var("PATH", &dir);
-        let found = which("agent.cmd");
-        match previous {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
+        // empty entries in PATHEXT shouldn't produce duplicate bare probes
+        let padded = candidate_extensions(true, Some(".EXE;;.BAT;".into()));
+        assert_eq!(padded, vec!["", ".exe", ".bat"]);
 
-        assert_eq!(found.as_deref(), Some(file.as_path()));
-        std::fs::remove_dir_all(&dir).unwrap();
+        // and unix only ever wants the name itself
+        assert_eq!(candidate_extensions(false, None), vec![""]);
     }
 
     #[test]
