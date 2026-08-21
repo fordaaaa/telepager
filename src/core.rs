@@ -50,7 +50,9 @@ struct Pending {
 /// holding the whole process table while an agent runs for an hour.
 struct AgentProcess {
     child: Arc<Mutex<Child>>,
-    stdin: Option<ChildStdin>,
+    /// Behind its own lock, so writing to an agent that has stopped reading
+    /// can't hold up the whole process table while the pipe buffer is full.
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
 }
 
 /// Where the web UI is listening, published so `telepager webui` can find it.
@@ -478,7 +480,10 @@ impl Core {
         self.processes
             .lock()
             .await
-            .insert(id.clone(), AgentProcess { child: child.clone(), stdin });
+            .insert(
+                id.clone(),
+                AgentProcess { child: child.clone(), stdin: Arc::new(Mutex::new(stdin)) },
+            );
 
         if let Some(out) = stdout {
             tokio::spawn(pump(self.clone(), id.clone(), "stdout", out));
@@ -493,16 +498,27 @@ impl Core {
 
     /// Type something at a running agent's stdin.
     pub async fn write_to_agent(&self, id: &str, text: &str) -> Result<()> {
-        let mut procs = self.processes.lock().await;
-        let proc = procs.get_mut(id).context("that session isn't a running agent")?;
-        let stdin = proc.stdin.as_mut().context("that agent isn't reading stdin any more")?;
+        // take the handle and let go of the table: an agent that has stopped
+        // reading stdin will block this write until its pipe drains, and
+        // holding the table meanwhile would wedge every other agent too
+        let stdin = {
+            let procs = self.processes.lock().await;
+            let proc = procs.get(id).context("that session isn't a running agent")?;
+            proc.stdin.clone()
+        };
 
-        stdin.write_all(text.as_bytes()).await.context("writing to the agent")?;
-        if !text.ends_with('\n') {
-            stdin.write_all(b"\n").await.ok();
+        {
+            let mut guard = stdin.lock().await;
+            let handle = guard
+                .as_mut()
+                .context("that agent isn't reading stdin any more")?;
+
+            handle.write_all(text.as_bytes()).await.context("writing to the agent")?;
+            if !text.ends_with('\n') {
+                handle.write_all(b"\n").await.ok();
+            }
+            handle.flush().await.ok();
         }
-        stdin.flush().await.ok();
-        drop(procs);
 
         self.record(Some(id), EventKind::Notice { text: format!("< {text}") }).await;
         Ok(())
@@ -510,9 +526,13 @@ impl Core {
 
     /// Close an agent's stdin, which is how most CLIs are told to finish.
     pub async fn close_agent_stdin(&self, id: &str) -> Result<()> {
-        let mut procs = self.processes.lock().await;
-        let proc = procs.get_mut(id).context("that session isn't a running agent")?;
-        proc.stdin = None;
+        let stdin = {
+            let procs = self.processes.lock().await;
+            let proc = procs.get(id).context("that session isn't a running agent")?;
+            proc.stdin.clone()
+        };
+        // dropping the handle is what actually sends EOF
+        *stdin.lock().await = None;
         Ok(())
     }
 
@@ -688,6 +708,60 @@ mod tests {
         c.set_ui(UiInfo { port: 4321, key: "abc".into() }).await;
         let url = c.ui().await.unwrap().url();
         assert_eq!(url, "http://127.0.0.1:4321/?k=abc");
+    }
+
+    /// A core with a real config file, so `spawn_agent` works. The agent
+    /// named "sleeper" never reads its stdin, which is the shape that used to
+    /// wedge the process table.
+    fn configured_core(name: &str) -> (Arc<Core>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("telepager-core-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "bot_token": "1:fake",
+                "allowed_user_ids": [1],
+                "agents": {
+                    "sleeper": { "command": "sh", "args": ["-c", "sleep 30"] }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (Core::new(Some(path.clone())), dir)
+    }
+
+    #[tokio::test]
+    async fn a_blocked_stdin_write_does_not_wedge_the_process_table() {
+        if crate::agents::which("sh").is_none() {
+            return;
+        }
+        let (core, dir) = configured_core("stdin");
+        let id = core
+            .spawn_agent("sleeper", dir.to_str().unwrap(), "sleep", false)
+            .await
+            .unwrap();
+
+        // more than a pipe buffer, aimed at an agent that never reads: this
+        // write cannot complete, and must not be holding the table
+        let writer = {
+            let core = core.clone();
+            let id = id.clone();
+            tokio::spawn(async move { core.write_to_agent(&id, &"x".repeat(1024 * 1024)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // the table has to still be usable while that write is stuck
+        let reachable = tokio::time::timeout(Duration::from_secs(5), core.is_running(&id)).await;
+        assert!(reachable.is_ok(), "the process table was blocked by a stuck write");
+
+        let killed = tokio::time::timeout(Duration::from_secs(10), core.kill_agent(&id)).await;
+        assert!(killed.is_ok(), "kill_agent could not run while a write was stuck");
+
+        writer.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
