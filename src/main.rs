@@ -52,6 +52,8 @@ usage: telepager [--config PATH]
 ";
 
 fn main() -> ExitCode {
+    restore_sigpipe();
+
     let action = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -114,6 +116,24 @@ fn finish(result: anyhow::Result<()>) -> ExitCode {
         }
     }
 }
+
+/// Rust ignores SIGPIPE, so `telepager status | head` panics on the first
+/// write after head exits. Put the default handler back and we exit quietly
+/// like every other command line tool.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
 
 // stdout is the mcp transport so logs have to go to stderr
 fn init_logging() {
