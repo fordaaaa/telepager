@@ -70,8 +70,11 @@ impl Conversation {
         if self.history.len() > MAX_HISTORY {
             let drop = self.history.len() - MAX_HISTORY;
             self.history.drain(..drop);
-            // a tool result whose call got dropped confuses every provider
-            while matches!(self.history.first(), Some(Msg::ToolResult { .. })) {
+
+            // a conversation has to start on a user turn: anthropic rejects
+            // anything else outright, and gemini's contents are turn-ordered.
+            // a tool result whose call got trimmed is just as broken.
+            while !matches!(self.history.first(), None | Some(Msg::User(_))) {
                 self.history.remove(0);
             }
         }
@@ -257,10 +260,14 @@ pub async fn reply(core: &Arc<Core>, text: &str, origin: Origin) -> Result<Strin
         let history = core.master.lock().await.history.clone();
         let turn: Turn = llm.turn(&system, &history, &toolbox).await?;
 
-        core.master.lock().await.push(Msg::Assistant {
-            text: turn.text.clone(),
-            calls: turn.calls.clone(),
-        });
+        // a turn with neither prose nor tool calls isn't a legal message for
+        // any provider, and openai rejects the whole request over it
+        if !turn.text.trim().is_empty() || !turn.calls.is_empty() {
+            core.master.lock().await.push(Msg::Assistant {
+                text: turn.text.clone(),
+                calls: turn.calls.clone(),
+            });
+        }
 
         if !turn.text.trim().is_empty() {
             core.record(None, EventKind::Chat { role: "master".into(), text: turn.text.clone() })
@@ -453,6 +460,18 @@ mod tests {
             assert_eq!(t.schema["type"], "object", "{} has a bad schema", t.name);
             assert!(!t.description.is_empty(), "{} has no description", t.name);
         }
+    }
+
+    #[test]
+    fn trimming_always_leaves_a_user_turn_first() {
+        let mut c = Conversation::default();
+        // fill past the cap, ending on an assistant turn so the trim has to
+        // walk past it to find a user message
+        for i in 0..MAX_HISTORY {
+            c.push(Msg::User(format!("m{i}")));
+            c.push(Msg::Assistant { text: format!("r{i}"), calls: vec![] });
+        }
+        assert!(matches!(c.history.first(), Some(Msg::User(_))), "history must open on a user turn");
     }
 
     #[test]
