@@ -6,8 +6,10 @@
 //! runnable, and configuring it is something you do from inside it.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::sync::Semaphore;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,6 +27,12 @@ const PAGE: &str = include_str!("web_page.html");
 /// browser request doesn't look hung.
 const DETECT_POLL_SECONDS: u64 = 15;
 const MAX_BODY: usize = 256 * 1024;
+/// How long a connection gets to send its request line, headers and body.
+/// Only covers the read: an event stream is meant to stay open afterwards.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Ceiling on connections being served at once, so idle sockets can't exhaust
+/// file descriptors. Generous — a console tab uses one stream plus short calls.
+const MAX_CONNECTIONS: usize = 64;
 /// How much history a freshly opened page is given.
 const SNAPSHOT_EVENTS: usize = 400;
 
@@ -64,16 +72,22 @@ pub async fn start(core: Arc<Core>, open_browser: bool, port_override: u16) -> R
 
     let serving = core.clone();
     let key = info.key.clone();
+    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let core = serving.clone();
                     let key = key.clone();
+                    // dropped when the connection ends, releasing the slot
+                    let Ok(permit) = permits.clone().acquire_owned().await else {
+                        return;
+                    };
                     tokio::spawn(async move {
                         if let Err(e) = handle(core, stream, key).await {
                             log::debug!("console connection ended: {e:#}");
                         }
+                        drop(permit);
                     });
                 }
                 Err(e) => {
@@ -112,7 +126,12 @@ pub fn run_standalone(config: Option<std::path::PathBuf>, port: u16, open: bool)
 }
 
 async fn handle(core: Arc<Core>, mut stream: TcpStream, key: String) -> Result<()> {
-    let Some(req) = read_request(&mut stream).await? else {
+    // a peer that connects and then says nothing would otherwise hold a task,
+    // a socket and up to MAX_BODY of buffer for as long as the app runs
+    let Some(req) = tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut stream))
+        .await
+        .context("the request was too slow to arrive")??
+    else {
         return Ok(());
     };
 
@@ -147,7 +166,19 @@ async fn handle(core: Arc<Core>, mut stream: TcpStream, key: String) -> Result<(
     let body: Value = if req.body.is_empty() {
         json!({})
     } else {
-        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+        match serde_json::from_slice(&req.body) {
+            Ok(value) => value,
+            // saying "missing 'token'" for a syntax error sends people hunting
+            // for the wrong problem
+            Err(e) => {
+                return reply_json(
+                    &mut stream,
+                    400,
+                    &json!({ "error": format!("the request body isn't valid JSON: {e}") }),
+                )
+                .await
+            }
+        }
     };
 
     let (status, payload) = match route(&core, req.path.as_str(), body).await {
@@ -673,24 +704,27 @@ fn query_param(target: &str, name: &str) -> Option<String> {
 }
 
 /// Enough of percent decoding for a session id or a path in a query string.
+///
+/// Works on bytes throughout. Slicing the &str by byte offsets would panic
+/// whenever an escape landed mid-character, on input that reaches us before
+/// any authentication.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
+            b'%' => match hex_pair(bytes, i) {
+                Some(byte) => {
+                    out.push(byte);
+                    i += 3;
                 }
-            }
+                // a malformed escape is a literal percent sign
+                None => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -702,6 +736,22 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The two hex digits following a `%`, if both are really there and really hex.
+fn hex_pair(bytes: &[u8], at: usize) -> Option<u8> {
+    let hi = hex_digit(*bytes.get(at + 1)?)?;
+    let lo = hex_digit(*bytes.get(at + 2)?)?;
+    Some(hi * 16 + lo)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn host_is_local(host: &str) -> bool {
@@ -795,6 +845,29 @@ mod tests {
         assert_eq!(percent_decode("%2Ftmp%2Fx"), "/tmp/x");
         // a broken escape is left alone rather than dropped
         assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn a_malformed_escape_never_panics() {
+        // regression: these used to slice the &str mid-character and panic,
+        // on input that arrives before any authentication
+        assert_eq!(percent_decode("%\u{20AC}"), "%\u{20AC}");
+        assert_eq!(percent_decode("%é"), "%é");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%2"), "%2");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("100%"), "100%");
+        // and the valid cases still decode
+        assert_eq!(percent_decode("%2Ftmp%2Fx"), "/tmp/x");
+        assert_eq!(percent_decode("%7e"), "~");
+        assert_eq!(percent_decode("a+b"), "a b");
+    }
+
+    #[test]
+    fn hex_pairs_are_only_accepted_when_both_digits_are_hex() {
+        assert_eq!(hex_pair(b"%41", 0), Some(0x41));
+        assert_eq!(hex_pair(b"%4g", 0), None);
+        assert_eq!(hex_pair(b"%4", 0), None);
     }
 
     #[test]
