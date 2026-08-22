@@ -4,10 +4,6 @@
 
 **Run and watch coding agents from your phone.**
 
-Start an agent in a directory, watch it work, answer the questions it gets stuck
-on, and kill it when it goes wrong — from Telegram, or from a console on your
-own machine.
-
 [![npm](https://img.shields.io/npm/v/telepager?color=cb3837&logo=npm)](https://www.npmjs.com/package/telepager)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#install)
@@ -16,80 +12,51 @@ own machine.
 
 ---
 
-```
-                    ┌─────────────────────────────────────┐
-  browser ──http──▶ │  console ─┐                         │
-                    │           ├─ sessions, events,      │ ──https──▶ Telegram
-  Claude Code ──────│  mcp shim ┘   master agent,         │               │
-      (stdio)       │               agent supervisor      │               ▼
-                    └───────────────────┬─────────────────┘          your phone
-                                        ▼
-                          claude · codex · gemini · opencode …
-```
+Start an agent in a directory, watch it work, answer questions it gets stuck
+on, and kill it when it goes wrong — from Telegram or a local console. Runs
+entirely on your machine; no webhook or public URL needed.
 
-One command starts everything. No webhook, no public URL, no port forwarding —
-it runs on your machine and dials out.
-
-## Start
+## Install & start
 
 ```bash
 npm install -g telepager
 telepager
 ```
 
-That's it. `telepager` starts the app and opens the console in your browser. If
-Telegram isn't connected yet, the page walks you through it — paste a bot token
-from [@BotFather](https://t.me/BotFather), press **Detect**, message your bot,
-done. The app keeps running in the background; `telepager stop` ends it.
+First run opens the console and walks you through connecting Telegram: paste
+a bot token from [@BotFather](https://t.me/BotFather), press **Detect**,
+message your bot, done.
 
 | Command | What it does |
 | --- | --- |
-| `telepager` | start the app and open the console |
-| `telepager webui` | the same thing, said out loud |
-| `telepager status` | is it set up, is it running, which model |
+| `telepager` / `telepager webui` | start the app, open the console |
+| `telepager status` | check setup, running state, active model |
 | `telepager stop` | stop the background app |
-| `telepager mcp` | the stdio server an MCP client spawns |
-| `telepager master-mcp` | the tools a CLI-backed master reaches telepager through (started by telepager, not you) |
 | `telepager daemon` | run in the foreground, no browser |
+| `telepager mcp` | stdio MCP server (spawned by MCP clients) |
 
 <details>
-<summary>Other ways to install</summary>
-
-**Without installing anything** — `npx` fetches it on demand:
+<summary>Other install methods</summary>
 
 ```bash
-npx -y telepager
+npx -y telepager                    # no install
+curl -fsSL https://raw.githubusercontent.com/fordaaaa/telepager/main/install.sh | sh   # plain binary
+cargo build --release               # from source -> target/release/telepager
 ```
 
-**The install script**, if you'd rather have a plain binary:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/fordaaaa/telepager/main/install.sh | sh
-```
-
-**From source:**
-
-```bash
-cargo build --release   # -> target/release/telepager
-```
-
-If `npm install -g` fails with `EACCES`, npm is trying to write somewhere you
-don't own. Point it at your home directory — this fixes every global npm
-package, not just this one:
+If `npm install -g` fails with `EACCES`, point npm at your home directory
+instead of using `sudo`:
 
 ```bash
 npm config set prefix ~/.local
 ```
 
-Don't reach for `sudo`: you'd be running a downloaded executable as root.
-
 </details>
 
-## The master agent
+## Using it
 
-You talk to it in Telegram, or in the console's chat pane. It isn't a router —
-answering a question still goes straight back to the session that asked. It's
-the thing you *talk to* when you're not addressing any particular session:
+Talk to the **master agent** in Telegram or the console's chat pane — it's
+what you address when you're not talking to a specific session:
 
 > **you:** start claude in ~/code/api and make the tests pass
 > **telepager:** Started claude in /home/you/code/api — session s3.
@@ -97,46 +64,32 @@ the thing you *talk to* when you're not addressing any particular session:
 > **you:** how's it going?
 > **telepager:** It's rewritten the fixtures and is on the last two failures.
 
-It can start workers, summarise what they're doing, read their output, type
-follow-ups at them, kill stuck ones, and — when you've told it how — answer a
-question a worker is blocked on.
+It starts workers, summarizes what they're doing, reads their output, sends
+follow-ups, kills stuck ones, and answers questions a worker is blocked on.
 
-### No API key required
+Worker agents are ordinary coding CLIs — anything installed on your machine
+shows up in the picker with no config: `claude` · `codex` · `gemini` ·
+`opencode` · `cursor-agent` · `amp` · `aider` · `crush` · `qwen` · `goose`.
 
-The two easiest backends reuse a CLI you're already logged into, so there's no
-key to find and nothing extra to pay for:
+### Master agent provider
 
-| Provider | What it uses |
-| --- | --- |
-| `claude-code` | your Claude Code login — the subscription you already have |
-| `opencode` | whatever opencode is set to, **including its free models** |
+No key needed — reuse a CLI you're already logged into:
 
 ```json
 { "master": { "provider": "claude-code" } }
 ```
-
 ```json
 { "master": { "provider": "opencode", "model": "opencode/nemotron-3.5-lightning-free" } }
 ```
 
-telepager runs the CLI headlessly and hands it its own tools over MCP, so the
-agent loop happens inside Claude Code or opencode while the spawning, session
-list and questions stay telepager's. Conversations continue across messages —
-it resumes the CLI's own session rather than replaying history.
-
-It only gets telepager's tools, not the CLI's file editing or shell. The master
-orchestrates; the workers do the work.
-
-### Or a model API directly
+Or a model API directly, set via env var or in the console's **Settings**:
 
 | Provider | Set | Notes |
 | --- | --- | --- |
 | `anthropic` | `ANTHROPIC_API_KEY` | |
-| `openai` | `OPENAI_API_KEY` | also OpenRouter, Groq, Together, LM Studio, vLLM — anything OpenAI-shaped, via `base_url` |
+| `openai` | `OPENAI_API_KEY` | also OpenRouter, Groq, Together, LM Studio, vLLM via `base_url` |
 | `gemini` | `GEMINI_API_KEY` | |
 | `ollama` | — | runs locally, no key |
-
-Pick any of them in the console under **Settings**, or write it yourself:
 
 ```json
 {
@@ -148,20 +101,7 @@ Pick any of them in the console under **Settings**, or write it yourself:
 }
 ```
 
-If you already have a key exported, telepager finds it — `OPENROUTER_API_KEY`,
-`GROQ_API_KEY` and friends are all checked before it gives up.
-
-## Worker agents
-
-The agents the master starts are ordinary coding CLIs. Anything installed on
-your machine shows up in the picker with no configuration:
-
-`claude` · `codex` · `gemini` · `opencode` · `cursor-agent` · `amp` · `aider`
-· `crush` · `qwen` · `goose`
-
-Add your own, or change how one is invoked, in the config file. `{task}` is
-replaced with the task text as a single argument — no shell, so quotes and
-semicolons in a task are inert:
+### Custom worker agents
 
 ```json
 {
@@ -175,9 +115,12 @@ semicolons in a task are inert:
 }
 ```
 
+`{task}` is passed as a single argument — no shell, so quotes and semicolons
+in a task are inert.
+
 ## As an MCP server
 
-telepager still does what it always did: let an agent page *you*.
+Let an agent page *you*:
 
 ```bash
 claude mcp add --scope user telepager -- telepager mcp
@@ -185,48 +128,17 @@ claude mcp add --scope user telepager -- telepager mcp
 
 | Tool | What it does |
 | --- | --- |
-| `send_message(text)` | Sends a message. Text over 4096 chars is split across several. |
-| `send_thinking(text)` | Shows a `💭 …` status line, **edited in place** instead of spamming the chat. |
-| `ask_question(question, options[])` | Sends the question with numbered buttons, blocks until you answer, and returns what you picked. |
+| `send_message(text)` | send a message (splits at 4096 chars) |
+| `send_thinking(text)` | a `💭 …` status line, edited in place |
+| `ask_question(question, options[])` | blocks until you answer; returns your pick |
 
-`ask_question` is the point of the whole thing. The tool call doesn't return, so
-your agent is genuinely parked until you answer — it stops and waits instead of
-guessing. Answer from Telegram or from the console; both reach the same session.
-
-Nothing forces an agent to page you, so add a line to your `CLAUDE.md`:
+Add to your `CLAUDE.md` so agents actually use it:
 
 > When you hit a decision you'd otherwise guess at during a long task, use
 > telepager's `ask_question` to ask me instead. Page me with `send_message`
 > when a long task finishes.
 
-## Security
-
-**telepager runs code on your machine.** That's the feature, and it's a real
-change from what it used to be — older versions couldn't touch anything but
-Telegram messages. What keeps it honest:
-
-- **The allowlist is the whole model.** telepager refuses to start with an empty
-  `allowed_user_ids`. Messages and taps from anyone else are ignored.
-- **Telegram can only start agents in directories you've allowed.** `allowed_dirs`
-  is empty by default, which means Telegram can't spawn anything at all. Set it
-  in the console under Settings. The local console isn't restricted — opening it
-  means you're already at the machine.
-- **The console is loopback-only**, on a random port, behind a one-off key in the
-  URL, and refuses requests whose `Host` isn't localhost.
-- **The bot token is a secret.** Anyone holding it can act as your bot. Prefer
-  `TELEGRAM_BOT_TOKEN` over the plaintext file; the config is written `0600`.
-- **Telegram is not end-to-end encrypted.** Don't have your agent page you with
-  real secrets.
-- **Keys never reach a log.** Both the bot token and your model key are scrubbed
-  out of every error before it goes anywhere.
-
-If you want the old, inert behaviour: leave `allowed_dirs` empty and don't
-configure a master agent. Spawning is then unreachable from Telegram, and
-telepager is a pager again.
-
 ## Configuration
-
-Where the file lives:
 
 | Platform | Path |
 | --- | --- |
@@ -242,31 +154,40 @@ Also read from `./telepager.config.json`; `--config PATH` overrides the lookup.
 | `allowed_user_ids` | — | Required, non-empty. `TELEGRAM_ALLOWED_IDS` (comma-separated) overrides it. |
 | `chat_id` | lowest allowed id | Where messages go. Rarely set. |
 | `ask_timeout_seconds` | `300` | How long `ask_question` waits before giving up. |
-| `master` | claude-code | What the master agent runs on: `claude-code`, `opencode`, `anthropic`, `openai`, `gemini` or `ollama`. See above. |
-| `agents` | the built-in list | Worker agent CLIs. Yours override built-ins of the same name. |
+| `master` | claude-code | `claude-code`, `opencode`, `anthropic`, `openai`, `gemini`, or `ollama`. |
+| `agents` | built-in list | Worker agent CLIs. Yours override built-ins of the same name. |
 | `allowed_dirs` | `[]` | Directories Telegram may start agents in. Empty disables it. |
 | `ui_port` | any free port | Pin the console's port. |
 
-## How it runs
+## Security
 
-Telegram allows one poller per bot, so telepager runs one background process
-that owns everything: the Telegram connection, the session registry, the agents
-it spawned, and the console. Everything else — the MCP shims, your browser — is
-a client of it over loopback, authenticated with a token in a `0600` file.
+**telepager runs code on your machine.**
 
-The first thing that needs it starts it, whether that's `telepager`, `telepager
-webui`, or an MCP client launching the shim. Run as many clients as you like.
+- `allowed_user_ids` must be non-empty — telepager refuses to start otherwise.
+  Messages from anyone else are ignored.
+- `allowed_dirs` is empty by default, so Telegram can't spawn agents anywhere
+  until you set it. The local console is unrestricted — using it means you're
+  already at the machine.
+- The console is loopback-only, on a random port, behind a one-off key in the
+  URL, and checks the `Host` header.
+- Prefer `TELEGRAM_BOT_TOKEN` over the plaintext config; the file is `0600`.
+  Anyone with the bot token can act as your bot.
+- Telegram isn't end-to-end encrypted — don't page real secrets through it.
+- Keys are scrubbed from every error before it's logged or sent anywhere.
+
+To keep the old, inert pager-only behavior: leave `allowed_dirs` empty and
+skip configuring a master agent.
 
 ## Known limits
 
-- `ask_question` can outlive your MCP client's own tool-call timeout. If your
-  client gives up first, lower `ask_timeout_seconds` to match.
-- Spawned agents are killed by process group on Unix. On Windows a killed agent
-  may leave grandchildren behind.
-- The app keeps running once started. `telepager stop` ends it.
+- `ask_question` can outlive your MCP client's own tool-call timeout — lower
+  `ask_timeout_seconds` to match if it does.
+- Spawned agents are killed by process group on Unix; on Windows a killed
+  agent may leave grandchildren behind.
+- The app keeps running once started; `telepager stop` ends it.
 
 ## License
 
 [AGPL-3.0](LICENSE). If you modify telepager and distribute it — or run a
-modified version as a service — you have to publish your source under the same
-license.
+modified version as a service — you have to publish your source under the
+same license.
