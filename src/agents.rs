@@ -57,16 +57,7 @@ pub fn which(command: &str) -> Option<PathBuf> {
     }
 
     let path = std::env::var_os("PATH")?;
-    let extensions: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into())
-            .split(';')
-            .filter(|e| !e.is_empty())
-            .map(|e| e.to_lowercase())
-            .collect()
-    } else {
-        vec![String::new()]
-    };
+    let extensions = candidate_extensions(cfg!(windows), std::env::var("PATHEXT").ok());
 
     for dir in std::env::split_paths(&path) {
         for ext in &extensions {
@@ -77,6 +68,29 @@ pub fn which(command: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// The suffixes to try after a bare command name, in order.
+///
+/// Always starts with the empty string so the name is tried exactly as given:
+/// a command configured as `claude.cmd` already carries its extension and
+/// would never be found if we only ever appended one.
+///
+/// Takes its inputs as arguments rather than reading the environment, so the
+/// Windows branch is testable from any platform and no test has to mutate
+/// global state to reach it.
+fn candidate_extensions(windows: bool, pathext: Option<String>) -> Vec<String> {
+    let mut all = vec![String::new()];
+    if windows {
+        all.extend(
+            pathext
+                .unwrap_or_else(|| ".EXE;.CMD;.BAT;.COM".into())
+                .split(';')
+                .filter(|e| !e.is_empty())
+                .map(|e| e.to_lowercase()),
+        );
+    }
+    all
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -303,6 +317,21 @@ mod tests {
         let args = render_args(&["{task}".into()], r#"say "hi"; rm -rf /"#, Path::new("/tmp"));
         // no shell is involved, so this is one inert argument
         assert_eq!(args, vec![r#"say "hi"; rm -rf /"#]);
+    }
+
+    #[test]
+    fn the_bare_name_is_always_tried_first() {
+        // regression: the windows list was built purely by appending PATHEXT
+        // entries, so a command like `claude.cmd` was never probed as given
+        let windows = candidate_extensions(true, Some(".EXE;.CMD".into()));
+        assert_eq!(windows, vec!["", ".exe", ".cmd"]);
+
+        // empty entries in PATHEXT shouldn't produce duplicate bare probes
+        let padded = candidate_extensions(true, Some(".EXE;;.BAT;".into()));
+        assert_eq!(padded, vec!["", ".exe", ".bat"]);
+
+        // and unix only ever wants the name itself
+        assert_eq!(candidate_extensions(false, None), vec![""]);
     }
 
     #[test]

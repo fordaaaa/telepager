@@ -65,6 +65,7 @@
   label { display: block; font-weight: 500; margin-bottom: 6px; font-size: 14px; }
   .hint { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
   .hint a { color: var(--accent); }
+  .hint.bad { color: var(--bad); }
   .field { margin-bottom: 14px; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .grow { flex: 1; min-width: 0; }
@@ -354,12 +355,12 @@
       <label for="model">Model</label>
       <input type="text" class="mono" id="model" placeholder="leave blank for the default">
     </div>
-    <div class="field">
+    <div class="field" id="fieldKey">
       <label for="apiKey">API key</label>
       <input type="text" class="mono" id="apiKey" placeholder="leave blank to keep using the environment">
       <p class="hint" id="keyHint"></p>
     </div>
-    <div class="field">
+    <div class="field" id="fieldBaseUrl">
       <label for="baseUrl">Base URL <span class="muted">(optional)</span></label>
       <input type="text" class="mono" id="baseUrl" placeholder="e.g. https://openrouter.ai/api/v1">
     </div>
@@ -477,8 +478,8 @@ function renderSessions() {
   box.innerHTML = list.map((s) => {
     const on = s.id === selected ? " on" : "";
     const meta = [s.agent || s.kind, s.detail || s.task || s.cwd || ""].filter(Boolean).join(" · ");
-    return '<div class="session' + on + '" data-id="' + s.id + '">' +
-      '<div class="name"><span class="dot ' + s.state + '"></span>' + escapeHtml(s.label) + '</div>' +
+    return '<div class="session' + on + '" data-id="' + escapeHtml(s.id) + '">' +
+      '<div class="name"><span class="dot ' + escapeHtml(s.state) + '"></span>' + escapeHtml(s.label) + '</div>' +
       '<div class="meta">' + escapeHtml(meta) + "</div></div>";
   }).join("");
 
@@ -537,7 +538,7 @@ function renderChat() {
         body = '<span class="muted">' + escapeHtml(t.calls.map((c) => c.name).join(", ")) + "…</span>";
       }
       if (t.role === "tool") body = escapeHtml((t.name ? t.name + ": " : "") + (t.text || ""));
-      return '<div class="turn ' + t.role + '"><div class="who">' + who +
+      return '<div class="turn ' + escapeHtml(t.role) + '"><div class="who">' + escapeHtml(who) +
         '</div><div class="what">' + body + "</div></div>";
     }).join("");
   }
@@ -767,8 +768,8 @@ $("openSpawn").onclick = () => {
   const sel = $("spawnAgent");
   const agents = state.agents || [];
   sel.innerHTML = agents.map((a) =>
-    '<option value="' + a.name + '"' + (a.installed ? "" : " disabled") + ">" +
-    a.name + (a.installed ? "" : " (not installed)") + "</option>").join("");
+    '<option value="' + escapeHtml(a.name) + '"' + (a.installed ? "" : " disabled") + ">" +
+    escapeHtml(a.name) + (a.installed ? "" : " (not installed)") + "</option>").join("");
 
   const describe = () => {
     const a = agents.find((x) => x.name === sel.value);
@@ -808,16 +809,31 @@ $("openSettings").onclick = () => {
   const m = state.master || {};
   const sel = $("provider");
   sel.innerHTML = (m.providers || []).map((p) =>
-    '<option value="' + p.id + '"' + (p.id === m.provider ? " selected" : "") + ">" +
-    p.id + "</option>").join("");
+    '<option value="' + escapeHtml(p.id) + '"' + (p.id === m.provider ? " selected" : "") + ">" +
+    escapeHtml(p.id) + " — " + escapeHtml(p.blurb) + "</option>").join("");
 
   const describe = () => {
     const p = (m.providers || []).find((x) => x.id === sel.value);
     if (!p) return;
-    $("providerHint").textContent = p.needs_key
-      ? (p.has_key_in_env ? p.key_env + " is set in the environment." : "Needs " + p.key_env + ", or a key below.")
-      : "Runs locally, no key needed.";
-    $("model").placeholder = p.default_model;
+
+    /* a cli backend carries its own login, so the key and url fields are noise */
+    const cli = !!p.is_cli;
+    $("fieldKey").style.display = cli ? "none" : "";
+    $("fieldBaseUrl").style.display = cli ? "none" : "";
+
+    if (cli) {
+      $("providerHint").textContent = p.installed
+        ? "Uses the " + p.id + " CLI you're already logged into. No API key needed."
+        : "The " + p.id + " CLI isn't installed on this machine — install it, or pick another.";
+      $("providerHint").className = "hint" + (p.installed ? "" : " bad");
+      $("model").placeholder = "leave blank for whatever that CLI is set to";
+    } else {
+      $("providerHint").textContent = p.needs_key
+        ? (p.has_key_in_env ? p.key_env + " is set in the environment." : "Needs " + p.key_env + ", or a key below.")
+        : "Runs locally, no key needed.";
+      $("providerHint").className = "hint";
+      $("model").placeholder = p.default_model;
+    }
   };
   sel.onchange = describe;
   describe();

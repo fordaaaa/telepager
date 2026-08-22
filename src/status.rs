@@ -87,17 +87,22 @@ pub fn print(config: Option<PathBuf>) {
         Ok(cfg) => {
             println!("  config    ok, {} allowed user(s)", cfg.allowed_user_ids.len());
             let master = &cfg.master;
-            if master.is_usable() {
-                println!(
-                    "  master    {} / {}",
-                    master.provider.as_str(),
-                    master.model_or_default()
-                );
-            } else {
-                println!(
+            let model = master.model_or_default();
+            match (master.is_usable(), master.provider.is_cli()) {
+                // a cli backend with no model set uses whatever it's set to
+                (true, true) if model.is_empty() => println!(
+                    "  master    {} (its own login and model)",
+                    master.provider.as_str()
+                ),
+                (true, _) => println!("  master    {} / {model}", master.provider.as_str()),
+                (false, true) => println!(
+                    "  master    {} isn't installed — install it or pick another in the console",
+                    master.cli_command().unwrap_or_default()
+                ),
+                (false, false) => println!(
                     "  master    no api key — set {} or pick a provider in the console",
                     master.provider.default_key_env()
-                );
+                ),
             }
         }
         Err(e) => {

@@ -23,3 +23,4 @@ npm/README.md
 *.tgz
 .npmrc
 npm/platforms/
+.panoply/

@@ -13,6 +13,8 @@ use std::time::Duration;
 use crate::config::{MasterConfig, Provider};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Why the CLI backends can't reach this file: `Llm::new` refuses them.
+const CLI_GUARD: &str = "cli backends are rejected by Llm::new";
 const REQUEST_TIMEOUT_SECONDS: u64 = 180;
 
 /// A tool the model may call, described the same way for every provider.
@@ -57,6 +59,13 @@ pub struct Llm {
 
 impl Llm {
     pub fn new(cfg: &MasterConfig) -> Result<Self> {
+        if cfg.provider.is_cli() {
+            bail!(
+                "{} is a cli backend — it runs its own agent loop and never comes \
+                 through here",
+                cfg.provider.as_str()
+            );
+        }
         let key = cfg.resolve_key();
         if cfg.provider.needs_key() && key.is_none() {
             bail!(
@@ -144,6 +153,7 @@ impl Llm {
                 }
                 (format!("{}/chat/completions", self.base), headers)
             }
+            Provider::ClaudeCode | Provider::Opencode => unreachable!("{CLI_GUARD}"),
             Provider::Gemini => {
                 // the key goes in a header rather than the query string so it
                 // stays out of logs and error messages
@@ -164,6 +174,7 @@ impl Llm {
             Provider::Anthropic => encode_anthropic(&self.model, self.max_tokens, system, history, tools),
             Provider::Openai | Provider::Ollama => encode_openai(&self.model, self.max_tokens, system, history, tools),
             Provider::Gemini => encode_gemini(self.max_tokens, system, history, tools),
+            Provider::ClaudeCode | Provider::Opencode => unreachable!("{CLI_GUARD}"),
         }
     }
 
@@ -172,6 +183,7 @@ impl Llm {
             Provider::Anthropic => decode_anthropic(value),
             Provider::Openai | Provider::Ollama => decode_openai(value),
             Provider::Gemini => decode_gemini(value),
+            Provider::ClaudeCode | Provider::Opencode => unreachable!("{CLI_GUARD}"),
         }
     }
 }
@@ -299,6 +311,11 @@ fn encode_openai(
         match msg {
             Msg::User(text) => messages.push(json!({ "role": "user", "content": text })),
             Msg::Assistant { text, calls } => {
+                // openai requires content unless there are tool calls, so an
+                // entirely empty turn would make the request invalid
+                if text.trim().is_empty() && calls.is_empty() {
+                    continue;
+                }
                 let mut m = json!({ "role": "assistant" });
                 // content has to be present even when it's only tool calls
                 m["content"] = if text.trim().is_empty() { Value::Null } else { json!(text) };
@@ -598,6 +615,20 @@ mod tests {
         // the empty assistant turn is dropped, the two results share a message
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn openai_drops_an_entirely_empty_assistant_turn() {
+        let h = vec![
+            Msg::User("hi".into()),
+            // what a provider returns on a length cap or a filtered response
+            Msg::Assistant { text: String::new(), calls: vec![] },
+            Msg::User("still there?".into()),
+        ];
+        let body = encode_openai("m", 100, "", &h, &[]);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|m| m["role"] != "assistant"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod agents;
+mod cli_master;
 mod client;
 mod config;
 mod core;
@@ -6,6 +7,7 @@ mod daemon;
 mod ipc;
 mod llm;
 mod master;
+mod master_mcp;
 mod mcp;
 mod session;
 mod status;
@@ -23,6 +25,7 @@ usage: telepager [--config PATH]
        telepager setup [--port N] [--no-open] [--config PATH]
        telepager status [--config PATH]
        telepager mcp [--config PATH]
+       telepager master-mcp
        telepager daemon [--no-open] [--config PATH]
        telepager stop
 
@@ -34,6 +37,8 @@ usage: telepager [--config PATH]
   status          show whether it's set up and running.
   mcp             the stdio server an mcp client starts. this is what you
                   register with claude code, cursor and friends.
+  master-mcp      the tools a cli-backed master agent reaches telepager
+                  through. started by telepager itself, not by you.
   daemon          run the app in the foreground without opening a browser.
   stop            stop the background app.
 
@@ -47,6 +52,8 @@ usage: telepager [--config PATH]
 ";
 
 fn main() -> ExitCode {
+    restore_sigpipe();
+
     let action = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -69,6 +76,10 @@ fn main() -> ExitCode {
         Action::Setup { config, port, open } => {
             init_logging();
             return finish(web::run_standalone(config, port, open));
+        }
+        Action::MasterMcp => {
+            init_logging();
+            return finish(master_mcp::run());
         }
         Action::Mcp(c) => c,
         Action::Daemon { config, open } => {
@@ -106,6 +117,24 @@ fn finish(result: anyhow::Result<()>) -> ExitCode {
     }
 }
 
+/// Rust ignores SIGPIPE, so `telepager status | head` panics on the first
+/// write after head exits. Put the default handler back and we exit quietly
+/// like every other command line tool.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
+
 // stdout is the mcp transport so logs have to go to stderr
 fn init_logging() {
     if std::env::var_os("RUST_LOG").is_none() {
@@ -120,6 +149,8 @@ enum Action {
     Setup { config: Option<PathBuf>, port: u16, open: bool },
     Status(Option<PathBuf>),
     Mcp(Option<PathBuf>),
+    /// The MCP bridge a CLI-backed master agent calls telepager through.
+    MasterMcp,
     Daemon { config: Option<PathBuf>, open: bool },
     Stop,
     Exit,
@@ -142,7 +173,9 @@ fn parse_args() -> Result<Action, String> {
                 println!("telepager {}", env!("CARGO_PKG_VERSION"));
                 return Ok(Action::Exit);
             }
-            "mcp" | "daemon" | "status" | "setup" | "webui" | "ui" | "stop" => mode = Some(arg),
+            "mcp" | "master-mcp" | "daemon" | "status" | "setup" | "webui" | "ui" | "stop" => {
+                mode = Some(arg)
+            }
             "--port" => {
                 let value = args.next().ok_or("--port needs a number")?;
                 port = value
@@ -163,6 +196,7 @@ fn parse_args() -> Result<Action, String> {
         Some("webui") | Some("ui") => Ok(Action::App { config, open }),
         Some("daemon") => Ok(Action::Daemon { config, open: false }),
         Some("mcp") => Ok(Action::Mcp(config)),
+        Some("master-mcp") => Ok(Action::MasterMcp),
         Some("status") => Ok(Action::Status(config)),
         Some("stop") => Ok(Action::Stop),
         // a person typing `telepager` wants the app. a client piping json at
@@ -176,7 +210,7 @@ fn parse_args() -> Result<Action, String> {
 mod tests {
     #[test]
     fn the_usage_documents_every_command() {
-        for command in ["webui", "setup", "status", "mcp", "daemon", "stop"] {
+        for command in ["webui", "setup", "status", "mcp", "master-mcp", "daemon", "stop"] {
             assert!(
                 super::USAGE.contains(command),
                 "usage doesn't mention {command}"

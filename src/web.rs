@@ -6,8 +6,10 @@
 //! runnable, and configuring it is something you do from inside it.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::sync::Semaphore;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,6 +27,12 @@ const PAGE: &str = include_str!("web_page.html");
 /// browser request doesn't look hung.
 const DETECT_POLL_SECONDS: u64 = 15;
 const MAX_BODY: usize = 256 * 1024;
+/// How long a connection gets to send its request line, headers and body.
+/// Only covers the read: an event stream is meant to stay open afterwards.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Ceiling on connections being served at once, so idle sockets can't exhaust
+/// file descriptors. Generous — a console tab uses one stream plus short calls.
+const MAX_CONNECTIONS: usize = 64;
 /// How much history a freshly opened page is given.
 const SNAPSHOT_EVENTS: usize = 400;
 
@@ -64,16 +72,22 @@ pub async fn start(core: Arc<Core>, open_browser: bool, port_override: u16) -> R
 
     let serving = core.clone();
     let key = info.key.clone();
+    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let core = serving.clone();
                     let key = key.clone();
+                    // dropped when the connection ends, releasing the slot
+                    let Ok(permit) = permits.clone().acquire_owned().await else {
+                        return;
+                    };
                     tokio::spawn(async move {
                         if let Err(e) = handle(core, stream, key).await {
                             log::debug!("console connection ended: {e:#}");
                         }
+                        drop(permit);
                     });
                 }
                 Err(e) => {
@@ -112,7 +126,12 @@ pub fn run_standalone(config: Option<std::path::PathBuf>, port: u16, open: bool)
 }
 
 async fn handle(core: Arc<Core>, mut stream: TcpStream, key: String) -> Result<()> {
-    let Some(req) = read_request(&mut stream).await? else {
+    // a peer that connects and then says nothing would otherwise hold a task,
+    // a socket and up to MAX_BODY of buffer for as long as the app runs
+    let Some(req) = tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut stream))
+        .await
+        .context("the request was too slow to arrive")??
+    else {
         return Ok(());
     };
 
@@ -147,7 +166,19 @@ async fn handle(core: Arc<Core>, mut stream: TcpStream, key: String) -> Result<(
     let body: Value = if req.body.is_empty() {
         json!({})
     } else {
-        serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+        match serde_json::from_slice(&req.body) {
+            Ok(value) => value,
+            // saying "missing 'token'" for a syntax error sends people hunting
+            // for the wrong problem
+            Err(e) => {
+                return reply_json(
+                    &mut stream,
+                    400,
+                    &json!({ "error": format!("the request body isn't valid JSON: {e}") }),
+                )
+                .await
+            }
+        }
     };
 
     let (status, payload) = match route(&core, req.path.as_str(), body).await {
@@ -204,6 +235,9 @@ async fn route(core: &Arc<Core>, path: &str, body: Value) -> Result<Value> {
         }
         "/api/dirs" => save_dirs(core, &body).await,
 
+        // the bridge a cli-backed master agent calls its tools through
+        "/api/tool" => run_tool(core, &body).await,
+
         other => anyhow::bail!("no such endpoint {other}"),
     }
 }
@@ -254,6 +288,9 @@ async fn state(core: &Arc<Core>) -> Result<Value> {
                 "default_model": p.default_model(),
                 "key_env": p.default_key_env(),
                 "needs_key": p.needs_key(),
+                "is_cli": p.is_cli(),
+                "blurb": p.blurb(),
+                "installed": p.cli_command().map(|c| agents::which(c).is_some()),
                 "has_key_in_env": std::env::var(p.default_key_env()).map(|v| !v.trim().is_empty()).unwrap_or(false)
                     || p.fallback_key_envs().iter().any(|n| std::env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false)),
             })).collect::<Vec<_>>(),
@@ -282,6 +319,12 @@ async fn sessions_with_liveness(core: &Arc<Core>) -> Vec<Value> {
 /// Where the master agent's key is coming from, so the UI can say so without
 /// ever showing the key itself.
 fn master_key_source(master: &MasterConfig) -> Option<String> {
+    if master.provider.is_cli() {
+        return Some(format!(
+            "the {} cli's own login",
+            master.cli_command().unwrap_or_default()
+        ));
+    }
     if master.api_key.as_deref().map(str::trim).is_some_and(|k| !k.is_empty()) {
         return Some("the config file".into());
     }
@@ -402,20 +445,45 @@ async fn save_master(core: &Arc<Core>, body: &Value) -> Result<Value> {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32)
             .unwrap_or(existing.max_tokens),
+        command: optional("command").or(existing.command),
+        args: existing.args,
     };
 
+    let switched = master.provider != existing.provider;
     config::save_master(core.config_path.as_deref(), &master)?;
     core.reload_config().await;
 
+    if switched {
+        // a cli session id means nothing to another backend, and tool results
+        // left behind by one would confuse the next
+        core.master.lock().await.clear();
+    }
+
     let ready = master.is_usable();
+    let problem = (!ready).then(|| {
+        if provider.is_cli() {
+            format!(
+                "the {} cli isn't installed, or isn't on telepager's PATH",
+                master.cli_command().unwrap_or_default()
+            )
+        } else {
+            format!(
+                "no api key yet — set {} in the environment telepager runs in, or paste one above",
+                provider.default_key_env()
+            )
+        }
+    });
+
     Ok(json!({
         "ok": true,
         "ready": ready,
-        "model": master.model_or_default(),
-        "problem": (!ready).then(|| format!(
-            "no api key yet — set {} in the environment telepager runs in, or paste one above",
-            provider.default_key_env()
-        )),
+        "switched": switched,
+        "model": if provider.is_cli() && master.model.trim().is_empty() {
+            format!("{}'s default model", provider.as_str())
+        } else {
+            master.model_or_default()
+        },
+        "problem": problem,
     }))
 }
 
@@ -435,6 +503,40 @@ async fn spawn(core: &Arc<Core>, body: &Value) -> Result<Value> {
     let task = str_field(body, "task")?;
     let id = core.spawn_agent(agent, dir, task, false).await?;
     Ok(json!({ "session": id }))
+}
+
+/// Run one master-agent tool and hand back its text.
+///
+/// This is how a CLI-backed master agent (Claude Code, opencode) reaches
+/// telepager: `telepager master-mcp` exposes these as MCP tools and proxies
+/// each call here, so there is still only one implementation of them.
+async fn run_tool(core: &Arc<Core>, body: &Value) -> Result<Value> {
+    let name = str_field(body, "name")?.to_string();
+    let args = body.get("args").cloned().unwrap_or_else(|| json!({}));
+    // a caller that doesn't say gets the gated treatment, not the trusted one
+    let origin = Origin::parse(body.get("origin").and_then(|v| v.as_str()).unwrap_or_default());
+
+    let call = crate::llm::ToolCall { id: String::new(), name: name.clone(), args };
+    let result = master::run_tool(core, &call, origin).await;
+
+    core.master.lock().await.push(crate::llm::Msg::ToolResult {
+        id: String::new(),
+        name: name.clone(),
+        content: result.clone(),
+    });
+
+    // so the console shows what a cli master is doing, the same way it shows
+    // the http one's tool calls
+    core.record(
+        None,
+        crate::session::EventKind::Chat {
+            role: "tool".into(),
+            text: format!("{name} → {}", result.lines().next().unwrap_or_default()),
+        },
+    )
+    .await;
+
+    Ok(json!({ "result": result }))
 }
 
 async fn save_dirs(core: &Arc<Core>, body: &Value) -> Result<Value> {
@@ -602,24 +704,27 @@ fn query_param(target: &str, name: &str) -> Option<String> {
 }
 
 /// Enough of percent decoding for a session id or a path in a query string.
+///
+/// Works on bytes throughout. Slicing the &str by byte offsets would panic
+/// whenever an escape landed mid-character, on input that reaches us before
+/// any authentication.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
+            b'%' => match hex_pair(bytes, i) {
+                Some(byte) => {
+                    out.push(byte);
+                    i += 3;
                 }
-            }
+                // a malformed escape is a literal percent sign
+                None => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -631,6 +736,22 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The two hex digits following a `%`, if both are really there and really hex.
+fn hex_pair(bytes: &[u8], at: usize) -> Option<u8> {
+    let hi = hex_digit(*bytes.get(at + 1)?)?;
+    let lo = hex_digit(*bytes.get(at + 2)?)?;
+    Some(hi * 16 + lo)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn host_is_local(host: &str) -> bool {
@@ -727,6 +848,29 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_escape_never_panics() {
+        // regression: these used to slice the &str mid-character and panic,
+        // on input that arrives before any authentication
+        assert_eq!(percent_decode("%\u{20AC}"), "%\u{20AC}");
+        assert_eq!(percent_decode("%é"), "%é");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%2"), "%2");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("100%"), "100%");
+        // and the valid cases still decode
+        assert_eq!(percent_decode("%2Ftmp%2Fx"), "/tmp/x");
+        assert_eq!(percent_decode("%7e"), "~");
+        assert_eq!(percent_decode("a+b"), "a b");
+    }
+
+    #[test]
+    fn hex_pairs_are_only_accepted_when_both_digits_are_hex() {
+        assert_eq!(hex_pair(b"%41", 0), Some(0x41));
+        assert_eq!(hex_pair(b"%4g", 0), None);
+        assert_eq!(hex_pair(b"%4", 0), None);
+    }
+
+    #[test]
     fn head_end_is_the_blank_line() {
         assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n\r\nbody"), Some(14));
         assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n"), None);
@@ -744,7 +888,12 @@ mod tests {
         assert_eq!(s["configured"], false);
         // the agent picker is still populated, so the console isn't empty
         assert!(s["agents"].as_array().unwrap().len() > 3);
-        assert_eq!(s["master"]["providers"].as_array().unwrap().len(), 4);
+        let providers = s["master"]["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), Provider::all().len());
+        // the cli backends are offered first, since they need no api key
+        assert_eq!(providers[0]["id"], "claude-code");
+        assert_eq!(providers[0]["is_cli"], true);
+        assert_eq!(providers[0]["needs_key"], false);
         assert!(s["sessions"].as_array().unwrap().is_empty());
     }
 
@@ -763,12 +912,17 @@ mod tests {
     #[test]
     fn the_key_source_never_reveals_the_key() {
         let master = MasterConfig {
+            provider: Provider::Anthropic,
             api_key: Some("sk-secret".into()),
             ..MasterConfig::default()
         };
         let source = master_key_source(&master).unwrap();
         assert_eq!(source, "the config file");
         assert!(!source.contains("sk-secret"));
+
+        // a cli backend has no key to reveal in the first place
+        let cli = MasterConfig::default();
+        assert_eq!(master_key_source(&cli).unwrap(), "the claude cli's own login");
     }
 
     #[tokio::test]
@@ -790,6 +944,24 @@ mod tests {
         let info = start(core(), false, taken).await.unwrap();
         assert_ne!(info.port, taken, "should have moved off the busy port");
         assert_ne!(info.port, 0);
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_lands_in_the_transcript() {
+        let c = core();
+        run_tool(&c, &json!({ "name": "list_sessions", "args": {} })).await.unwrap();
+
+        let transcript = c.master.lock().await.transcript();
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0]["role"], "tool");
+        assert_eq!(transcript[0]["name"], "list_sessions");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_tool_is_reported_rather_than_failing_the_request() {
+        let c = core();
+        let out = run_tool(&c, &json!({ "name": "nonsense", "args": {} })).await.unwrap();
+        assert!(out["result"].as_str().unwrap().contains("no tool called"));
     }
 
     #[tokio::test]
