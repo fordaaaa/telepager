@@ -309,6 +309,7 @@ async fn handle_command(core: &Arc<Core>, command: &str) {
             }
             None => "Not set up yet.".into(),
         },
+        "model" => model_command(core, rest).await,
         "a" | "answer" => answer_command(core, rest).await,
         "sh" | "run" => master::shell(core, rest, None, None, Origin::Telegram).await,
         "cd" => cd_command(core, rest).await,
@@ -394,6 +395,75 @@ async fn cd_command(core: &Arc<Core>, rest: &str) -> String {
 
     core.set_work_dir(path.clone()).await;
     format!("Working directory is now {}.", path.display())
+}
+
+/// `/model <name>` — which model the master agent thinks on. Reading it is
+/// free; changing it is remote control, the same as `/settings`.
+async fn model_command(core: &Arc<Core>, rest: &str) -> String {
+    let Some(cfg) = core.config().await else {
+        return "Not set up yet.".into();
+    };
+    let master = &cfg.master;
+    let now = format!("The master agent is on {}.", describe_model(master));
+
+    if rest.is_empty() {
+        return format!(
+            "{now}\n\n{}\n\n/model <name> changes it, e.g. /model opus. \
+             /model default hands the choice back to the cli.",
+            model_examples(master.provider),
+        );
+    }
+
+    if !cfg.permissions.remote_control {
+        return format!(
+            "{now}\n\nchanging it from telegram is off — turn remote control on \
+             in the console's Settings."
+        );
+    }
+
+    // "default" is the one name that means "stop overriding it"
+    let wanted = rest.trim();
+    let model = match wanted.to_lowercase().as_str() {
+        "default" | "reset" | "none" => String::new(),
+        _ => wanted.to_string(),
+    };
+
+    let updated = crate::config::MasterConfig { model, ..master.clone() };
+    if let Err(e) = crate::config::save_master(core.config_path.as_deref(), &updated) {
+        return format!("Could not save that: {e:#}");
+    }
+    core.reload_config().await;
+
+    // the conversation carries on: `claude --resume` takes the model we hand
+    // it now over the one the session was started on
+    format!(
+        "The master agent is on {} now. It'll say if that model doesn't exist.",
+        describe_model(&updated)
+    )
+}
+
+/// What the master is actually running on, in the shape someone asked.
+fn describe_model(master: &crate::config::MasterConfig) -> String {
+    match (master.provider.is_cli(), master.model.trim().is_empty()) {
+        (true, true) => format!(
+            "whatever {} is set to",
+            master.cli_command().unwrap_or_else(|| master.provider.as_str().to_string())
+        ),
+        _ => master.model_or_default(),
+    }
+}
+
+/// Names worth trying, since no cli will list them for us.
+fn model_examples(provider: crate::config::Provider) -> &'static str {
+    match provider {
+        crate::config::Provider::ClaudeCode => {
+            "claude code takes opus, sonnet, haiku, or a full model id."
+        }
+        crate::config::Provider::Opencode => {
+            "opencode takes provider/model, e.g. anthropic/claude-sonnet-4-5."
+        }
+        _ => "any model id the provider knows.",
+    }
 }
 
 /// The question `/settings` asks belongs to no session — it's about the app.
@@ -503,6 +573,7 @@ Just say what you want, e.g. \"start claude in ~/code/api and make the tests pas
 or \"what's running?\".
 
 /a <text>  answer the question something is waiting on
+/model <m> which model I think on, e.g. /model opus
 /sh <cmd>  run a command in the working directory
 /cd <dir>  set that working directory
 /kill <s>  stop a running session
@@ -808,6 +879,7 @@ mod tests {
         handle_command(&c, "sh echo hi").await;
         handle_command(&c, "cd /tmp").await;
         handle_command(&c, "settings").await;
+        handle_command(&c, "model opus").await;
         handle_command(&c, "kill s9").await;
     }
 
@@ -876,6 +948,47 @@ mod tests {
         assert!(out.contains("shell access on"), "{out}");
         // and it's in the file, not just in memory
         assert!(crate::config::load(Some(&path)).unwrap().permissions.shell);
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_model_is_readable_but_not_settable_until_remote_control_is_on() {
+        let (c, dir, server) = configured("model-ro", Default::default(), vec![]).await;
+        let path = dir.join("config.json");
+
+        let out = model_command(&c, "").await;
+        assert!(out.contains("whatever claude is set to"), "{out}");
+
+        let refused = model_command(&c, "opus").await;
+        assert!(refused.contains("changing it from telegram is off"), "{refused}");
+        // and nothing reached the file
+        assert!(crate::config::load(Some(&path)).unwrap().master.model.is_empty());
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remote_control_lets_telegram_change_the_model() {
+        let permissions = crate::config::Permissions {
+            remote_control: true,
+            ..Default::default()
+        };
+        let (c, dir, server) = configured("model-rw", permissions.clone(), vec![]).await;
+        let path = dir.join("config.json");
+        // saving the model re-reads the file, so the grant has to be in it
+        crate::config::save_permissions(Some(&path), &permissions).unwrap();
+
+        let out = model_command(&c, "opus").await;
+        assert!(out.contains("on opus now"), "{out}");
+        assert_eq!(crate::config::load(Some(&path)).unwrap().master.model, "opus");
+
+        // and back to the cli's own choice, without naming it
+        let back = model_command(&c, "default").await;
+        assert!(back.contains("whatever claude is set to"), "{back}");
+        assert!(crate::config::load(Some(&path)).unwrap().master.model.is_empty());
 
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
