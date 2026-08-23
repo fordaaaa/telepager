@@ -90,9 +90,12 @@ pub async fn start(core: Arc<Core>, open_browser: bool, port_override: u16) -> R
                         drop(permit);
                     });
                 }
+                // one bad accept isn't the end of the console. returning here
+                // left the app running with a port nothing answered on, which
+                // reads to the user as telepager having quit
                 Err(e) => {
                     log::warn!("console accept failed: {e:#}");
-                    return;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
         }
@@ -223,6 +226,15 @@ async fn route(core: &Arc<Core>, path: &str, body: Value) -> Result<Value> {
         "/api/session/eof" => {
             core.close_agent_stdin(str_field(&body, "session")?).await?;
             Ok(json!({ "ok": true }))
+        }
+        "/api/session/screen" => {
+            let since = body.get("since").and_then(|v| v.as_u64());
+            core.screen_view(str_field(&body, "session")?, since).await
+        }
+        "/api/session/resize" => {
+            let cols = size_field(&body, "cols")?;
+            let rows = size_field(&body, "rows")?;
+            core.resize_session(str_field(&body, "session")?, cols, rows).await
         }
         "/api/session/forget" => Ok(json!({
             "ok": core.forget_session(str_field(&body, "session")?).await,
@@ -404,11 +416,14 @@ async fn save(core: &Arc<Core>, body: &Value) -> Result<Value> {
 }
 
 async fn send_test(core: &Arc<Core>) -> Result<Value> {
-    let cfg = core.config().await.context("not set up yet")?;
-    let tg = core.telegram().await.context("not set up yet")?;
-    tg.send_message(cfg.chat_id, "telepager is set up. this is what a page looks like.")
-        .await?;
-    Ok(json!({ "sent": true }))
+    // goes to everyone, so the test proves what it looks like it proves
+    let (result, fanout) = core
+        .broadcast("telepager is set up. this is what a page looks like.")
+        .await;
+    if fanout.is_empty() {
+        anyhow::bail!("{result}");
+    }
+    Ok(json!({ "sent": true, "chats": fanout.len() }))
 }
 
 async fn save_master(core: &Arc<Core>, body: &Value) -> Result<Value> {
@@ -494,6 +509,8 @@ async fn master_send(core: &Arc<Core>, body: &Value) -> Result<Value> {
     }
     // the console is local, so it isn't held to the telegram directory allowlist
     let answer = master::reply(core, &text, Origin::Ui).await?;
+    // said at the console, but everyone should still hear it
+    core.announce(answer.clone());
     Ok(json!({ "reply": answer }))
 }
 
@@ -617,6 +634,18 @@ fn str_field<'a>(body: &'a Value, name: &str) -> Result<&'a str> {
     body.get(name)
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing '{name}'"))
+}
+
+/// A terminal dimension: a positive whole number the screen can clamp.
+fn size_field(body: &Value, name: &str) -> Result<u16> {
+    let value = body
+        .get(name)
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("missing '{name}'"))?;
+    if value == 0 {
+        anyhow::bail!("'{name}' has to be at least 1");
+    }
+    Ok(value.min(u16::MAX as u64) as u16)
 }
 
 struct Request {
@@ -895,6 +924,17 @@ mod tests {
         assert_eq!(providers[0]["is_cli"], true);
         assert_eq!(providers[0]["needs_key"], false);
         assert!(s["sessions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_terminal_size_has_to_be_a_positive_number() {
+        let body = json!({ "cols": 100, "rows": 0, "wrong": "80" });
+        assert_eq!(size_field(&body, "cols").unwrap(), 100);
+        assert!(size_field(&body, "rows").is_err());
+        assert!(size_field(&body, "wrong").is_err());
+        assert!(size_field(&body, "missing").is_err());
+        // more columns than a u16 holds is clamped, not wrapped
+        assert_eq!(size_field(&json!({ "cols": 999999 }), "cols").unwrap(), u16::MAX);
     }
 
     #[tokio::test]

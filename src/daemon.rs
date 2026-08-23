@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::core::{Answer, Core};
+use crate::core::{Answer, Core, Fanout};
 use crate::ipc::{self, Endpoint, Request, Response};
 use crate::master::{self, Origin};
 use crate::session::{Kind, State};
@@ -22,11 +22,36 @@ use crate::telegram::{IncomingMessage, Telegram};
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn run(config: Option<std::path::PathBuf>, open_browser: bool) -> Result<()> {
+    // one daemon per machine, or telegram breaks in a way nothing reports:
+    // both poll getUpdates with the same bot token, telegram terminates one
+    // poll for the other, and each message lands on whichever daemon happened
+    // to have the live request. the newer daemon also overwrites the endpoint
+    // file, so `telepager master-mcp` — how a cli-backed master agent reaches
+    // its tools — resolves to the daemon that didn't get the message.
+    refuse_if_already_running(crate::client::running_endpoint())?;
+
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let core = Core::new(config);
         serve_all(core, open_browser).await
     })
+}
+
+/// An endpoint that still answers and isn't ours means another daemon owns
+/// this machine's bot token and endpoint file, so we must not start.
+fn refuse_if_already_running(existing: Option<Endpoint>) -> Result<()> {
+    let Some(ep) = existing else { return Ok(()) };
+    // a daemon re-reading its own endpoint is not a second daemon
+    if ep.pid == std::process::id() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "telepager is already running (pid {}){}. stop it with `telepager stop` \
+         before starting another — two daemons share one bot token and telegram \
+         gives each message to only one of them.",
+        ep.pid,
+        ep.ui_url().map(|u| format!(", console at {u}")).unwrap_or_default()
+    )
 }
 
 pub async fn serve_all(core: Arc<Core>, open_browser: bool) -> Result<()> {
@@ -52,7 +77,20 @@ pub async fn serve_all(core: Arc<Core>, open_browser: bool) -> Result<()> {
     tokio::spawn(telegram_loop(core.clone()));
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        // one bad accept is not a reason to end the app. a peer that hung up
+        // between connecting and being accepted, or a moment with no file
+        // descriptors left, used to take the daemon down through this `?` —
+        // and with it the telegram poller, the console and every session it
+        // was holding, right in the middle of somebody's work.
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::warn!("could not accept a client: {e}");
+                // enough of a pause that a persistent failure doesn't spin
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
         let core = core.clone();
         let token = token.clone();
         tokio::spawn(async move {
@@ -95,6 +133,15 @@ async fn poll_updates(core: Arc<Core>, tg: Arc<Telegram>) {
     loop {
         let updates = match tg.get_updates(offset).await {
             Ok(u) => u,
+            Err(e) if crate::telegram::is_conflict(&e) => {
+                log::warn!(
+                    "another telepager is polling this bot token — messages will \
+                     reach only one of us. stop the other one with `telepager stop`."
+                );
+                core.notice("another telepager is polling the same bot token").await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
+            }
             Err(e) => {
                 log::debug!("getUpdates failed, retrying: {e:#}");
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -154,7 +201,7 @@ fn parse_callback(data: &str) -> Option<(String, usize)> {
 /// What a typed Telegram message should do.
 enum Routing {
     /// Answer this waiting question.
-    Answer(String),
+    Answer(String, Answer),
     /// Hand it to the master agent.
     Master,
     Command(String),
@@ -165,20 +212,37 @@ async fn route_message(core: &Arc<Core>, msg: &IncomingMessage, text: &str) -> R
         return Routing::Command(rest.trim().to_string());
     }
 
-    // replying to the question's own message is the unambiguous case
+    // replying to the question's own message is the unambiguous case, and the
+    // one place free text is taken at face value
     if let Some(replied) = &msg.reply_to_message {
         if let Some(qid) = core.question_for_message(replied.message_id).await {
-            return Routing::Answer(qid);
+            return Routing::Answer(qid, Answer::Typed(text.to_string()));
         }
     }
 
-    // one question waiting and a bare message: they're answering it. this is
-    // what telepager has always done and what a blocked agent needs.
-    if let Some(qid) = core.only_pending_question().await {
-        return Routing::Answer(qid);
+    // a bare message answers the one waiting question only when it plainly is
+    // an answer. everything used to be swallowed here, so anything said to the
+    // master while an unrelated worker was blocked never reached it.
+    if let Some((qid, options)) = core.only_pending_question().await {
+        if let Some(answer) = as_answer(text, &options) {
+            return Routing::Answer(qid, answer);
+        }
     }
 
     Routing::Master
+}
+
+/// A typed message read as an answer: one of the options, or the number
+/// Telegram put on its button. Anything else isn't an answer.
+fn as_answer(text: &str, options: &[String]) -> Option<Answer> {
+    let text = text.trim().to_lowercase();
+    if let Some(i) = options.iter().position(|o| o.trim().to_lowercase() == text) {
+        return Some(Answer::Tapped(i));
+    }
+    match text.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= options.len() => Some(Answer::Tapped(n - 1)),
+        _ => None,
+    }
 }
 
 async fn handle_message(core: &Arc<Core>, msg: IncomingMessage) {
@@ -194,8 +258,8 @@ async fn handle_message(core: &Arc<Core>, msg: IncomingMessage) {
     }
 
     match route_message(core, &msg, &text).await {
-        Routing::Answer(qid) => {
-            if !core.answer(&qid, Answer::Typed(text.clone())).await {
+        Routing::Answer(qid, answer) => {
+            if !core.answer(&qid, answer).await {
                 // it timed out between routing and delivery
                 reply_to_telegram(core, "That question isn't waiting any more.").await;
             }
@@ -248,15 +312,45 @@ async fn handle_command(core: &Arc<Core>, command: &str) {
             }
             None => "Not set up yet.".into(),
         },
-        // anything else is just talk aimed at the master agent
-        _ => match master::reply(core, command, Origin::Telegram).await {
+        "a" | "answer" => answer_command(core, rest).await,
+        // anything else is just talk aimed at the master agent, argument and all
+        _ => match master::reply(core, &as_prompt(name, rest), Origin::Telegram).await {
             Ok(text) => text,
             Err(e) => format!("⚠️ {e:#}"),
         },
     };
 
-    let _ = rest;
     reply_to_telegram(core, &reply).await;
+}
+
+/// What an unknown `/command` says to the master. The argument used to be
+/// dropped here, so "/deploy the api" arrived as "deploy".
+fn as_prompt(name: &str, rest: &str) -> String {
+    if rest.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} {rest}")
+    }
+}
+
+/// `/a <text>` — the escape hatch for answering the waiting question when the
+/// text isn't one of its options.
+async fn answer_command(core: &Arc<Core>, rest: &str) -> String {
+    if rest.is_empty() {
+        return "Say what to answer with, e.g. /a yes.".into();
+    }
+    let Some((qid, options)) = core.only_pending_question().await else {
+        return match core.pending_questions().await.len() {
+            0 => "Nothing is waiting on an answer.".into(),
+            _ => "More than one question is waiting — tap a button, or reply to the one you mean.".into(),
+        };
+    };
+    let answer = as_answer(rest, &options).unwrap_or_else(|| Answer::Typed(rest.to_string()));
+    if core.answer(&qid, answer).await {
+        format!("Answered {qid}.")
+    } else {
+        "That question isn't waiting any more.".into()
+    }
 }
 
 const HELP: &str = "\
@@ -265,6 +359,7 @@ telepager — talk to me and I'll run agents on your machine.
 Just say what you want, e.g. \"start claude in ~/code/api and make the tests pass\"
 or \"what's running?\".
 
+/a <text>  answer the question something is waiting on
 /status    what every session is doing
 /agents    which agent CLIs are installed
 /new       forget our conversation so far
@@ -272,12 +367,7 @@ or \"what's running?\".
 /help      this";
 
 async fn reply_to_telegram(core: &Arc<Core>, text: &str) {
-    let (Some(tg), Some(cfg)) = (core.telegram().await, core.config().await) else {
-        return;
-    };
-    if let Err(e) = tg.send_message(cfg.chat_id, text).await {
-        log::warn!("could not reply on telegram: {e:#}");
-    }
+    core.broadcast(text).await;
 }
 
 async fn allowed(core: &Arc<Core>, user_id: i64) -> bool {
@@ -328,8 +418,8 @@ async fn serve_requests(
     lines: &mut tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
     write: &mut tokio::net::tcp::OwnedWriteHalf,
 ) -> Result<()> {
-    // the status line this session is editing, if any
-    let mut thinking: Option<i64> = None;
+    // the status line this session is editing, one message per chat
+    let mut thinking = Fanout::default();
 
     while let Some(line) = lines.next_line().await? {
         let req: Request = match serde_json::from_str(&line) {
@@ -344,14 +434,14 @@ async fn serve_requests(
         let result = match req {
             Request::Hello { .. } => "already connected".to_string(),
             Request::Send { text } => {
-                thinking = None;
+                thinking = Fanout::default();
                 core.set_state(session, State::Working).await;
                 core.send(Some(session), &text).await
             }
             Request::Thinking { text } => {
                 core.set_state(session, State::Working).await;
-                let (result, id) = core.thinking(Some(session), &text, thinking).await;
-                thinking = id;
+                let (result, sent) = core.thinking(Some(session), &text, &thinking).await;
+                thinking = sent;
                 result
             }
             Request::Ask { question, options } => {
@@ -382,6 +472,42 @@ mod tests {
             text: Some(text.to_string()),
             reply_to_message: reply_to.map(|message_id| SentMessage { message_id }),
         }
+    }
+
+    fn endpoint(pid: u32) -> Endpoint {
+        Endpoint {
+            port: 44013,
+            token: "t".into(),
+            pid,
+            ui_port: Some(46375),
+            ui_key: Some("k".into()),
+        }
+    }
+
+    #[test]
+    fn a_second_daemon_refuses_to_start_while_another_one_answers() {
+        // this is what split a bot token in two: both daemons polled, telegram
+        // handed each message to one of them, and the newer one's endpoint file
+        // sent the master agent's mcp bridge to the wrong daemon
+        let err = refuse_if_already_running(Some(endpoint(4756))).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("already running"), "{text}");
+        assert!(text.contains("4756"), "{text}");
+        assert!(text.contains("telepager stop"), "{text}");
+
+        // nothing running, or our own endpoint read back, is not a second daemon
+        refuse_if_already_running(None).unwrap();
+        refuse_if_already_running(Some(endpoint(std::process::id()))).unwrap();
+    }
+
+    #[test]
+    fn a_poll_conflict_is_told_apart_from_an_ordinary_failure() {
+        let conflict = anyhow::anyhow!(
+            "telegram rejected getUpdates: Conflict: terminated by other getUpdates \
+             request; make sure that only one bot instance is running"
+        );
+        assert!(crate::telegram::is_conflict(&conflict));
+        assert!(!crate::telegram::is_conflict(&anyhow::anyhow!("calling getUpdates: connection reset")));
     }
 
     #[test]
@@ -429,6 +555,84 @@ mod tests {
         assert!(!c.master.lock().await.transcript().is_empty());
         handle_command(&c, "new").await;
         assert!(c.master.lock().await.transcript().is_empty());
+    }
+
+    #[test]
+    fn an_option_or_its_number_is_an_answer_and_nothing_else_is() {
+        let options = vec!["yes".to_string(), "no".to_string()];
+
+        assert!(matches!(as_answer("yes", &options), Some(Answer::Tapped(0))));
+        assert!(matches!(as_answer("  NO ", &options), Some(Answer::Tapped(1))));
+        assert!(matches!(as_answer("2", &options), Some(Answer::Tapped(1))));
+
+        // the things that used to be swallowed as answers
+        assert!(as_answer("deploy the api", &options).is_none());
+        assert!(as_answer("0", &options).is_none());
+        assert!(as_answer("3", &options).is_none());
+        assert!(as_answer("yes please", &options).is_none());
+    }
+
+    // regression: any bare message was taken as the answer to whatever question
+    // happened to be waiting, so the master never heard it
+    #[tokio::test]
+    async fn a_bare_message_only_answers_when_it_really_is_one() {
+        let (c, _seen, server) = crate::core::tests::wired_core(&[7]).await;
+        let id = c
+            .open_session(Kind::Attached, "proj".into(), None, None, None)
+            .await;
+
+        let asker = {
+            let c = c.clone();
+            let id = id.clone();
+            tokio::spawn(async move { c.ask(&id, "ship it?", &["yes".into(), "no".into()]).await })
+        };
+        let qid = crate::core::tests::waiting_question(&c).await;
+
+        assert!(matches!(
+            route_message(&c, &message("deploy the api", None), "deploy the api").await,
+            Routing::Master
+        ));
+        // a reply to the question's own message is free text, and still an answer
+        assert!(matches!(
+            route_message(&c, &message("whatever you think", Some(11)), "whatever you think").await,
+            Routing::Answer(id, Answer::Typed(_)) if id == qid
+        ));
+        assert!(matches!(
+            route_message(&c, &message("no", None), "no").await,
+            Routing::Answer(id, Answer::Tapped(1)) if id == qid
+        ));
+
+        c.answer(&qid, Answer::Tapped(0)).await;
+        assert_eq!(asker.await.unwrap(), "yes");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn the_answer_command_answers_the_waiting_question() {
+        let (c, _seen, server) = crate::core::tests::wired_core(&[7]).await;
+        assert!(answer_command(&c, "").await.contains("what to answer"));
+        assert!(answer_command(&c, "yes").await.contains("Nothing is waiting"));
+
+        let id = c
+            .open_session(Kind::Attached, "proj".into(), None, None, None)
+            .await;
+        let asker = {
+            let c = c.clone();
+            let id = id.clone();
+            tokio::spawn(async move { c.ask(&id, "which branch?", &["main".into()]).await })
+        };
+        crate::core::tests::waiting_question(&c).await;
+
+        assert!(answer_command(&c, "the release one").await.starts_with("Answered"));
+        assert_eq!(asker.await.unwrap(), "the release one");
+        server.abort();
+    }
+
+    // regression: "/deploy the api" reached the master as "deploy"
+    #[test]
+    fn an_unknown_command_keeps_its_argument() {
+        assert_eq!(as_prompt("deploy", "the api"), "deploy the api");
+        assert_eq!(as_prompt("deploy", ""), "deploy");
     }
 
     #[tokio::test]

@@ -77,6 +77,21 @@ impl Telegram {
         })
     }
 
+    /// Point the client somewhere other than telegram, so a test can stand a
+    /// fake api up on localhost.
+    #[cfg(test)]
+    pub fn with_base(base: &str) -> Self {
+        Self {
+            // a fake api that wedges should fail the test, not hang it
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("building the http client"),
+            base: base.to_string(),
+            token: "test".into(),
+        }
+    }
+
     // reqwest prints the request url in its errors and the token is in the url
     fn scrub(&self, e: anyhow::Error) -> anyhow::Error {
         let text = format!("{e:#}");
@@ -150,6 +165,13 @@ impl Telegram {
         }
     }
 
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        let _: Value = self
+            .call("deleteMessage", json!({ "chat_id": chat_id, "message_id": message_id }))
+            .await?;
+        Ok(())
+    }
+
     /// `question_id` rides along in the callback data so a tap identifies the
     /// question it answers, rather than relying on the message being unique.
     pub async fn send_with_buttons(
@@ -212,6 +234,14 @@ impl Telegram {
 
 fn is_unmodified(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("message is not modified")
+}
+
+/// Telegram gives one bot token one poller: a second `getUpdates` terminates
+/// the first, and the two then trade this error while messages land on
+/// whichever poll happened to be live. It never resolves by retrying, so it
+/// has to be said out loud rather than swallowed like a dropped connection.
+pub fn is_conflict(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("terminated by other getUpdates request")
 }
 
 fn truncate(s: &str, limit: usize) -> String {

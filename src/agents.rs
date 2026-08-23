@@ -5,27 +5,104 @@
 //! telepager owns its pipes: stdout and stderr become session events, stdin
 //! stays open so a follow-up can be typed at it, and the child can be killed.
 //!
+//! An `interactive` preset gets a real pty instead — a tui agent draws nothing
+//! at all down a pipe. core turns that byte stream into a screen.
+//!
 //! This file deliberately knows nothing about the registry or Telegram. It
 //! resolves and launches processes; core wires the output up.
 
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 
 use crate::config::AgentPreset;
+use crate::screen::{DEFAULT_COLS, DEFAULT_ROWS};
 
-/// What `launch` hands back: the child and its pipes, already split out.
+/// What `launch` hands back: a handle to wait on, and its io.
 pub struct Launched {
-    pub child: Child,
-    pub stdout: Option<ChildStdout>,
-    pub stderr: Option<ChildStderr>,
-    pub stdin: Option<ChildStdin>,
+    pub child: Handle,
+    pub io: Io,
     /// The command line we actually ran, for the session log.
     pub rendered: Vec<String>,
+}
+
+/// The two shapes an agent's io comes in.
+pub enum Io {
+    Pipes {
+        stdout: Option<ChildStdout>,
+        stderr: Option<ChildStderr>,
+        stdin: Option<ChildStdin>,
+    },
+    /// One bidirectional stream, plus the master for resizes. Both ends
+    /// block, so core keeps them off the runtime threads.
+    Pty {
+        master: Box<dyn MasterPty + Send>,
+        reader: Box<dyn Read + Send>,
+        writer: Box<dyn Write + Send>,
+    },
+}
+
+/// How an agent finished. `code` is None when a signal ended it, same as
+/// `std::process::ExitStatus::code`.
+#[derive(Debug, Clone, Copy)]
+pub struct Exit {
+    pub code: Option<i32>,
+}
+
+impl Exit {
+    #[allow(dead_code)]
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
+/// A running agent, whichever way it was started.
+pub enum Handle {
+    Piped(Child),
+    Pty(Box<dyn portable_pty::Child + Send + Sync>),
+}
+
+impl Handle {
+    pub fn id(&self) -> Option<u32> {
+        match self {
+            Handle::Piped(c) => c.id(),
+            Handle::Pty(c) => c.process_id(),
+        }
+    }
+
+    pub fn try_wait(&mut self) -> std::io::Result<Option<Exit>> {
+        match self {
+            Handle::Piped(c) => Ok(c.try_wait()?.map(|s| Exit { code: s.code() })),
+            Handle::Pty(c) => Ok(c.try_wait()?.map(|s| Exit {
+                code: (s.signal().is_none()).then(|| s.exit_code() as i32),
+            })),
+        }
+    }
+
+    /// Polled, not blocked on: one implementation covers both kinds, and
+    /// nothing sits on a lock the killer needs.
+    pub async fn wait(&mut self) -> std::io::Result<Exit> {
+        loop {
+            if let Some(exit) = self.try_wait()? {
+                return Ok(exit);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Handle::Piped(c) => c.start_kill(),
+            Handle::Pty(c) => c.kill(),
+        }
+    }
 }
 
 /// Substitute the placeholders a preset may use in its arguments.
@@ -103,7 +180,7 @@ fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return meta.permissions().mode() & 0o111 != 0;
+        meta.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     {
@@ -175,7 +252,14 @@ pub fn resolve_dir(input: &str) -> Result<PathBuf> {
 ///
 /// This gates spawning from Telegram only. The local web UI isn't restricted:
 /// reaching it already means being at the machine with the config file.
+///
+/// Both sides are canonicalized before they're compared. Resolving only the
+/// root would compare paths that went through different amounts of symlink
+/// resolution — on macOS an allowed `/var/…` root becomes `/private/var/…`
+/// while the dir stays `/var/…`, and on Windows canonicalizing adds a `\\?\`
+/// prefix to one side only. Either way an allowed directory reads as denied.
 pub fn dir_is_allowed(dir: &Path, allowed: &[PathBuf]) -> bool {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     allowed.iter().any(|root| {
         let root = root.canonicalize().unwrap_or_else(|_| root.clone());
         dir == root || dir.starts_with(&root)
@@ -194,48 +278,124 @@ pub fn launch(preset: &AgentPreset, dir: &Path, task: &str) -> Result<Launched> 
     })?;
 
     let args = render_args(&preset.args, task, dir);
+    let mut rendered = vec![preset.command.clone()];
+    rendered.extend(args.clone());
 
-    let mut cmd = tokio::process::Command::new(&program);
-    cmd.args(&args)
+    let (child, io) = if preset.interactive {
+        launch_on_pty(preset, &program, &args, dir)?
+    } else {
+        launch_on_pipes(preset, &program, &args, dir)?
+    };
+
+    Ok(Launched { child, io, rendered })
+}
+
+/// The pty path, for agents that draw a terminal ui.
+///
+/// portable-pty puts the child in a session of its own with the pty as its
+/// controlling terminal, so a group-wide signal from the agent can't reach the
+/// daemon — what `own_process_group` buys the pipe path, only stronger.
+fn launch_on_pty(
+    preset: &AgentPreset,
+    program: &Path,
+    args: &[String],
+    dir: &Path,
+) -> Result<(Handle, Io)> {
+    let pty = portable_pty::native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: DEFAULT_ROWS,
+            cols: DEFAULT_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("opening a pty for the agent")?;
+
+    let mut cmd = CommandBuilder::new(program);
+    cmd.args(args);
+    cmd.cwd(dir);
+    // the whole point: a terminal the agent will actually draw on
+    cmd.env("TERM", "xterm-256color");
+    cmd.env_remove("NO_COLOR");
+    for (key, value) in &preset.env {
+        cmd.env(key, value);
+    }
+
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .with_context(|| format!("starting {}", program.display()))?;
+    // the slave fd has to go, or the pty never reports eof when the agent exits
+    drop(pair.slave);
+
+    let reader = pair.master.try_clone_reader().context("reading the agent's pty")?;
+    let writer = pair.master.take_writer().context("writing to the agent's pty")?;
+
+    Ok((
+        Handle::Pty(child),
+        Io::Pty { master: pair.master, reader, writer },
+    ))
+}
+
+fn launch_on_pipes(
+    preset: &AgentPreset,
+    program: &Path,
+    args: &[String],
+    dir: &Path,
+) -> Result<(Handle, Io)> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // agents that colour their output make a mess of the log pane
         .env("NO_COLOR", "1")
-        .env("TERM", "dumb")
-        .kill_on_drop(true);
+        .env("TERM", "dumb");
 
+    // deliberately *not* kill_on_drop. an agent is a long-lived job that
+    // outlives whatever turn started it, and kill_on_drop hands its life to
+    // whoever happens to hold the `Child`: drop the process table, drop the
+    // task that owns it, or let the runtime unwind on the way out of an
+    // unrelated error, and every running agent is SIGKILLed with no session
+    // event and nothing to tell the user why their work stopped. telepager
+    // ends agents in exactly one place — `kill_tree`, from `kill_agent`.
     for (key, value) in &preset.env {
         cmd.env(key, value);
     }
 
-    #[cfg(unix)]
-    {
-        unsafe {
-            // its own process group, so killing it takes the whole tree with
-            // it rather than leaving orphans behind
-            cmd.pre_exec(|| {
-                setpgid_to_self();
-                Ok(())
-            });
-        }
-    }
+    own_process_group(&mut cmd);
 
     let mut child = cmd
         .spawn()
         .with_context(|| format!("starting {}", program.display()))?;
 
-    let mut rendered = vec![preset.command.clone()];
-    rendered.extend(args);
-
-    Ok(Launched {
+    let io = Io::Pipes {
         stdout: child.stdout.take(),
         stderr: child.stderr.take(),
         stdin: child.stdin.take(),
-        child,
-        rendered,
-    })
+    };
+    Ok((Handle::Piped(child), io))
+}
+
+/// Put a child in a process group of its own.
+///
+/// Two things depend on this. Killing the child then takes its whole tree with
+/// it — agents shell out constantly — rather than leaving a build running with
+/// nothing reading its output. And, just as important, it means a group-wide
+/// signal the child sends (or that its own supervisor sends on its behalf)
+/// stops at the child instead of travelling up into telepager's group, where
+/// it would hit the daemon and every other agent it is running.
+pub fn own_process_group(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            setpgid_to_self();
+            Ok(())
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = cmd;
 }
 
 #[cfg(unix)]
@@ -248,33 +408,44 @@ fn setpgid_to_self() {
     }
 }
 
-/// Kill a whole process group on unix, or just the child elsewhere.
+/// SIGTERM a whole process group, given the pid of the process leading it.
 ///
-/// Agents shell out constantly, so signalling only the parent tends to leave
-/// a build running with nothing reading its output.
-pub async fn kill_tree(child: &mut Child) -> Result<()> {
+/// Nothing here waits: the caller either has the `Child` and can wait on it,
+/// or has already lost it and only wants the strays gone.
+pub fn signal_process_group(pid: u32) {
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
+    {
         unsafe extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
         }
         const SIGTERM: i32 = 15;
-        // negative pid means the group, which launch() made the child lead
+        // a negative pid means the group, which own_process_group made it lead
         unsafe {
             kill(-(pid as i32), SIGTERM);
         }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// Kill a whole process group on unix, or just the child elsewhere.
+///
+/// Agents shell out constantly, so signalling only the parent tends to leave
+/// a build running with nothing reading its output.
+pub async fn kill_tree(child: &mut Handle) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        signal_process_group(pid);
         // give it a moment to go down politely before pulling the plug
-        let graceful = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            child.wait(),
-        )
-        .await;
+        let graceful =
+            tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
         if graceful.is_ok() {
             return Ok(());
         }
     }
 
-    child.kill().await.context("killing the agent process")?;
+    child.kill().context("killing the agent process")?;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
     Ok(())
 }
 
@@ -392,6 +563,33 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    // the case that broke ci: macos hands out a `/var/…` temp dir that is really
+    // `/private/var/…`, so a dir and a root that agree can still disagree once
+    // one of them is resolved. a symlinked root reproduces it anywhere.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_still_covers_what_is_under_it() {
+        let base = std::env::temp_dir().join("telepager-symlink-test");
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("project")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let by_link = std::slice::from_ref(&link);
+        let by_real = std::slice::from_ref(&real);
+
+        // allowed by its unresolved name, entered by its unresolved name
+        assert!(dir_is_allowed(&link.join("project"), by_link));
+        // allowed by one name, entered by the other, in both directions
+        assert!(dir_is_allowed(&link.join("project"), by_real));
+        assert!(dir_is_allowed(&real.join("project"), by_link));
+        // and a sibling of the real root is still out
+        assert!(!dir_is_allowed(&base, by_link));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     #[test]
     fn a_traversal_cannot_escape_the_allowlist() {
         let root = std::env::temp_dir().join("telepager-escape-test");
@@ -424,11 +622,121 @@ mod tests {
         let mut launched = launch(&preset(&["{task}"]), &std::env::temp_dir(), "hello agent").unwrap();
         assert_eq!(launched.rendered, vec!["echo", "hello agent"]);
 
-        let mut lines = BufReader::new(launched.stdout.take().unwrap()).lines();
+        let Io::Pipes { stdout, .. } = &mut launched.io else {
+            panic!("a non-interactive preset should not get a pty");
+        };
+        let mut lines = BufReader::new(stdout.take().unwrap()).lines();
         assert_eq!(lines.next_line().await.unwrap().unwrap(), "hello agent");
 
         let status = launched.child.wait().await.unwrap();
         assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interactive_preset_gets_a_real_terminal() {
+        let Some(_) = which("sh") else { return };
+        let p = AgentPreset {
+            command: "sh".into(),
+            // both of these only answer the way we want on a tty
+            args: vec!["-c".into(), "tty > /dev/null && echo yes; echo $TERM".into()],
+            interactive: true,
+            ..AgentPreset::default()
+        };
+        let mut launched = launch(&p, &std::env::temp_dir(), "").unwrap();
+
+        let Io::Pty { reader, .. } = &mut launched.io else {
+            panic!("an interactive preset should get a pty");
+        };
+        let mut reader = std::mem::replace(reader, Box::new(std::io::empty()));
+        let text = tokio::task::spawn_blocking(move || {
+            let mut buf = Vec::new();
+            let _ = reader.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+        .await
+        .unwrap();
+
+        assert!(text.contains("yes"), "the agent was not on a tty: {text:?}");
+        assert!(text.contains("xterm-256color"), "TERM was not set: {text:?}");
+        launched.child.wait().await.unwrap();
+    }
+
+    // a pty child gets its own session, so a signal it sends its group can't
+    // travel up into the daemon's
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pty_agent_leads_its_own_process_group() {
+        let Some(_) = which("sh") else { return };
+        let p = AgentPreset {
+            command: "sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            interactive: true,
+            ..AgentPreset::default()
+        };
+        let mut launched = launch(&p, &std::env::temp_dir(), "").unwrap();
+        let pid = launched.child.id().unwrap() as i32;
+
+        unsafe extern "C" {
+            fn getpgid(pid: i32) -> i32;
+        }
+        assert_eq!(unsafe { getpgid(pid) }, pid, "the agent joined our group");
+        assert_ne!(pid, unsafe { getpgid(0) });
+
+        kill_tree(&mut launched.child).await.unwrap();
+    }
+
+    /// A preset whose agent keeps writing to `marker` for a good while, so a
+    /// test can tell "still running" from "was killed and became a zombie" —
+    /// which `kill(pid, 0)` cannot, since a reaped-later corpse still answers.
+    #[cfg(unix)]
+    fn ticker(marker: &Path) -> AgentPreset {
+        AgentPreset {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("i=0; while [ $i -lt 60 ]; do echo $i >> {}; i=$((i+1)); sleep 1; done", marker.display()),
+            ],
+            ..AgentPreset::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn ticks(marker: &Path) -> usize {
+        std::fs::read_to_string(marker).map(|t| t.lines().count()).unwrap_or(0)
+    }
+
+    // regression: launch() armed kill_on_drop(true), so an agent's life was
+    // owned by whoever happened to hold its `Child`. dropping the process
+    // table — or unwinding out of an unrelated error on the way to the
+    // runtime being dropped — SIGKILLed every running agent, with no session
+    // event and nothing to tell the user why their work stopped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_handle_does_not_kill_a_running_agent() {
+        let Some(_) = which("sh") else { return };
+        let dir = std::env::temp_dir().join(format!("telepager-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ticks");
+
+        let launched = launch(&ticker(&marker), &dir, "").unwrap();
+        let pid = launched.child.id().unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let before = ticks(&marker);
+        assert!(before > 0, "the agent never started");
+
+        drop(launched);
+
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert!(
+            ticks(&marker) > before,
+            "the agent stopped ticking once we dropped its handle"
+        );
+
+        signal_process_group(pid);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

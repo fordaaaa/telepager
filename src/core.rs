@@ -6,18 +6,21 @@
 //! where a question gets routed or an agent gets started.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use portable_pty::{MasterPty, PtySize};
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
-use tokio::process::{Child, ChildStdin};
+use tokio::process::ChildStdin;
 use tokio::sync::{oneshot, Mutex, Notify, RwLock};
 
-use crate::agents;
+use crate::agents::{self, Handle};
 use crate::config::{self, Config};
+use crate::screen::{self, Screen};
 use crate::session::{Event, EventKind, Kind, Registry, SessionId, State};
 use crate::telegram::Telegram;
 
@@ -27,6 +30,9 @@ pub const MAX_OPTIONS: usize = 20;
 const KEEP_FINISHED: usize = 30;
 /// Output lines quoted back to Telegram when an agent finishes.
 const EXIT_TAIL_LINES: usize = 15;
+/// How often a busy screen may say it changed. A tui redraws faster than
+/// anyone reads, and the bus is shared.
+const SCREEN_TICK: Duration = Duration::from_millis(80);
 
 #[derive(Debug)]
 pub enum Answer {
@@ -39,9 +45,38 @@ struct Pending {
     session: SessionId,
     question: String,
     options: Vec<String>,
-    /// The Telegram message carrying the buttons, so a tap can find it.
-    tg_message_id: Option<i64>,
+    /// The Telegram messages carrying the buttons — one per chat, so a tap
+    /// from any of them finds the question.
+    tg_messages: Fanout,
     tx: oneshot::Sender<Answer>,
+}
+
+/// Where one outbound message landed: a Telegram message id per chat.
+///
+/// Everything the bot says goes to every allowed user, so a status line being
+/// edited in place is several messages, not one.
+#[derive(Debug, Clone, Default)]
+pub struct Fanout {
+    sent: Vec<(i64, i64)>,
+}
+
+impl Fanout {
+    fn message_in(&self, chat: i64) -> Option<i64> {
+        self.sent.iter().find(|(c, _)| *c == chat).map(|(_, m)| *m)
+    }
+
+    fn carries(&self, message_id: i64) -> bool {
+        self.sent.iter().any(|(_, m)| *m == message_id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sent.is_empty()
+    }
+
+    /// How many chats it actually reached.
+    pub fn len(&self) -> usize {
+        self.sent.len()
+    }
 }
 
 /// A running agent process, kept so it can be written to and killed.
@@ -49,10 +84,20 @@ struct Pending {
 /// The child sits behind its own lock so the reaper can poll it without
 /// holding the whole process table while an agent runs for an hour.
 struct AgentProcess {
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<Handle>>,
     /// Behind its own lock, so writing to an agent that has stopped reading
     /// can't hold up the whole process table while the pipe buffer is full.
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    input: AgentInput,
+    /// The pty master, for resizes.
+    pty: Option<Arc<std::sync::Mutex<Box<dyn MasterPty + Send>>>>,
+}
+
+/// Where a follow-up typed at an agent goes.
+#[derive(Clone)]
+enum AgentInput {
+    Pipe(Arc<Mutex<Option<ChildStdin>>>),
+    /// A pty write blocks, so it happens on a blocking thread.
+    Pty(Arc<std::sync::Mutex<Option<Box<dyn Write + Send>>>>),
 }
 
 /// Where the web UI is listening, published so `telepager webui` can find it.
@@ -217,6 +262,91 @@ impl Core {
         self.registry.lock().await.forget(id)
     }
 
+    // -------------------------------------------------------- broadcasting
+
+    /// Send one message to every allowed user.
+    ///
+    /// The single place the fan-out happens. One chat failing — they blocked
+    /// the bot, or never said hello to it — must not stop the others, so a
+    /// failure is logged and the rest still go out.
+    pub async fn broadcast(&self, text: &str) -> (String, Fanout) {
+        let (Some(tg), Some(cfg)) = (self.telegram().await, self.config().await) else {
+            return ("not set up yet — run `telepager setup`".into(), Fanout::default());
+        };
+
+        let mut out = Fanout::default();
+        let mut last_error = None;
+        for chat in cfg.chat_ids() {
+            match tg.send_message(chat, text).await {
+                Ok(id) => out.sent.push((chat, id)),
+                Err(e) => {
+                    log::warn!("could not page {chat}: {e:#}");
+                    last_error = Some(format!("{e:#}"));
+                }
+            }
+        }
+
+        if out.is_empty() {
+            let why = last_error.unwrap_or_else(|| "nobody to send to".into());
+            return (format!("could not send: {why}"), out);
+        }
+        ("sent".into(), out)
+    }
+
+    /// Edit a message already broadcast, in every chat it reached. A chat that
+    /// hasn't got one yet — or whose edit fails — gets a fresh message.
+    pub async fn broadcast_edit(&self, previous: &Fanout, text: &str) -> (String, Fanout) {
+        let (Some(tg), Some(cfg)) = (self.telegram().await, self.config().await) else {
+            return ("not set up yet — run `telepager setup`".into(), previous.clone());
+        };
+
+        let mut out = Fanout::default();
+        let mut last_error = None;
+        for chat in cfg.chat_ids() {
+            if let Some(id) = previous.message_in(chat) {
+                match tg.edit_message(chat, id, text).await {
+                    Ok(()) => {
+                        out.sent.push((chat, id));
+                        continue;
+                    }
+                    Err(e) => log::debug!("status edit failed, sending a new one: {e:#}"),
+                }
+            }
+            match tg.send_message(chat, text).await {
+                Ok(id) => out.sent.push((chat, id)),
+                Err(e) => {
+                    log::warn!("could not page {chat}: {e:#}");
+                    last_error = Some(format!("{e:#}"));
+                }
+            }
+        }
+
+        if out.is_empty() {
+            let why = last_error.unwrap_or_else(|| "nobody to send to".into());
+            return (format!("could not send: {why}"), out);
+        }
+        ("sent".into(), out)
+    }
+
+    /// Take a broadcast message back down. Used for the master's status line,
+    /// which is scaffolding — once the answer arrives it's just noise.
+    pub async fn erase(&self, sent: &Fanout) {
+        let Some(tg) = self.telegram().await else { return };
+        for (chat, id) in &sent.sent {
+            if let Err(e) = tg.delete_message(*chat, *id).await {
+                log::debug!("could not take the status line down: {e:#}");
+            }
+        }
+    }
+
+    /// Tell everyone something without making the caller wait on Telegram.
+    pub fn announce(self: &Arc<Self>, text: String) {
+        let core = self.clone();
+        tokio::spawn(async move {
+            core.broadcast(&text).await;
+        });
+    }
+
     // ----------------------------------------------------------- paging
 
     /// Send a message to Telegram on a session's behalf.
@@ -233,17 +363,11 @@ impl Core {
                 .record(Some(id), EventKind::Message { text: text.to_string() });
         }
 
-        let (Some(tg), Some(cfg)) = (self.telegram().await, self.config().await) else {
-            return "not set up yet — run `telepager setup`".into();
-        };
-        match tg.send_message(cfg.chat_id, &decorate(&label, text)).await {
-            Ok(_) => "sent".into(),
-            Err(e) => format!("could not send: {e:#}"),
-        }
+        self.broadcast(&decorate(&label, text)).await.0
     }
 
-    /// The in-place status line. `previous` is the message being edited.
-    pub async fn thinking(&self, session: Option<&str>, text: &str, previous: Option<i64>) -> (String, Option<i64>) {
+    /// The in-place status line. `previous` is the broadcast being edited.
+    pub async fn thinking(&self, session: Option<&str>, text: &str, previous: &Fanout) -> (String, Fanout) {
         let label = match session {
             Some(id) => self.session_label(id).await.unwrap_or_else(|| "telepager".into()),
             None => "telepager".into(),
@@ -252,21 +376,7 @@ impl Core {
             self.registry.lock().await.set_thinking(id, text);
         }
 
-        let (Some(tg), Some(cfg)) = (self.telegram().await, self.config().await) else {
-            return ("not set up yet — run `telepager setup`".into(), previous);
-        };
-
-        let body = decorate(&label, &format!("💭 {text}"));
-        if let Some(id) = previous {
-            match tg.edit_message(cfg.chat_id, id, &body).await {
-                Ok(()) => return ("updated".into(), Some(id)),
-                Err(e) => log::debug!("status edit failed, sending a new one: {e:#}"),
-            }
-        }
-        match tg.send_message(cfg.chat_id, &body).await {
-            Ok(id) => ("sent".into(), Some(id)),
-            Err(e) => (format!("could not send: {e:#}"), None),
-        }
+        self.broadcast_edit(previous, &decorate(&label, &format!("💭 {text}"))).await
     }
 
     /// Ask the user something and block until they answer, from either front
@@ -295,20 +405,16 @@ impl Core {
         // the question is live in the ui whether or not telegram works
         self.registry.lock().await.set_question(session, question, options);
 
-        let tg_message_id = match self.telegram().await {
-            Some(tg) => {
-                let prompt = format!("{text}\n\n(or reply to this message with your own answer)");
-                let buttons: Vec<String> = options.to_vec();
-                match tg.send_with_buttons(cfg.chat_id, &prompt, &buttons, &qid).await {
-                    Ok(id) => Some(id),
-                    Err(e) => {
-                        log::warn!("could not send the question to telegram: {e:#}");
-                        None
-                    }
+        let mut tg_messages = Fanout::default();
+        if let Some(tg) = self.telegram().await {
+            let prompt = format!("{text}\n\n(or reply to this message with your own answer)");
+            for chat in cfg.chat_ids() {
+                match tg.send_with_buttons(chat, &prompt, options, &qid).await {
+                    Ok(id) => tg_messages.sent.push((chat, id)),
+                    Err(e) => log::warn!("could not send the question to {chat}: {e:#}"),
                 }
             }
-            None => None,
-        };
+        }
 
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(
@@ -317,7 +423,7 @@ impl Core {
                 session: session.to_string(),
                 question: question.to_string(),
                 options: options.to_vec(),
-                tg_message_id,
+                tg_messages: tg_messages.clone(),
                 tx,
             },
         );
@@ -325,7 +431,7 @@ impl Core {
         let wait = Duration::from_secs(cfg.ask_timeout_seconds);
         let picked = tokio::time::timeout(wait, rx).await;
         let entry = self.pending.lock().await.remove(&qid);
-        let tg_message_id = entry.and_then(|p| p.tg_message_id).or(tg_message_id);
+        let tg_messages = entry.map(|p| p.tg_messages).unwrap_or(tg_messages);
 
         let (answer, settled) = match picked {
             Ok(Ok(Answer::Tapped(index))) => {
@@ -347,9 +453,12 @@ impl Core {
 
         self.registry.lock().await.clear_question(session, &answer);
 
-        if let (Some(tg), Some(msg_id)) = (self.telegram().await, tg_message_id) {
-            if let Err(e) = tg.edit_message(cfg.chat_id, msg_id, &settled).await {
-                log::debug!("could not clear the keyboard: {e:#}");
+        // every chat got buttons, so every chat's keyboard has to go
+        if let Some(tg) = self.telegram().await {
+            for (chat, msg_id) in &tg_messages.sent {
+                if let Err(e) = tg.edit_message(*chat, *msg_id, &settled).await {
+                    log::debug!("could not clear the keyboard in {chat}: {e:#}");
+                }
             }
         }
         answer
@@ -363,13 +472,14 @@ impl Core {
         }
     }
 
-    /// Find the question a Telegram message carries the buttons for.
+    /// Find the question a Telegram message carries the buttons for. The tap
+    /// or reply can come from any of the chats the question went to.
     pub async fn question_for_message(&self, message_id: i64) -> Option<String> {
         self.pending
             .lock()
             .await
             .iter()
-            .find(|(_, p)| p.tg_message_id == Some(message_id))
+            .find(|(_, p)| p.tg_messages.carries(message_id))
             .map(|(id, _)| id.clone())
     }
 
@@ -385,11 +495,14 @@ impl Core {
         }
     }
 
-    /// The only pending question, when there's exactly one — what an
-    /// unaddressed typed reply in Telegram should answer.
-    pub async fn only_pending_question(&self) -> Option<String> {
+    /// The only pending question, when there's exactly one, with its options —
+    /// what a typed reply in Telegram might be answering.
+    pub async fn only_pending_question(&self) -> Option<(String, Vec<String>)> {
         let pending = self.pending.lock().await;
-        (pending.len() == 1).then(|| pending.keys().next().cloned()).flatten()
+        if pending.len() != 1 {
+            return None;
+        }
+        pending.iter().next().map(|(id, p)| (id.clone(), p.options.clone()))
     }
 
     pub async fn pending_questions(&self) -> Vec<Value> {
@@ -464,9 +577,13 @@ impl Core {
             Err(e) => {
                 let reason = format!("{e:#}");
                 self.registry.lock().await.fail(&id, &reason);
+                self.announce(format!("⚠️ {agent} wouldn't start in {}: {reason}", path.display()));
                 return Err(e);
             }
         };
+
+        // whoever started it, everyone hears about it
+        self.announce(format!("🚀 {agent} started in {} as {id}\n\ntask: {task}", path.display()));
 
         self.record(
             Some(&id),
@@ -475,25 +592,84 @@ impl Core {
         .await;
         self.set_state(&id, State::Working).await;
 
-        let agents::Launched { child, stdout, stderr, stdin, .. } = launched;
+        let agents::Launched { child, io, .. } = launched;
         let child = Arc::new(Mutex::new(child));
+
+        let (input, pty) = match io {
+            agents::Io::Pipes { stdout, stderr, stdin } => {
+                if let Some(out) = stdout {
+                    tokio::spawn(pump(self.clone(), id.clone(), "stdout", out));
+                }
+                if let Some(err) = stderr {
+                    tokio::spawn(pump(self.clone(), id.clone(), "stderr", err));
+                }
+                (AgentInput::Pipe(Arc::new(Mutex::new(stdin))), None)
+            }
+            agents::Io::Pty { master, reader, writer } => {
+                let screen = Arc::new(std::sync::Mutex::new(Screen::new(
+                    screen::DEFAULT_COLS,
+                    screen::DEFAULT_ROWS,
+                )));
+                self.registry.lock().await.attach_screen(&id, screen.clone());
+                tokio::spawn(pump_pty(self.clone(), id.clone(), screen, reader));
+                (
+                    AgentInput::Pty(Arc::new(std::sync::Mutex::new(Some(writer)))),
+                    Some(Arc::new(std::sync::Mutex::new(master))),
+                )
+            }
+        };
+
         self.processes
             .lock()
             .await
-            .insert(
-                id.clone(),
-                AgentProcess { child: child.clone(), stdin: Arc::new(Mutex::new(stdin)) },
-            );
+            .insert(id.clone(), AgentProcess { child: child.clone(), input, pty });
 
-        if let Some(out) = stdout {
-            tokio::spawn(pump(self.clone(), id.clone(), "stdout", out));
-        }
-        if let Some(err) = stderr {
-            tokio::spawn(pump(self.clone(), id.clone(), "stderr", err));
-        }
         tokio::spawn(reap(self.clone(), id.clone(), child, agent.to_string(), task.to_string()));
 
         Ok(id)
+    }
+
+    /// A pty session's screen: all of it, or what changed since `since`.
+    pub async fn screen_view(&self, id: &str, since: Option<u64>) -> Result<Value> {
+        let screen = self
+            .registry
+            .lock()
+            .await
+            .screen(id)
+            .context("that session isn't running on a terminal")?;
+        let view = screen::lock(&screen).view(since);
+        Ok(view)
+    }
+
+    /// Tell a session's screen — and the agent drawing on it — a new size.
+    pub async fn resize_session(&self, id: &str, cols: u16, rows: u16) -> Result<Value> {
+        let screen = self
+            .registry
+            .lock()
+            .await
+            .screen(id)
+            .context("that session isn't running on a terminal")?;
+
+        let (revision, cols, rows) = {
+            let mut screen = screen::lock(&screen);
+            screen.resize(cols, rows);
+            (screen.revision(), screen.cols(), screen.rows())
+        };
+
+        // the kernel has to agree, or the agent keeps drawing the old size
+        if let Some(pty) = self.processes.lock().await.get(id).and_then(|p| p.pty.clone()) {
+            let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+            let result = match pty.lock() {
+                Ok(m) => m.resize(size),
+                Err(p) => p.into_inner().resize(size),
+            };
+            if let Err(e) = result {
+                log::debug!("could not resize {id}'s pty: {e:#}");
+            }
+        }
+
+        self.record(Some(id), EventKind::Screen { revision }).await;
+        Ok(json!({ "revision": revision, "cols": cols, "rows": rows }))
     }
 
     /// Type something at a running agent's stdin.
@@ -501,23 +677,33 @@ impl Core {
         // take the handle and let go of the table: an agent that has stopped
         // reading stdin will block this write until its pipe drains, and
         // holding the table meanwhile would wedge every other agent too
-        let stdin = {
+        let input = {
             let procs = self.processes.lock().await;
             let proc = procs.get(id).context("that session isn't a running agent")?;
-            proc.stdin.clone()
+            proc.input.clone()
         };
 
-        {
-            let mut guard = stdin.lock().await;
-            let handle = guard
-                .as_mut()
-                .context("that agent isn't reading stdin any more")?;
+        match input {
+            AgentInput::Pipe(stdin) => {
+                let mut guard = stdin.lock().await;
+                let handle = guard
+                    .as_mut()
+                    .context("that agent isn't reading stdin any more")?;
 
-            handle.write_all(text.as_bytes()).await.context("writing to the agent")?;
-            if !text.ends_with('\n') {
-                handle.write_all(b"\n").await.ok();
+                handle.write_all(text.as_bytes()).await.context("writing to the agent")?;
+                if !text.ends_with('\n') {
+                    handle.write_all(b"\n").await.ok();
+                }
+                handle.flush().await.ok();
             }
-            handle.flush().await.ok();
+            // a terminal sees the return key as CR, not LF
+            AgentInput::Pty(writer) => {
+                let mut bytes = text.as_bytes().to_vec();
+                if !text.ends_with('\r') && !text.ends_with('\n') {
+                    bytes.push(b'\r');
+                }
+                pty_write(writer, bytes).await?;
+            }
         }
 
         self.record(Some(id), EventKind::Notice { text: format!("< {text}") }).await;
@@ -526,13 +712,17 @@ impl Core {
 
     /// Close an agent's stdin, which is how most CLIs are told to finish.
     pub async fn close_agent_stdin(&self, id: &str) -> Result<()> {
-        let stdin = {
+        let input = {
             let procs = self.processes.lock().await;
             let proc = procs.get(id).context("that session isn't a running agent")?;
-            proc.stdin.clone()
+            proc.input.clone()
         };
-        // dropping the handle is what actually sends EOF
-        *stdin.lock().await = None;
+        match input {
+            // dropping the handle is what actually sends EOF
+            AgentInput::Pipe(stdin) => *stdin.lock().await = None,
+            // a pty never closes; ^D is how you say end-of-input to one
+            AgentInput::Pty(writer) => pty_write(writer, vec![0x04]).await?,
+        }
         Ok(())
     }
 
@@ -549,6 +739,14 @@ impl Core {
 
     pub async fn is_running(&self, id: &str) -> bool {
         self.processes.lock().await.contains_key(id)
+    }
+
+    /// Wire a core straight to a config and a Telegram client, so a test needs
+    /// neither a config file nor the real api.
+    #[cfg(test)]
+    pub async fn attach(&self, cfg: Config, tg: Telegram) {
+        *self.cfg.write().await = Some(cfg);
+        *self.tg.write().await = Some(Arc::new(tg));
     }
 }
 
@@ -578,8 +776,83 @@ where
     }
 }
 
+/// A pty write blocks, so it happens off the runtime.
+async fn pty_write(
+    writer: Arc<std::sync::Mutex<Option<Box<dyn Write + Send>>>>,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = guard.as_mut().context("that agent isn't reading input any more")?;
+        handle.write_all(&bytes).context("writing to the agent")?;
+        handle.flush().ok();
+        Ok(())
+    })
+    .await
+    .context("writing to the agent")?
+}
+
+/// Feed a pty into a session's screen.
+///
+/// The read blocks, so it gets a thread of its own and hands chunks over.
+/// Screen events are coalesced — a redrawing tui would otherwise put a
+/// revision per frame on the shared bus.
+async fn pump_pty(core: Arc<Core>, id: SessionId, screen: screen::Shared, mut reader: Box<dyn std::io::Read + Send>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            // a closed pty reads as an error, not eof, on some platforms
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut announced = 0u64;
+    let mut last = Instant::now();
+
+    loop {
+        let chunk = tokio::time::timeout(SCREEN_TICK, rx.recv()).await;
+        let revision = match chunk {
+            Ok(Some(bytes)) => {
+                let (revision, lines) = {
+                    let mut screen = screen::lock(&screen);
+                    screen.feed(&bytes);
+                    (screen.revision(), screen.take_lines())
+                };
+                // what scrolled off is the session's output log, which
+                // read_output and the telegram summaries still read
+                for line in lines {
+                    core.record(Some(&id), EventKind::Output { stream: "screen".into(), line })
+                        .await;
+                }
+                revision
+            }
+            Ok(None) => break,
+            Err(_) => screen::lock(&screen).revision(),
+        };
+
+        if revision != announced && last.elapsed() >= SCREEN_TICK {
+            announced = revision;
+            last = Instant::now();
+            core.record(Some(&id), EventKind::Screen { revision }).await;
+        }
+    }
+
+    let revision = screen::lock(&screen).revision();
+    if revision != announced {
+        core.record(Some(&id), EventKind::Screen { revision }).await;
+    }
+}
+
 /// Wait for an agent to finish, then close the session and page the user.
-async fn reap(core: Arc<Core>, id: SessionId, child: Arc<Mutex<Child>>, agent: String, task: String) {
+async fn reap(core: Arc<Core>, id: SessionId, child: Arc<Mutex<Handle>>, agent: String, task: String) {
     // polled rather than awaited, so `kill_agent` can take the lock meanwhile
     let status = loop {
         match child.lock().await.try_wait() {
@@ -593,7 +866,7 @@ async fn reap(core: Arc<Core>, id: SessionId, child: Arc<Mutex<Child>>, agent: S
     core.processes.lock().await.remove(&id);
 
     let code = match &status {
-        Ok(s) => s.code(),
+        Ok(s) => s.code,
         Err(e) => {
             log::debug!("waiting on {id} failed: {e:#}");
             None
@@ -621,8 +894,88 @@ pub fn decorate(label: &str, text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+
+    /// Chat ids a fake Telegram was asked to send to, in order.
+    pub(crate) type Seen = Arc<std::sync::Mutex<Vec<i64>>>;
+
+    /// A stand-in Telegram api on localhost. It accepts messages for `good`
+    /// and refuses every other chat, which is how a test gets a chat that has
+    /// blocked the bot without one.
+    pub(crate) async fn fake_telegram(good: i64) -> (String, Seen, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let recorder = seen.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                // the body is what we're after, so read until it shows up
+                while let Ok(n) = stream.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                    if String::from_utf8_lossy(&request).contains("chat_id") {
+                        break;
+                    }
+                }
+
+                let chat = chat_id_in(&String::from_utf8_lossy(&request));
+                if let Some(chat) = chat {
+                    recorder.lock().unwrap().push(chat);
+                }
+                let body = if chat == Some(good) {
+                    r#"{"ok":true,"result":{"message_id":11}}"#
+                } else {
+                    r#"{"ok":false,"description":"chat not found"}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.ok();
+            }
+        });
+
+        (base, seen, server)
+    }
+
+    fn chat_id_in(request: &str) -> Option<i64> {
+        let rest = request.split("\"chat_id\":").nth(1)?;
+        let digits: String = rest
+            .chars()
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_ascii_digit() || *c == '-')
+            .collect();
+        digits.parse().ok()
+    }
+
+    pub(crate) fn config_for(ids: &[i64]) -> Config {
+        Config {
+            token: "1:fake".into(),
+            allowed_user_ids: ids.to_vec(),
+            chat_id: ids[0],
+            ask_timeout_seconds: 5,
+            master: Default::default(),
+            agents: Default::default(),
+            allowed_dirs: Vec::new(),
+            ui_port: 0,
+        }
+    }
+
+    /// A core talking to a fake Telegram that only `ids[0]` can receive from.
+    pub(crate) async fn wired_core(ids: &[i64]) -> (Arc<Core>, Seen, tokio::task::JoinHandle<()>) {
+        let (base, seen, server) = fake_telegram(ids[0]).await;
+        let c = core();
+        c.attach(config_for(ids), Telegram::with_base(&base)).await;
+        (c, seen, server)
+    }
 
     fn core() -> Arc<Core> {
         // a path that will never exist, so the core comes up unconfigured
@@ -650,7 +1003,7 @@ mod tests {
         let c = core();
         let id = c.open_session(Kind::Attached, "x".into(), None, None, None).await;
         assert!(c.send(Some(&id), "hi").await.contains("not set up"));
-        let (result, _) = c.thinking(Some(&id), "working", None).await;
+        let (result, _) = c.thinking(Some(&id), "working", &Fanout::default()).await;
         assert!(result.contains("not set up"));
         assert!(c.ask(&id, "q", &["a".into()]).await.contains("not set up"));
     }
@@ -762,6 +1115,236 @@ mod tests {
 
         writer.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A core whose only agent keeps appending to a file, so a test can tell
+    /// "still running" apart from "killed": a killed process is still a pid
+    /// until someone reaps it, but it stops ticking.
+    #[cfg(unix)]
+    fn ticking_core(name: &str) -> (Arc<Core>, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("telepager-core-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ticks");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "bot_token": "1:fake",
+                "allowed_user_ids": [1],
+                "agents": {
+                    "ticker": {
+                        "command": "sh",
+                        // bounded, so a test that fails still can't leave a
+                        // process behind for long
+                        "args": [
+                            "-c",
+                            format!(
+                                "i=0; while [ $i -lt 15 ]; do echo $i >> {}; i=$((i+1)); sleep 1; done",
+                                marker.display()
+                            ),
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (Core::new(Some(path)), dir, marker)
+    }
+
+    // regression: agents were launched with kill_on_drop(true), so the process
+    // table owned their lives. anything that dropped the core — the daemon
+    // unwinding out of an unrelated error, a runtime shutting down — SIGKILLed
+    // every agent that was still working, silently.
+    #[cfg(unix)]
+    #[test]
+    fn shutting_the_runtime_down_does_not_kill_running_agents() {
+        if crate::agents::which("sh").is_none() {
+            return;
+        }
+        let (core, dir, marker) = ticking_core("drop");
+        let ticks = || std::fs::read_to_string(&marker).map(|t| t.lines().count()).unwrap_or(0);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            core.spawn_agent("ticker", dir.to_str().unwrap(), "tick", false)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        });
+        let before = ticks();
+        assert!(before > 0, "the agent never started");
+
+        // this is the shape the daemon takes when it unwinds: every task goes,
+        // and with them the last references to the core and its process table
+        drop(core);
+        drop(runtime);
+
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(ticks() > before, "shutting the runtime down killed a live agent");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A core whose only agent is interactive, so it lands on a pty.
+    #[cfg(unix)]
+    fn tui_core(name: &str) -> (Arc<Core>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("telepager-core-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "bot_token": "1:fake",
+                "allowed_user_ids": [1],
+                "agents": {
+                    "tui": {
+                        "command": "sh",
+                        "args": ["-c", "printf 'hello\\r\\n'; sleep 20"],
+                        "interactive": true
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (Core::new(Some(path)), dir)
+    }
+
+    /// Wait for the screen to say something instead of sleeping and hoping.
+    #[cfg(unix)]
+    async fn screen_says(core: &Arc<Core>, id: &str, want: &str) -> bool {
+        for _ in 0..50 {
+            if core.output_tail(id, 40).await.unwrap_or_default().contains(want) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pty_agent_gets_a_screen_that_can_be_read_and_resized() {
+        if crate::agents::which("sh").is_none() {
+            return;
+        }
+        let (core, dir) = tui_core("screen");
+        let id = core.spawn_agent("tui", dir.to_str().unwrap(), "draw", false).await.unwrap();
+
+        assert!(screen_says(&core, &id, "hello").await, "the screen never drew");
+
+        let snap = core.screen_view(&id, None).await.unwrap();
+        assert_eq!(snap["full"], true);
+        assert_eq!(snap["cols"], 80);
+        assert_eq!(snap["rows"], 24);
+        let revision = snap["revision"].as_u64().unwrap();
+
+        // a diff from where we are is empty, and says the same revision
+        let diff = core.screen_view(&id, Some(revision)).await.unwrap();
+        assert_eq!(diff["full"], false);
+        assert_eq!(diff["revision"], revision);
+        assert_eq!(diff["lines"].as_array().unwrap().len(), 0);
+
+        let resized = core.resize_session(&id, 100, 30).await.unwrap();
+        assert_eq!(resized["cols"], 100);
+        assert_eq!(resized["rows"], 30);
+        assert_eq!(core.screen_view(&id, None).await.unwrap()["cols"], 100);
+
+        core.kill_agent(&id).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_session_with_no_screen_says_so_instead_of_panicking() {
+        let c = core();
+        let id = c.open_session(Kind::Attached, "x".into(), None, None, None).await;
+        assert!(c.screen_view(&id, None).await.is_err());
+        assert!(c.resize_session(&id, 80, 24).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_broadcast_goes_to_every_allowed_user() {
+        let (c, seen, server) = wired_core(&[7, 8, 9]).await;
+        let (status, sent) = c.broadcast("hello").await;
+
+        assert_eq!(status, "sent");
+        assert_eq!(*seen.lock().unwrap(), vec![7, 8, 9]);
+        // only 7 accepted it, so only 7's message can be edited later
+        assert_eq!(sent.sent, vec![(7, 11)]);
+        server.abort();
+    }
+
+    // one person blocking the bot used to be the whole fan-out's problem
+    #[tokio::test]
+    async fn one_chat_refusing_does_not_stop_the_others() {
+        // only 9 can receive, and it's last in line behind two refusals
+        let (base, seen, server) = fake_telegram(9).await;
+        let c = core();
+        c.attach(config_for(&[8, 7, 9]), Telegram::with_base(&base)).await;
+
+        let (status, sent) = c.broadcast("hello").await;
+        assert_eq!(*seen.lock().unwrap(), vec![8, 7, 9]);
+        assert_eq!(status, "sent");
+        assert_eq!(sent.sent, vec![(9, 11)]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nobody_reachable_is_reported_rather_than_claimed_sent() {
+        let (base, _seen, server) = fake_telegram(0).await;
+        let c = core();
+        c.attach(config_for(&[7, 8]), Telegram::with_base(&base)).await;
+
+        let (status, sent) = c.broadcast("hello").await;
+        assert!(status.starts_with("could not send"), "{status}");
+        assert!(sent.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_status_line_is_edited_where_it_landed_and_sent_where_it_did_not() {
+        let (c, seen, server) = wired_core(&[7, 8]).await;
+        let (_, first) = c.thinking(None, "working", &Fanout::default()).await;
+        assert_eq!(first.sent, vec![(7, 11)]);
+
+        let (_, second) = c.thinking(None, "still working", &first).await;
+        assert_eq!(second.sent, vec![(7, 11)]);
+        // 7 got an edit, 8 another attempt at a fresh message
+        assert_eq!(*seen.lock().unwrap(), vec![7, 8, 7, 8]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_tap_from_any_chat_finds_its_question() {
+        let (c, _seen, server) = wired_core(&[7]).await;
+        let id = c.open_session(Kind::Attached, "proj".into(), None, None, None).await;
+
+        let asker = {
+            let c = c.clone();
+            let id = id.clone();
+            tokio::spawn(async move { c.ask(&id, "ship it?", &["yes".into(), "no".into()]).await })
+        };
+        let qid = waiting_question(&c).await;
+
+        assert_eq!(c.question_for_message(11).await.as_deref(), Some(qid.as_str()));
+        assert!(c.question_for_message(12).await.is_none());
+        assert!(c.answer(&qid, Answer::Tapped(1)).await);
+        assert_eq!(asker.await.unwrap(), "no");
+        server.abort();
+    }
+
+    /// Wait for `ask` to park its question, rather than sleeping and hoping.
+    pub(crate) async fn waiting_question(core: &Arc<Core>) -> String {
+        for _ in 0..100 {
+            if let Some((qid, _)) = core.only_pending_question().await {
+                return qid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no question was ever waiting");
     }
 
     #[tokio::test]

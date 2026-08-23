@@ -241,7 +241,7 @@ impl MasterConfig {
 /// `{task}` in an arg is replaced with the task text; an arg that is exactly
 /// `{task}` and nothing else is replaced as a whole argument, so tasks with
 /// spaces and quotes survive without a shell.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentPreset {
     pub command: String,
@@ -253,18 +253,6 @@ pub struct AgentPreset {
     /// Whether this agent keeps reading stdin after it starts, which decides
     /// if "send a follow-up" is offered for its sessions.
     pub interactive: bool,
-}
-
-impl Default for AgentPreset {
-    fn default() -> Self {
-        Self {
-            command: String::new(),
-            args: Vec::new(),
-            description: String::new(),
-            env: BTreeMap::new(),
-            interactive: false,
-        }
-    }
 }
 
 /// The coding CLIs telepager knows how to drive out of the box. Anything on
@@ -321,6 +309,21 @@ pub struct Config {
     /// since reaching it already means being at the machine.
     pub allowed_dirs: Vec<PathBuf>,
     pub ui_port: u16,
+}
+
+impl Config {
+    /// Every chat we page, primary one first. `chat_id` stays the default so
+    /// old config files keep working; the rest of the allowlist gets the same
+    /// messages, which is the point of allowing them.
+    pub fn chat_ids(&self) -> Vec<i64> {
+        let mut ids = vec![self.chat_id];
+        for id in &self.allowed_user_ids {
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        ids
+    }
 }
 
 // %APPDATA%\telepager on windows, ~/Library/Application Support on mac,
@@ -585,6 +588,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn everyone_allowed_gets_paged_with_the_primary_chat_first() {
+        let cfg = Config {
+            token: "t".into(),
+            allowed_user_ids: vec![7, 8, 9],
+            chat_id: 8,
+            ask_timeout_seconds: 300,
+            master: Default::default(),
+            agents: Default::default(),
+            allowed_dirs: Vec::new(),
+            ui_port: 0,
+        };
+        assert_eq!(cfg.chat_ids(), vec![8, 7, 9]);
+
+        // a group chat isn't in the allowlist, and still gets everything
+        let group = Config { chat_id: -100, ..cfg };
+        assert_eq!(group.chat_ids(), vec![-100, 7, 8, 9]);
     }
 
     #[test]

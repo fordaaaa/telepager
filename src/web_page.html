@@ -6,33 +6,55 @@
 <title>telepager</title>
 <style>
   :root {
-    --bg: #f6f7f9;
+    color-scheme: light;
+    --bg: #f4f5f7;
     --card: #ffffff;
+    --sunk: #eceef1;
     --ink: #16181d;
-    --muted: #6b7280;
-    --line: #e3e6ea;
+    --muted: #697280;
+    --line: #e0e4e9;
+    --line-soft: #edf0f3;
     --accent: #2aabee;
     --accent-ink: #ffffff;
-    --ok: #1a7f45;
-    --bad: #b3261e;
-    --warn: #b45309;
-    --code-bg: #f0f2f5;
+    --ok: #12784a;
+    --bad: #c0362c;
+    --warn: #a45a09;
+    --code-bg: #f3f5f7;
+
+    /* the terminal keeps its own dark surface in both themes — ansi colours
+       are picked for a dark background and look broken on a light one */
+    --term-bg: #10131a;
+    --term-fg: #d3d8e0;
+
+    /* one spacing scale, so panes line up instead of each picking a number */
+    --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px;
+    --r1: 6px; --r2: 9px; --r3: 13px;
+    --header-h: 49px;
+    --shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+    --shadow-lift: 0 10px 34px -8px rgba(16, 24, 40, 0.28);
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #101216;
-      --card: #191c22;
-      --ink: #e8eaed;
-      --muted: #9aa1ac;
-      --line: #2a2f38;
-      --accent: #2aabee;
-      --accent-ink: #06121a;
-      --ok: #4ade80;
-      --bad: #f87171;
-      --warn: #fbbf24;
-      --code-bg: #11141a;
+      color-scheme: dark;
+      --bg: #0e1014;
+      --card: #171a20;
+      --sunk: #1e222a;
+      --ink: #e7e9ed;
+      --muted: #98a0ac;
+      --line: #272c35;
+      --line-soft: #1f242c;
+      --accent: #38b3f0;
+      --accent-ink: #06131b;
+      --ok: #45d483;
+      --bad: #f8827c;
+      --warn: #f5b93c;
+      --code-bg: #12151b;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+      --shadow-lift: 0 12px 38px -8px rgba(0, 0, 0, 0.6);
     }
   }
+
   * { box-sizing: border-box; }
   html, body { height: 100%; }
   body {
@@ -40,182 +62,394 @@
     background: var(--bg);
     color: var(--ink);
     font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
     display: flex; flex-direction: column;
   }
+
+  /* scrollbars: the default light ones look broken over a dark console */
+  * { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+  *::-webkit-scrollbar { width: 10px; height: 10px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: var(--line); border-radius: 999px;
+    border: 3px solid transparent; background-clip: content-box;
+  }
+  *::-webkit-scrollbar-thumb:hover { background-color: var(--muted); background-clip: content-box; }
+
+  /* ---- controls */
   button {
-    font: inherit; font-weight: 500; padding: 8px 14px; border-radius: 8px;
+    font: inherit; font-weight: 500; padding: 7px 13px; border-radius: var(--r2);
     border: 1px solid var(--line); background: var(--card); color: var(--ink);
-    cursor: pointer;
+    cursor: pointer; box-shadow: var(--shadow);
+    transition: background 0.12s, border-color 0.12s, color 0.12s, transform 0.06s;
   }
-  button:hover:not(:disabled) { border-color: var(--accent); }
-  button:disabled { opacity: 0.5; cursor: default; }
-  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button:hover:not(:disabled) { background: var(--sunk); border-color: var(--muted); }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; box-shadow: none; }
+  button.primary {
+    background: var(--accent); color: var(--accent-ink);
+    border-color: color-mix(in srgb, var(--accent) 80%, #000);
+  }
+  button.primary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 88%, #000);
+    border-color: color-mix(in srgb, var(--accent) 70%, #000);
+  }
   button.danger { color: var(--bad); }
+  button.danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--bad) 10%, var(--card));
+    border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
+  }
   button.small { padding: 4px 10px; font-size: 13px; }
+
   input[type=text], textarea, select {
-    width: 100%; padding: 9px 11px; font: inherit; font-size: 14px;
-    background: var(--bg); color: var(--ink);
-    border: 1px solid var(--line); border-radius: 8px;
+    width: 100%; padding: 8px 11px; font: inherit; font-size: 14px;
+    background: var(--card); color: var(--ink);
+    border: 1px solid var(--line); border-radius: var(--r2);
+    transition: border-color 0.12s, box-shadow 0.12s;
   }
-  input[type=text].mono, textarea.mono {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+  input[type=text]:hover:not(:disabled), textarea:hover:not(:disabled) { border-color: var(--muted); }
+  input[type=text]:focus, textarea:focus, select:focus {
+    outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
   }
+  input:disabled, textarea:disabled { background: var(--sunk); color: var(--muted); cursor: not-allowed; }
+  input::placeholder, textarea::placeholder { color: var(--muted); opacity: 0.75; }
+  input[type=text].mono, textarea.mono { font-family: var(--mono); font-size: 13px; }
   textarea { resize: vertical; }
-  :focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
-  label { display: block; font-weight: 500; margin-bottom: 6px; font-size: 14px; }
-  .hint { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r1); }
+
+  label { display: block; font-weight: 500; margin-bottom: var(--s2); font-size: 14px; }
+  .hint { color: var(--muted); font-size: 13px; margin: var(--s2) 0 0; }
   .hint a { color: var(--accent); }
   .hint.bad { color: var(--bad); }
-  .field { margin-bottom: 14px; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .field { margin-bottom: var(--s4); }
+  .row { display: flex; gap: var(--s2); flex-wrap: wrap; align-items: center; }
   .grow { flex: 1; min-width: 0; }
-  .note { margin-top: 10px; font-size: 14px; }
+  .note:not(:empty) { margin-top: var(--s3); font-size: 14px; }
   .note.ok { color: var(--ok); }
   .note.bad { color: var(--bad); }
   .note.wait { color: var(--muted); }
   .muted { color: var(--muted); }
-  pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre, code { font-family: var(--mono); }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: var(--r1); font-size: 0.9em; }
 
   /* ---- header */
   header {
-    display: flex; align-items: center; gap: 12px;
-    padding: 10px 16px; border-bottom: 1px solid var(--line);
-    background: var(--card); flex-shrink: 0;
+    display: flex; align-items: center; gap: var(--s2);
+    padding: var(--s2) var(--s4); border-bottom: 1px solid var(--line);
+    background: var(--card); flex-shrink: 0; height: var(--header-h);
   }
-  header h1 { font-size: 15px; margin: 0; letter-spacing: -0.01em; }
+  .brand { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+  .brand .mark {
+    width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+  }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: -0.01em; font-weight: 600; }
   header .spacer { flex: 1; }
   .badge {
-    font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    font-size: 12px; padding: 3px 9px; border-radius: 999px; font-weight: 500;
     border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+    background: var(--card);
   }
-  .badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
-  .badge.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
+  .badge.ok {
+    color: var(--ok); background: color-mix(in srgb, var(--ok) 9%, var(--card));
+    border-color: color-mix(in srgb, var(--ok) 32%, var(--line));
+  }
+  .badge.bad {
+    color: var(--bad); background: color-mix(in srgb, var(--bad) 9%, var(--card));
+    border-color: color-mix(in srgb, var(--bad) 32%, var(--line));
+  }
+  .badge.warn {
+    color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, var(--card));
+    border-color: color-mix(in srgb, var(--warn) 34%, var(--line));
+  }
+  .badge.mono { font-family: var(--mono); font-size: 11px; }
+  /* on a narrow window the badges are the first thing worth dropping */
+  @media (max-width: 620px) { header .badge { display: none; } }
+
+  /* a count on the menu button, so a waiting agent is visible with the
+     sidebar closed */
+  #menu { position: relative; }
+  #menu .pip {
+    position: absolute; top: -4px; right: -4px; min-width: 15px; height: 15px;
+    border-radius: 999px; background: var(--warn); color: #fff;
+    font-size: 10px; line-height: 15px; font-weight: 700; padding: 0 3px;
+  }
 
   /* ---- layout */
   .view { display: none; flex: 1; min-height: 0; }
   .view.on { display: flex; }
-  #setup { justify-content: center; overflow-y: auto; padding: 32px 20px 60px; }
+  #setup { justify-content: center; overflow-y: auto; padding: var(--s6) var(--s5) 72px; }
   #setup .inner { max-width: 560px; width: 100%; }
+
   aside {
-    width: 260px; flex-shrink: 0; border-right: 1px solid var(--line);
+    width: 264px; flex-shrink: 0; border-right: 1px solid var(--line);
     display: flex; flex-direction: column; background: var(--card);
   }
   aside .head {
-    padding: 10px 12px; border-bottom: 1px solid var(--line);
-    display: flex; align-items: center; gap: 8px;
+    padding: var(--s2) var(--s3) var(--s2) var(--s4);
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: var(--s2); min-height: 45px;
   }
   aside .head h2 {
-    font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em;
     color: var(--muted); margin: 0; font-weight: 600; flex: 1;
   }
-  #sessions { overflow-y: auto; flex: 1; padding: 6px; }
-  .session {
-    padding: 8px 10px; border-radius: 8px; cursor: pointer;
-    border: 1px solid transparent; margin-bottom: 2px;
+  #sessions { overflow-y: auto; flex: 1; padding: var(--s2); }
+  .group {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em;
+    color: var(--muted); font-weight: 600; padding: var(--s3) var(--s2) var(--s1);
   }
-  .session:hover { background: var(--bg); }
-  .session.on { background: var(--bg); border-color: var(--line); }
-  .session .name { font-weight: 500; font-size: 14px; display: flex; gap: 6px; align-items: center; }
-  .session .meta { font-size: 12px; color: var(--muted); margin-top: 2px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .group:first-child { padding-top: var(--s1); }
+  .session {
+    position: relative; padding: var(--s2) var(--s2) var(--s2) var(--s3);
+    border-radius: var(--r2); cursor: pointer;
+    border: 1px solid transparent; margin-bottom: 2px;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .session:hover { background: var(--sunk); }
+  .session.on {
+    background: color-mix(in srgb, var(--accent) 11%, var(--card));
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
+  }
+  /* the selected row also gets an edge, so it stays obvious next to a hover */
+  .session.on::before {
+    content: ""; position: absolute; left: 0; top: 8px; bottom: 8px;
+    width: 3px; border-radius: 0 3px 3px 0; background: var(--accent);
+  }
+  .session.asks { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+  .session .name {
+    font-weight: 500; font-size: 14px; display: flex; gap: var(--s2);
+    align-items: center; min-width: 0; white-space: nowrap;
+  }
+  .session .name .txt { overflow: hidden; text-overflow: ellipsis; }
+  .session .name .tag {
+    margin-left: auto; font-size: 11px; color: var(--muted); font-weight: 500;
+  }
+  .session.asks .name .tag { color: var(--warn); font-weight: 600; }
+  .session .meta {
+    font-size: 12px; color: var(--muted); margin-top: 2px; padding-left: 15px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .session .meta.live { color: var(--ink); opacity: 0.75; }
+
   .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
-  .dot.working { background: var(--accent); }
-  .dot.waiting { background: var(--warn); }
-  .dot.exited { background: var(--muted); opacity: 0.5; }
+  .dot.working {
+    background: var(--accent);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+    animation: pulse 1.9s ease-out infinite;
+  }
+  .dot.waiting { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent); }
+  .dot.exited { background: var(--muted); opacity: 0.45; }
   .dot.failed { background: var(--bad); }
-  .empty { color: var(--muted); font-size: 14px; padding: 16px 10px; text-align: center; }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+    70%  { box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 0%, transparent); }
+    100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important; }
+  }
+
+  .empty {
+    color: var(--muted); font-size: 14px; padding: var(--s5) var(--s4);
+    text-align: center; line-height: 1.65; text-wrap: balance;
+  }
 
   main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  .tabs { display: flex; gap: 4px; padding: 8px 12px 0; border-bottom: 1px solid var(--line); }
-  .tab {
-    padding: 7px 14px; border-radius: 8px 8px 0 0; cursor: pointer; font-size: 14px;
-    border: 1px solid transparent; border-bottom: none; color: var(--muted);
+
+  /* tabs: an underline rather than folder tabs, which never aligned with the
+     1px rule underneath them */
+  .tabs {
+    display: flex; gap: var(--s5); padding: 0 var(--s4);
+    border-bottom: 1px solid var(--line); background: var(--card); flex-shrink: 0;
   }
-  .tab.on { background: var(--card); border-color: var(--line); color: var(--ink); font-weight: 500; }
+  .tab {
+    padding: var(--s3) 0 10px; cursor: pointer; font-size: 14px;
+    color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px;
+    transition: color 0.12s, border-color 0.12s;
+    max-width: 45vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tab:hover { color: var(--ink); }
+  .tab.on { color: var(--ink); font-weight: 500; border-bottom-color: var(--accent); }
   .pane { display: none; flex: 1; min-height: 0; flex-direction: column; }
   .pane.on { display: flex; }
 
   /* ---- questions */
-  #questions { padding: 0 12px; }
+  #questions:not(:empty) { padding: var(--s3) var(--s4) 0; flex-shrink: 0; }
   .question {
-    background: var(--card); border: 1px solid var(--warn); border-radius: 10px;
-    padding: 12px 14px; margin-top: 10px;
+    background: color-mix(in srgb, var(--warn) 8%, var(--card));
+    border: 1px solid color-mix(in srgb, var(--warn) 38%, var(--line));
+    border-left: 3px solid var(--warn);
+    border-radius: var(--r2); padding: var(--s3) var(--s4); margin-bottom: var(--s2);
   }
-  .question .q { font-weight: 500; margin-bottom: 4px; }
+  .question .from {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em;
+    color: var(--warn); font-weight: 600; margin-bottom: 2px;
+  }
+  .question .q { font-weight: 500; margin-bottom: var(--s2); }
+  /* the free-text answer wraps onto its own line rather than being squeezed
+     to nothing next to the option buttons on a narrow window */
+  .question input[type=text] { flex: 1 1 220px; }
 
   /* ---- chat */
-  #chatlog { flex: 1; overflow-y: auto; padding: 16px; }
-  .turn { max-width: 720px; margin: 0 auto 14px; display: flex; gap: 10px; }
+  #chatlog { flex: 1; overflow-y: auto; padding: var(--s5) var(--s4); }
+  .turn { max-width: 760px; margin: 0 auto var(--s4); display: flex; gap: var(--s3); }
   .turn .who {
-    font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
-    color: var(--muted); width: 52px; flex-shrink: 0; padding-top: 3px; font-weight: 600;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em;
+    color: var(--muted); width: 48px; flex-shrink: 0; padding-top: 4px; font-weight: 600;
   }
-  .turn .what { flex: 1; min-width: 0; white-space: pre-wrap; word-wrap: break-word; }
-  .turn.tool .what {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px;
-    color: var(--muted); background: var(--code-bg); border: 1px solid var(--line);
-    border-radius: 8px; padding: 6px 9px;
+  .turn.user .who { color: var(--accent); }
+  .turn .what { flex: 1; min-width: 0; }
+  .turn .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* your own turns get a tint, so a long thread stays scannable */
+  .turn.user .what {
+    background: color-mix(in srgb, var(--accent) 8%, var(--card));
+    border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--line));
+    border-radius: var(--r2); padding: var(--s2) var(--s3); margin: -6px 0 0 -2px;
   }
-  .composer { border-top: 1px solid var(--line); padding: 12px; background: var(--card); }
-  .composer .inner { max-width: 720px; margin: 0 auto; }
+  /* tool calls the agent made: one chip each, not a comma soup */
+  .calls { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s2); }
+  .turn .text:empty + .calls { margin-top: 2px; }
+  .call {
+    display: inline-flex; align-items: baseline; gap: 6px; max-width: 100%;
+    font-family: var(--mono); font-size: 12px;
+    background: var(--code-bg); border: 1px solid var(--line-soft);
+    border-radius: 999px; padding: 3px 10px;
+  }
+  .call .nm { font-weight: 600; }
+  .call .ar { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* a tool result is usually noise until you want it, so it starts folded */
+  .turn.tool { margin-bottom: var(--s3); }
+  .turn.tool .what { font-size: 13px; }
+  details.result summary {
+    cursor: pointer; color: var(--muted); font-family: var(--mono); font-size: 12px;
+    list-style: none; display: flex; gap: 6px; align-items: baseline;
+  }
+  details.result summary::-webkit-details-marker { display: none; }
+  details.result summary::before { content: "▸"; font-size: 10px; }
+  details.result[open] summary::before { content: "▾"; }
+  details.result summary .peek { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  details.result pre {
+    margin: var(--s2) 0 0; padding: var(--s2) 10px; max-height: 260px; overflow: auto;
+    background: var(--code-bg); border: 1px solid var(--line-soft); border-radius: var(--r2);
+    font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .composer {
+    border-top: 1px solid var(--line); padding: var(--s3) var(--s4);
+    background: var(--card); flex-shrink: 0;
+  }
+  .composer .inner { max-width: 760px; margin: 0 auto; }
+  .composer .hint { margin-top: 6px; }
 
   /* ---- session output */
   .outhead {
-    padding: 10px 12px; border-bottom: 1px solid var(--line);
-    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    padding: var(--s2) var(--s4); border-bottom: 1px solid var(--line);
+    display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap;
+    background: var(--card); flex-shrink: 0; min-height: 45px;
   }
-  .outhead .title { font-weight: 500; }
+  .outhead .title { font-weight: 600; font-size: 14px; }
   #output {
-    flex: 1; overflow: auto; margin: 0; padding: 12px 14px;
-    font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
-    background: var(--code-bg);
+    flex: 1; overflow: auto; margin: 0; padding: var(--s3) var(--s4);
+    font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+    background: var(--code-bg); tab-size: 4;
   }
   #output .stderr { color: var(--warn); }
   #output .notice { color: var(--muted); }
   #output .msg { color: var(--accent); }
 
+  /* ---- terminal */
+  #term {
+    flex: 1; overflow: auto; padding: 10px 12px;
+    background: var(--term-bg); color: var(--term-fg);
+  }
+  #grid {
+    position: relative; font-family: var(--mono); font-size: 12.5px;
+    line-height: 1.32; white-space: pre; tab-size: 8;
+  }
+  #grid .trow { min-height: 1px; }
+  #grid .b { font-weight: 700; }
+  #probe { position: absolute; visibility: hidden; top: -9999px; left: 0; }
+  #cursor {
+    position: absolute; pointer-events: none; background: var(--term-fg);
+    mix-blend-mode: difference;
+  }
+
   /* ---- dialogs */
   dialog {
-    border: 1px solid var(--line); border-radius: 12px; background: var(--card);
-    color: var(--ink); padding: 0; max-width: 520px; width: calc(100% - 32px);
+    border: 1px solid var(--line); border-radius: var(--r3); background: var(--card);
+    color: var(--ink); padding: 0; max-width: 520px; width: calc(100% - var(--s6));
+    box-shadow: var(--shadow-lift);
   }
-  dialog::backdrop { background: rgba(0,0,0,0.45); }
-  dialog .body { padding: 18px 20px; max-height: 75vh; overflow-y: auto; }
-  dialog h2 { font-size: 16px; margin: 0 0 14px; }
+  dialog::backdrop { background: rgba(8, 11, 16, 0.5); backdrop-filter: blur(2px); }
+  dialog[open] { animation: dialog-in 0.14s ease-out; }
+  @keyframes dialog-in {
+    from { opacity: 0; transform: translateY(6px) scale(0.985); }
+    to   { opacity: 1; transform: none; }
+  }
+  dialog .body { padding: var(--s5); max-height: 75vh; overflow-y: auto; }
+  dialog h2 { font-size: 17px; margin: 0 0 var(--s5); letter-spacing: -0.01em; }
   dialog .foot {
-    padding: 12px 20px; border-top: 1px solid var(--line);
-    display: flex; gap: 8px; justify-content: flex-end;
+    padding: var(--s3) var(--s5); border-top: 1px solid var(--line);
+    display: flex; gap: var(--s2); justify-content: flex-end; background: var(--sunk);
+    border-radius: 0 0 var(--r3) var(--r3);
   }
+
   .card {
     background: var(--card); border: 1px solid var(--line);
-    border-radius: 12px; padding: 20px; margin-bottom: 16px;
+    border-radius: var(--r3); padding: var(--s5); margin-bottom: var(--s4);
+    box-shadow: var(--shadow); transition: opacity 0.2s;
   }
   .card h2 {
-    font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em;
-    color: var(--muted); margin: 0 0 12px; font-weight: 600;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em;
+    color: var(--muted); margin: 0 0 var(--s3); font-weight: 600;
   }
-  .card.done { opacity: 0.6; }
+  /* a finished setup step recedes, but stays readable — dimming the whole card
+     made its still-usable buttons look disabled */
+  .card.done { opacity: 0.9; border-color: color-mix(in srgb, var(--ok) 34%, var(--line)); }
+  .card.done h2 { color: var(--ok); }
   pre.snippet {
-    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
-    padding: 10px 12px; font-size: 12.5px; overflow-x: auto; margin: 10px 0 0;
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: var(--r2);
+    padding: 10px var(--s3); font-size: 12.5px; overflow-x: auto; margin: 10px 0 0;
   }
-  .sep { height: 1px; background: var(--line); margin: 18px 0; }
+  .sep { height: 1px; background: var(--line); margin: var(--s5) 0; }
+
+  /* the sidebar is always on screen here, so its toggle would do nothing.
+     the button's inline display is cleared by js once telegram is configured,
+     which is why this has to out-rank it. */
+  @media (min-width: 701px) { #menu { display: none !important; } }
 
   @media (max-width: 700px) {
-    aside { width: 100%; position: absolute; inset: 45px 0 0 0; z-index: 5; display: none; }
+    aside {
+      width: 100%; position: absolute; inset: var(--header-h) 0 0 0;
+      z-index: 5; display: none; border-right: none;
+    }
     aside.open { display: flex; }
     #console { position: relative; }
+    #chatlog { padding: var(--s4) var(--s3); }
+    .composer { padding: var(--s2) var(--s3); }
+    .tabs { gap: var(--s4); padding: 0 var(--s3); }
+    .turn { gap: var(--s2); }
+    .turn .who { width: 36px; font-size: 10px; }
+    .outhead { padding: var(--s2) var(--s3); gap: 6px; }
+    .outhead .title { width: 100%; }
+    #questions:not(:empty) { padding: var(--s2) var(--s3) 0; }
+    .question { padding: var(--s3); }
+    #term { padding: var(--s2); }
+    #output { padding: var(--s2) var(--s3); }
   }
 </style>
 </head>
 <body>
 
 <header>
-  <button id="menu" class="small" style="display:none">☰</button>
-  <h1>telepager</h1>
+  <button id="menu" class="small" style="display:none" aria-label="Show sessions">☰</button>
+  <div class="brand"><span class="mark"></span><h1>telepager</h1></div>
+  <span class="spacer"></span>
   <span id="tgBadge" class="badge">…</span>
   <span id="modelBadge" class="badge">…</span>
-  <span class="spacer"></span>
   <button id="openSettings" class="small">Settings</button>
 </header>
 
@@ -269,7 +503,7 @@
 <div id="console" class="view">
   <aside id="aside">
     <div class="head">
-      <h2>Sessions</h2>
+      <h2 id="sessionsHead">Sessions</h2>
       <button class="small primary" id="openSpawn">New agent</button>
     </div>
     <div id="sessions"></div>
@@ -301,11 +535,13 @@
       <div class="outhead">
         <span class="title" id="outTitle">—</span>
         <span class="badge" id="outState"></span>
+        <span class="badge mono" id="outSize" style="display:none"></span>
         <span class="spacer grow"></span>
         <button class="small" id="btnEof">Finish input</button>
         <button class="small danger" id="btnKill">Kill</button>
         <button class="small" id="btnForget">Clear</button>
       </div>
+      <div id="term" style="display:none"><div id="grid"><div id="probe"></div><div id="cursor"></div></div></div>
       <pre id="output"></pre>
       <div class="composer">
         <div class="inner row">
@@ -408,6 +644,7 @@ if (KEY) history.replaceState(null, "", location.pathname);
 let state = null;
 let selected = null;          // session id shown in the session pane
 const buffers = new Map();    // session id -> array of {cls, text}
+const isPty = new Map();      // session id -> true once /screen answers
 let transcript = [];
 
 async function api(path, body) {
@@ -432,6 +669,19 @@ function escapeHtml(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+/* everything built from agent output goes through here, never innerHTML */
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
+}
+
+function clip(s, n) {
+  s = String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
 /* ------------------------------------------------------------ state */
 
 async function refresh() {
@@ -454,7 +704,8 @@ function render() {
 
   const m = state.master || {};
   const mb = $("modelBadge");
-  mb.textContent = m.ready ? (m.provider + " / " + m.model) : "no model key";
+  /* a cli backend often reports no model of its own — don't show a bare slash */
+  mb.textContent = m.ready ? [m.provider, m.model].filter(Boolean).join(" / ") : "no model key";
   mb.className = "badge " + (m.ready ? "ok" : "bad");
 
   $("chatHint").textContent = m.ready
@@ -468,51 +719,90 @@ function render() {
   if (selected) renderSession();
 }
 
+/* --------------------------------------------------------- sidebar */
+
+function sessionRow(s) {
+  const row = el("div", "session" + (s.id === selected ? " on" : "") + (s.question ? " asks" : ""));
+  row.dataset.id = s.id;
+
+  const name = el("div", "name");
+  name.appendChild(el("span", "dot " + (s.state || "")));
+  name.appendChild(el("span", "txt", s.label));
+  if (s.question) name.appendChild(el("span", "tag", "asking"));
+  else if (s.detail) name.appendChild(el("span", "tag", clip(s.detail, 14)));
+  row.appendChild(name);
+
+  /* what it's actually doing beats repeating the task it was given */
+  const live = s.question ? s.question.question : s.thinking;
+  const meta = el("div", "meta" + (live ? " live" : ""),
+    live ? clip(live, 90) : clip([s.agent || s.kind, s.task || s.cwd || ""].filter(Boolean).join(" · "), 90));
+  row.appendChild(meta);
+
+  row.onclick = () => selectSession(s.id);
+  return row;
+}
+
 function renderSessions() {
   const box = $("sessions");
   const list = state.sessions || [];
+  const waiting = list.filter((s) => s.question).length;
+  const live = list.filter((s) => s.state === "working" || s.state === "waiting").length;
+
+  $("sessionsHead").textContent = list.length
+    ? "Sessions · " + live + " live" + (waiting ? " · " + waiting + " asking" : "")
+    : "Sessions";
+
+  const pip = $("menu").querySelector(".pip");
+  if (pip) pip.remove();
+  if (waiting) $("menu").appendChild(el("span", "pip", String(waiting)));
+
+  box.textContent = "";
   if (!list.length) {
     box.innerHTML = '<div class="empty">Nothing running yet.<br>Ask the master agent, or press New agent.</div>';
     return;
   }
-  box.innerHTML = list.map((s) => {
-    const on = s.id === selected ? " on" : "";
-    const meta = [s.agent || s.kind, s.detail || s.task || s.cwd || ""].filter(Boolean).join(" · ");
-    return '<div class="session' + on + '" data-id="' + escapeHtml(s.id) + '">' +
-      '<div class="name"><span class="dot ' + escapeHtml(s.state) + '"></span>' + escapeHtml(s.label) + '</div>' +
-      '<div class="meta">' + escapeHtml(meta) + "</div></div>";
-  }).join("");
 
-  box.querySelectorAll(".session").forEach((el) => {
-    el.onclick = () => selectSession(el.dataset.id);
-  });
+  /* the ones that need you, then the ones still going, then the rest */
+  const rank = (s) => (s.question ? 0 : s.state === "working" || s.state === "waiting" ? 1 : 2);
+  const groups = [["Waiting on you", 0], ["Running", 1], ["Done", 2]];
+  for (const [title, r] of groups) {
+    const some = list.filter((s) => rank(s) === r);
+    if (!some.length) continue;
+    box.appendChild(el("div", "group", title));
+    some.forEach((s) => box.appendChild(sessionRow(s)));
+  }
 }
+
+/* ------------------------------------------------------- questions */
 
 function renderQuestions() {
   const box = $("questions");
   const list = state.questions || [];
-  if (!list.length) { box.innerHTML = ""; return; }
+  box.textContent = "";
+  if (!list.length) return;
 
-  box.innerHTML = list.map((q, i) => {
-    const options = (q.options || []).map((o, j) =>
-      '<button class="small" data-q="' + i + '" data-opt="' + escapeHtml(o) + '">' +
-      (j + 1) + ". " + escapeHtml(o) + "</button>").join(" ");
-    return '<div class="question"><div class="q">' + escapeHtml(q.question) + "</div>" +
-      '<div class="muted" style="font-size:13px;margin-bottom:8px">' + escapeHtml(q.session) + "</div>" +
-      '<div class="row">' + options +
-      '<input type="text" class="grow" data-typed="' + i + '" placeholder="or type an answer…"></div></div>';
-  }).join("");
+  for (const q of list) {
+    const s = sessionById(q.session);
+    const card = el("div", "question");
+    card.appendChild(el("div", "from", (s ? s.label : q.session) + " is asking"));
+    card.appendChild(el("div", "q", q.question));
 
-  box.querySelectorAll("button[data-q]").forEach((b) => {
-    b.onclick = () => answer(list[+b.dataset.q].id, b.dataset.opt);
-  });
-  box.querySelectorAll("input[data-typed]").forEach((input) => {
-    input.onkeydown = (e) => {
-      if (e.key === "Enter" && input.value.trim()) {
-        answer(list[+input.dataset.typed].id, input.value.trim());
-      }
+    const row = el("div", "row");
+    (q.options || []).forEach((o, j) => {
+      const b = el("button", "small", (j + 1) + ". " + o);
+      b.onclick = () => answer(q.id, o);
+      row.appendChild(b);
+    });
+    const typed = el("input", "grow");
+    typed.type = "text";
+    typed.placeholder = (q.options || []).length ? "or type an answer…" : "type an answer…";
+    typed.onkeydown = (e) => {
+      if (e.key === "Enter" && typed.value.trim()) answer(q.id, typed.value.trim());
     };
-  });
+    row.appendChild(typed);
+    card.appendChild(row);
+    box.appendChild(card);
+  }
 }
 
 async function answer(id, text) {
@@ -522,26 +812,75 @@ async function answer(id, text) {
   } catch (e) { alert(e.message); }
 }
 
+/* ------------------------------------------------------------ chat */
+
+let chatKeys = [];
+
+function argSummary(args) {
+  if (!args || typeof args !== "object") return "";
+  return clip(Object.keys(args).map((k) => k + ": " + clip(
+    typeof args[k] === "object" ? JSON.stringify(args[k]) : args[k], 40)).join("  "), 90);
+}
+
+function turnNode(t) {
+  const role = t.role === "user" ? "user" : t.role === "tool" ? "tool" : "master";
+  const node = el("div", "turn " + role);
+  node.appendChild(el("div", "who", role === "master" ? "agent" : role));
+  const what = el("div", "what");
+
+  if (role === "tool") {
+    /* results are long and mostly skimmed past, so fold them */
+    const d = el("details", "result");
+    const sum = el("summary");
+    sum.appendChild(el("span", "nm", t.name || "result"));
+    sum.appendChild(el("span", "peek", clip(t.text, 80)));
+    d.appendChild(sum);
+    d.appendChild(el("pre", null, t.text || ""));
+    what.appendChild(d);
+  } else {
+    what.appendChild(el("div", "text", t.text || ""));
+    if (role === "master" && t.calls && t.calls.length) {
+      const calls = el("div", "calls");
+      for (const c of t.calls) {
+        const chip = el("span", "call");
+        chip.appendChild(el("span", "nm", c.name));
+        const a = argSummary(c.args);
+        if (a) chip.appendChild(el("span", "ar", a));
+        calls.appendChild(chip);
+      }
+      what.appendChild(calls);
+    }
+  }
+
+  node.appendChild(what);
+  return node;
+}
+
+/* rebuilt turn by turn: a full redraw while a reply streams in throws away
+   scroll position and any result you had open */
 function renderChat() {
   const log = $("chatlog");
   const stuck = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
 
   if (!transcript.length) {
+    chatKeys = [];
     log.innerHTML = '<div class="empty" style="margin-top:40px">' +
       "Tell it what you want done.<br><span class=\"muted\">" +
       "“start claude in ~/code/api and make the tests pass”</span></div>";
-  } else {
-    log.innerHTML = transcript.map((t) => {
-      const who = t.role === "master" ? "agent" : t.role;
-      let body = escapeHtml(t.text || "");
-      if (t.role === "master" && t.calls && t.calls.length && !t.text) {
-        body = '<span class="muted">' + escapeHtml(t.calls.map((c) => c.name).join(", ")) + "…</span>";
-      }
-      if (t.role === "tool") body = escapeHtml((t.name ? t.name + ": " : "") + (t.text || ""));
-      return '<div class="turn ' + escapeHtml(t.role) + '"><div class="who">' + escapeHtml(who) +
-        '</div><div class="what">' + body + "</div></div>";
-    }).join("");
+    return;
   }
+  if (!chatKeys.length) log.textContent = "";
+
+  const keys = transcript.map((t) => JSON.stringify(t));
+  for (let i = 0; i < keys.length; i++) {
+    if (chatKeys[i] === keys[i]) continue;
+    const node = turnNode(transcript[i]);
+    if (log.children[i]) log.replaceChild(node, log.children[i]);
+    else log.appendChild(node);
+  }
+  while (log.children.length > keys.length) log.removeChild(log.lastChild);
+  chatKeys = keys;
+
   if (stuck) log.scrollTop = log.scrollHeight;
 }
 
@@ -549,11 +888,11 @@ function renderChat() {
 
 function selectSession(id) {
   selected = id;
-  $("sessionTab").style.display = "";
   showPane("session");
   $("aside").classList.remove("open");
   renderSessions();
   renderSession();
+  openScreen(id);
 }
 
 function sessionById(id) {
@@ -562,10 +901,13 @@ function sessionById(id) {
 
 function renderSession() {
   const s = sessionById(selected);
+  $("sessionTab").style.display = "";
+  $("sessionTab").textContent = s ? s.label : "Session";
   $("outTitle").textContent = s ? (s.label + "  ·  " + s.id) : selected;
   const badge = $("outState");
   badge.textContent = s ? (s.detail ? s.state + " (" + s.detail + ")" : s.state) : "gone";
-  badge.className = "badge " + (s && s.state === "failed" ? "bad" : s && s.state === "working" ? "ok" : "");
+  badge.className = "badge " + (s && s.state === "failed" ? "bad"
+    : s && s.question ? "warn" : s && s.state === "working" ? "ok" : "");
 
   /* only spawned agents we still hold a process for can be typed at */
   const running = !!(s && s.running);
@@ -573,19 +915,230 @@ function renderSession() {
   $("btnEof").disabled = !running;
   $("sessionSend").disabled = !running;
   $("sessionInput").disabled = !running;
+  $("sessionInput").placeholder = isPty.get(selected)
+    ? "Type at this terminal…" : "Type at this agent's stdin…";
 
-  const lines = buffers.get(selected) || [];
+  if (isPty.get(selected)) return;
+  renderLog();
+}
+
+/* the plain line log, for anything not on a pty */
+let logShown = { session: null, count: 0 };
+
+function renderLog() {
   const out = $("output");
+  const lines = buffers.get(selected) || [];
   const stuck = out.scrollHeight - out.scrollTop - out.clientHeight < 60;
-  out.innerHTML = lines.map((l) =>
-    '<span class="' + l.cls + '">' + escapeHtml(l.text) + "</span>").join("\n");
+
+  /* append-only while the buffer just grows; it can also be trimmed or
+     cleared, and then it's a redraw */
+  if (logShown.session !== selected || lines.length < logShown.count) {
+    out.textContent = "";
+    logShown = { session: selected, count: 0 };
+  }
+  for (let i = logShown.count; i < lines.length; i++) {
+    if (i) out.appendChild(document.createTextNode("\n"));
+    out.appendChild(el("span", lines[i].cls, lines[i].text));
+  }
+  logShown.count = lines.length;
   if (stuck) out.scrollTop = out.scrollHeight;
 }
 
 function showPane(name) {
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t.dataset.pane === name));
   document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("on", p.id === "pane-" + name));
+  if (name === "session" && isPty.get(selected)) sizeTerm();
 }
+
+/* -------------------------------------------------------- terminal */
+
+/* xterm's 256: the 16 named ones, a 6×6×6 cube, then 24 greys */
+const PALETTE = (() => {
+  const p = ["#1c1f26", "#e05252", "#57a75a", "#c7a336", "#4d8ee0", "#b46bd0", "#3aa5a5", "#c3c8d0",
+             "#5a626e", "#ff6b6b", "#6fdc75", "#f2cf5b", "#6fb0ff", "#d68cf0", "#5fd8d8", "#ffffff"];
+  const hex = (n) => n.toString(16).padStart(2, "0");
+  const step = [0, 95, 135, 175, 215, 255];
+  for (let r = 0; r < 6; r++) for (let g = 0; g < 6; g++) for (let b = 0; b < 6; b++)
+    p.push("#" + hex(step[r]) + hex(step[g]) + hex(step[b]));
+  for (let i = 0; i < 24; i++) { const v = hex(8 + i * 10); p.push("#" + v + v + v); }
+  return p;
+})();
+
+const term = { session: null, revision: null, cols: 0, rows: 0, sigs: [], busy: false, again: false };
+let cell = { w: 7, h: 16 };
+
+function colorOf(v) {
+  if (typeof v === "number") return PALETTE[v] || null;
+  if (typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v)) return v;
+  return null;
+}
+
+function paintRow(node, runs) {
+  node.textContent = "";
+  if (!runs || !runs.length) { node.textContent = " "; return; }
+  for (const r of runs) {
+    let fg = colorOf(r.fg), bg = colorOf(r.bg);
+    if (r.inverse) {
+      const f = fg || "var(--term-fg)", b = bg || "var(--term-bg)";
+      fg = b; bg = f;
+    }
+    if (!fg && !bg && !r.bold) { node.appendChild(document.createTextNode(r.text || "")); continue; }
+    const span = el("span", r.bold ? "b" : null, r.text || "");
+    if (fg) span.style.color = fg;
+    if (bg) span.style.background = bg;
+    node.appendChild(span);
+  }
+}
+
+function gridRows() {
+  return Array.prototype.filter.call($("grid").children, (c) => c.classList.contains("trow"));
+}
+
+function applyScreen(d) {
+  const grid = $("grid");
+  let rows = gridRows();
+
+  /* a full snapshot or a new height means the row elements themselves change;
+     otherwise only the rows in the diff get touched */
+  if (d.full || rows.length !== d.rows) {
+    rows.forEach((r) => r.remove());
+    rows = [];
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < d.rows; i++) {
+      const row = el("div", "trow", " ");
+      frag.appendChild(row);
+      rows.push(row);
+    }
+    grid.appendChild(frag);
+    term.sigs = new Array(d.rows).fill(null);
+  }
+
+  for (const line of d.lines || []) {
+    const i = line.row;
+    if (i < 0 || i >= rows.length) continue;
+    const sig = JSON.stringify(line.runs || []);
+    if (term.sigs[i] === sig) continue;
+    term.sigs[i] = sig;
+    paintRow(rows[i], line.runs);
+  }
+
+  term.revision = d.revision;
+  term.cols = d.cols;
+  term.rows = d.rows;
+
+  const cur = $("cursor");
+  const c = d.cursor || {};
+  if (c.visible === false || c.row == null) {
+    cur.style.display = "none";
+  } else {
+    cur.style.display = "";
+    cur.style.width = cell.w + "px";
+    cur.style.height = cell.h + "px";
+    cur.style.left = (c.col || 0) * cell.w + "px";
+    cur.style.top = (c.row || 0) * cell.h + "px";
+  }
+
+  $("outSize").textContent = d.cols + "×" + d.rows;
+  $("outSize").style.display = "";
+}
+
+async function pullScreen() {
+  if (term.busy) { term.again = true; return; }
+  term.busy = true;
+  const id = term.session;
+  try {
+    const body = { session: id };
+    if (term.revision !== null) body.since = term.revision;
+    const d = await api("/api/session/screen", body);
+    if (id === term.session) applyScreen(d);
+  } catch (_) {
+    /* the session probably ended; the state refresh will say so */
+  } finally {
+    term.busy = false;
+    if (term.again) { term.again = false; pullScreen(); }
+  }
+}
+
+function measureCell() {
+  const probe = $("probe");
+  probe.textContent = "M".repeat(50);
+  const r = probe.getBoundingClientRect();
+  if (r.width > 0) cell = { w: r.width / 50, h: r.height };
+  probe.textContent = "";
+}
+
+/* what fits in the pane right now, in character cells */
+function fitSize() {
+  const box = $("term");
+  if (!box.clientWidth) return null;
+  const cs = getComputedStyle(box);
+  const w = box.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  const h = box.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+  return {
+    cols: Math.max(20, Math.min(500, Math.floor(w / cell.w))),
+    rows: Math.max(6, Math.min(300, Math.floor(h / cell.h))),
+  };
+}
+
+async function sizeTerm() {
+  if (!term.session || !isPty.get(term.session)) return;
+  measureCell();
+  const want = fitSize();
+  if (!want || (want.cols === term.cols && want.rows === term.rows)) return;
+  try {
+    /* the daemon clamps, so its echo is the truth — and every row is now stale */
+    const r = await api("/api/session/resize", { session: term.session, cols: want.cols, rows: want.rows });
+    term.cols = r.cols;
+    term.rows = r.rows;
+    term.revision = null;
+    await pullScreen();
+  } catch (_) {}
+}
+
+let sizeTimer = null;
+function sizeSoon() {
+  clearTimeout(sizeTimer);
+  sizeTimer = setTimeout(sizeTerm, 220);
+}
+
+async function openScreen(id) {
+  // the session list says whether it's on a pty. only a seed — a failed fetch
+  // below sets it to false for good, and must not be re-seeded back to true.
+  const known = sessionById(id);
+  if (!isPty.has(id) && known && typeof known.pty === "boolean") {
+    isPty.set(id, known.pty);
+  }
+
+  if (isPty.get(id) === false) {
+    term.session = null;
+    $("term").style.display = "none";
+    $("output").style.display = "";
+    $("outSize").style.display = "none";
+    renderLog();
+    return;
+  }
+  term.session = id;
+  term.revision = null;
+  term.cols = 0;
+  term.rows = 0;
+  try {
+    const d = await api("/api/session/screen", { session: id });
+    if (term.session !== id) return;
+    isPty.set(id, true);
+    $("term").style.display = "";
+    $("output").style.display = "none";
+    measureCell();
+    applyScreen(d);
+    renderSession();
+    sizeTerm();
+  } catch (_) {
+    isPty.set(id, false);
+    if (term.session === id) openScreen(id);
+  }
+}
+
+if (window.ResizeObserver) new ResizeObserver(sizeSoon).observe($("term"));
+window.addEventListener("resize", sizeSoon);
 
 /* ----------------------------------------------------------- events */
 
@@ -614,10 +1167,22 @@ function bufferEvent(ev) {
 function connect() {
   const es = new EventSource("/api/events?k=" + encodeURIComponent(KEY));
   let dirty = false;
+  let lastSeq = -1;
 
   es.onmessage = (msg) => {
     let ev;
     try { ev = JSON.parse(msg.data); } catch (_) { return; }
+
+    /* a reconnect replays the backlog — without this the chat doubles up */
+    if (typeof ev.seq === "number") {
+      if (ev.seq <= lastSeq) return;
+      lastSeq = ev.seq;
+    }
+
+    if (ev.type === "screen") {
+      if (ev.session === term.session) pullScreen();
+      return;
+    }
 
     bufferEvent(ev);
 
@@ -632,10 +1197,13 @@ function connect() {
     if (["started", "ended", "state_changed", "question", "answer"].includes(ev.type)) {
       dirty = true;
     }
-    if (ev.session === selected) renderSession();
+    if (ev.session === selected && !isPty.get(selected)) renderLog();
   };
 
-  es.addEventListener("ready", () => { if (selected) renderSession(); });
+  es.addEventListener("ready", () => {
+    if (!selected) return;
+    if (isPty.get(selected)) pullScreen(); else renderLog();
+  });
   es.onerror = () => { /* EventSource retries on its own */ };
 
   /* batched so a chatty agent doesn't cause a refetch per line */
@@ -712,7 +1280,7 @@ async function sendChat() {
   try {
     await api("/api/master/send", { text });
   } catch (e) {
-    transcript.push({ role: "tool", text: e.message });
+    transcript.push({ role: "tool", name: "error", text: e.message });
   } finally {
     $("chatSend").disabled = false;
     await refresh().catch(() => {});
@@ -755,6 +1323,8 @@ $("btnForget").onclick = async () => {
   try {
     await api("/api/session/forget", { session: selected });
     buffers.delete(selected);
+    isPty.delete(selected);
+    term.session = null;
     selected = null;
     $("sessionTab").style.display = "none";
     showPane("chat");
@@ -878,6 +1448,9 @@ $("settingsSave").onclick = async () => {
 };
 
 $("menu").onclick = () => $("aside").classList.toggle("open");
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") $("aside").classList.remove("open");
+});
 
 /* ------------------------------------------------------------- boot */
 

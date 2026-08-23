@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
+use crate::screen;
+
 /// How many output lines a session keeps. Enough to scroll back through a
 /// build, small enough that a runaway agent can't eat the machine's memory.
 const MAX_EVENTS_PER_SESSION: usize = 2000;
@@ -74,6 +76,9 @@ pub enum EventKind {
     /// A turn of the master agent conversation. `role` is user, master or tool.
     Chat { role: String, text: String },
     Notice { text: String },
+    /// A pty session's screen moved on. Deliberately just the revision: the
+    /// console fetches the diff, so no screen dump goes through the bus.
+    Screen { revision: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +109,9 @@ pub struct Session {
     pub question: Option<Value>,
     #[serde(skip)]
     pub events: VecDeque<Event>,
+    /// The terminal screen, for sessions running on a pty.
+    #[serde(skip)]
+    pub screen: Option<screen::Shared>,
 }
 
 impl Session {
@@ -126,6 +134,8 @@ impl Session {
             "created_at": self.created_at,
             "thinking": self.thinking,
             "question": self.question,
+            // so the console knows to draw a terminal without asking first
+            "pty": self.screen.is_some(),
         })
     }
 
@@ -150,6 +160,10 @@ impl Session {
     /// The tail of this session's output, for the UI terminal pane and for the
     /// master agent when it wants to know what an agent actually said.
     pub fn output_tail(&self, lines: usize) -> String {
+        // a pty session's real output is the screen, not the line log
+        if let Some(screen) = &self.screen {
+            return screen::lock(screen).tail_text(lines);
+        }
         let picked: Vec<&str> = self
             .events
             .iter()
@@ -258,6 +272,7 @@ impl Registry {
                 thinking: None,
                 question: None,
                 events: VecDeque::new(),
+                screen: None,
             },
         );
 
@@ -267,6 +282,17 @@ impl Registry {
             self.record(Some(&id), EventKind::Notice { text: "session connected".into() });
         }
         id
+    }
+
+    /// Give a session a screen, once we know it's running on a pty.
+    pub fn attach_screen(&mut self, id: &str, screen: screen::Shared) {
+        if let Some(s) = self.sessions.get_mut(id) {
+            s.screen = Some(screen);
+        }
+    }
+
+    pub fn screen(&self, id: &str) -> Option<screen::Shared> {
+        self.sessions.get(id).and_then(|s| s.screen.clone())
     }
 
     pub fn set_state(&mut self, id: &str, state: State) {
@@ -499,6 +525,22 @@ mod tests {
 
         assert_eq!(r.get(&id).unwrap().output_tail(10), "one\ntwo");
         assert_eq!(r.get(&id).unwrap().output_tail(1), "two");
+    }
+
+    #[test]
+    fn a_pty_sessions_tail_comes_from_its_screen() {
+        use std::sync::{Arc, Mutex};
+
+        let mut r = registry();
+        let id = r.open(Kind::Spawned, "x".into(), None, None, None);
+        r.record(Some(&id), EventKind::Output { stream: "screen".into(), line: "old".into() });
+
+        let screen = Arc::new(Mutex::new(crate::screen::Screen::new(20, 4)));
+        crate::screen::lock(&screen).feed(b"drawn\r\nin place");
+        r.attach_screen(&id, screen);
+
+        assert_eq!(r.get(&id).unwrap().output_tail(10), "drawn\nin place");
+        assert!(r.screen(&id).is_some());
     }
 
     #[test]
