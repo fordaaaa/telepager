@@ -76,6 +76,16 @@ pub fn clear_endpoint() {
     let _ = std::fs::remove_file(state_path());
 }
 
+/// Clear the endpoint file only when it still describes this process. A daemon
+/// that failed to start must not delete the address of the one that is running
+/// — every mcp shim and the master agent's bridge resolve the daemon through
+/// this file, and without it they can't reach anything.
+pub fn clear_endpoint_if_ours() {
+    if read_endpoint().map(|e| e.pid) == Some(std::process::id()) {
+        clear_endpoint();
+    }
+}
+
 // a label for the session, so messages can say which project is asking
 pub fn session_label() -> String {
     std::env::current_dir()

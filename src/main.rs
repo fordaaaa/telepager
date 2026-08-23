@@ -9,6 +9,7 @@ mod llm;
 mod master;
 mod master_mcp;
 mod mcp;
+mod screen;
 mod session;
 mod status;
 mod telegram;
@@ -20,8 +21,9 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 telepager — run and watch coding agents from your phone
 
-usage: telepager [--config PATH]
+usage: telepager [--no-open] [--config PATH]
        telepager webui [--no-open] [--config PATH]
+       telepager start [--no-open] [--config PATH]
        telepager setup [--port N] [--no-open] [--config PATH]
        telepager status [--config PATH]
        telepager mcp [--config PATH]
@@ -29,10 +31,13 @@ usage: telepager [--config PATH]
        telepager daemon [--no-open] [--config PATH]
        telepager stop
 
-  (no command)    start the app and open the console in your browser. runs
-                  setup first if it isn't configured yet.
-  webui           the same thing, said out loud. opens the console, starting
-                  the app first if it isn't already up.
+  (no command)    run the app here and open the console in your browser. it
+                  lives in this terminal — ctrl-c ends it. runs setup first if
+                  it isn't configured yet.
+  webui           the same thing, said out loud. attaches to the app if one is
+                  already up, instead of running one.
+  start           run the app in the background instead, so it outlives this
+                  terminal. `telepager stop` ends it.
   setup           connect a telegram bot: paste a token, pick up your user id.
   status          show whether it's set up and running.
   mcp             the stdio server an mcp client starts. this is what you
@@ -73,6 +78,10 @@ fn main() -> ExitCode {
             init_logging();
             return finish(status::open_console(config, open));
         }
+        Action::Start { config, open } => {
+            init_logging();
+            return finish(status::start_background(config, open));
+        }
         Action::Setup { config, port, open } => {
             init_logging();
             return finish(web::run_standalone(config, port, open));
@@ -88,7 +97,7 @@ fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e:#}");
-                    ipc::clear_endpoint();
+                    ipc::clear_endpoint_if_ours();
                     ExitCode::FAILURE
                 }
             };
@@ -144,8 +153,10 @@ fn init_logging() {
 }
 
 enum Action {
-    /// Bring the app up and open the console.
+    /// Be the app for as long as this terminal is open, and open the console.
     App { config: Option<PathBuf>, open: bool },
+    /// Put the app in the background and open the console.
+    Start { config: Option<PathBuf>, open: bool },
     Setup { config: Option<PathBuf>, port: u16, open: bool },
     Status(Option<PathBuf>),
     Mcp(Option<PathBuf>),
@@ -157,11 +168,16 @@ enum Action {
 }
 
 fn parse_args() -> Result<Action, String> {
+    parse(std::env::args().skip(1), status::started_by_a_person())
+}
+
+/// Split out from [`parse_args`] so the grammar is testable.
+fn parse(args: impl Iterator<Item = String>, by_a_person: bool) -> Result<Action, String> {
     let mut config = None;
     let mut mode = None;
     let mut port = 0u16;
     let mut open = true;
-    let mut args = std::env::args().skip(1);
+    let mut args = args;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -173,9 +189,8 @@ fn parse_args() -> Result<Action, String> {
                 println!("telepager {}", env!("CARGO_PKG_VERSION"));
                 return Ok(Action::Exit);
             }
-            "mcp" | "master-mcp" | "daemon" | "status" | "setup" | "webui" | "ui" | "stop" => {
-                mode = Some(arg)
-            }
+            "mcp" | "master-mcp" | "daemon" | "status" | "setup" | "webui" | "ui" | "start"
+            | "stop" => mode = Some(arg),
             "--port" => {
                 let value = args.next().ok_or("--port needs a number")?;
                 port = value
@@ -194,6 +209,7 @@ fn parse_args() -> Result<Action, String> {
     match mode.as_deref() {
         Some("setup") => Ok(Action::Setup { config, port, open }),
         Some("webui") | Some("ui") => Ok(Action::App { config, open }),
+        Some("start") => Ok(Action::Start { config, open }),
         Some("daemon") => Ok(Action::Daemon { config, open: false }),
         Some("mcp") => Ok(Action::Mcp(config)),
         Some("master-mcp") => Ok(Action::MasterMcp),
@@ -201,19 +217,61 @@ fn parse_args() -> Result<Action, String> {
         Some("stop") => Ok(Action::Stop),
         // a person typing `telepager` wants the app. a client piping json at
         // us is an mcp registration, and those keep working.
-        _ if status::started_by_a_person() => Ok(Action::App { config, open }),
+        _ if by_a_person => Ok(Action::App { config, open }),
         _ => Ok(Action::Mcp(config)),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{parse, Action};
+
+    fn args(list: &[&str]) -> impl Iterator<Item = String> {
+        list.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    }
+
     #[test]
     fn the_usage_documents_every_command() {
-        for command in ["webui", "setup", "status", "mcp", "master-mcp", "daemon", "stop"] {
+        for command in ["webui", "setup", "status", "mcp", "master-mcp", "daemon", "start", "stop"] {
             assert!(
                 super::USAGE.contains(command),
                 "usage doesn't mention {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_telepager_from_a_person_runs_the_app_here() {
+        assert!(matches!(
+            parse(args(&[]), true).unwrap(),
+            Action::App { open: true, .. }
+        ));
+    }
+
+    #[test]
+    fn json_on_stdin_is_still_an_mcp_registration() {
+        assert!(matches!(parse(args(&[]), false).unwrap(), Action::Mcp(None)));
+    }
+
+    #[test]
+    fn start_is_the_background_one() {
+        // `telepager` is foreground now, so the background one is asked for by name
+        assert!(matches!(
+            parse(args(&["start"]), true).unwrap(),
+            Action::Start { open: true, .. }
+        ));
+        assert!(matches!(
+            parse(args(&["start", "--no-open"]), true).unwrap(),
+            Action::Start { open: false, .. }
+        ));
+    }
+
+    #[test]
+    fn webui_takes_the_foreground_path_too() {
+        for name in ["webui", "ui"] {
+            assert!(
+                matches!(parse(args(&[name]), true).unwrap(), Action::App { .. }),
+                "{name} isn't the app"
             );
         }
     }
