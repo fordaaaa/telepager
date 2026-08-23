@@ -242,8 +242,8 @@ struct Grid {
 
 impl Grid {
     fn new(cols: u16, rows: u16) -> Self {
-        let cols = (cols.max(1)).min(MAX_COLS) as usize;
-        let rows = (rows.max(1)).min(MAX_ROWS) as usize;
+        let cols = cols.clamp(1, MAX_COLS) as usize;
+        let rows = rows.clamp(1, MAX_ROWS) as usize;
         Grid {
             cols,
             rows,
@@ -423,8 +423,8 @@ impl Grid {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
-        let cols = (cols.max(1)).min(MAX_COLS) as usize;
-        let rows = (rows.max(1)).min(MAX_ROWS) as usize;
+        let cols = cols.clamp(1, MAX_COLS) as usize;
+        let rows = rows.clamp(1, MAX_ROWS) as usize;
         if cols == self.cols && rows == self.rows {
             return;
         }
@@ -474,8 +474,8 @@ impl Grid {
         let pen = self.pen.erasing();
         let cols = self.cols;
         if let Some(line) = self.cells.get_mut(row) {
-            for col in from..to.min(cols) {
-                line[col] = Cell::blank(pen);
+            for cell in &mut line[from..to.min(cols)] {
+                *cell = Cell::blank(pen);
             }
         }
         self.touch(row);
@@ -629,7 +629,7 @@ impl vte::Perform for Grid {
                 self.cx = next.min(self.cols - 1);
                 self.wrap_next = false;
             }
-            0x0a | 0x0b | 0x0c => self.linefeed(),
+            0x0a..=0x0c => self.linefeed(),
             0x0d => {
                 self.cx = 0;
                 self.wrap_next = false;
