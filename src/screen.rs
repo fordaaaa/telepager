@@ -196,11 +196,11 @@ impl Screen {
         self.grid.plain_lines().join("\n")
     }
 
-    /// The last `lines` lines of `to_plain_text`.
+    /// The last `lines` lines of `to_plain_text`. Walks back from the end
+    /// rather than rendering all of scrollback to keep a handful of rows —
+    /// the master polls this while a worker runs.
     pub fn tail_text(&self, lines: usize) -> String {
-        let all = self.grid.plain_lines();
-        let start = all.len().saturating_sub(lines);
-        all[start..].join("\n")
+        self.grid.tail_lines(lines).join("\n")
     }
 
     /// Lines that scrolled off the top since the last call, so the line-based
@@ -541,6 +541,35 @@ impl Grid {
 
     /// Scrollback and screen as text, minus the empty tail a mostly-blank
     /// screen is full of.
+    /// The last `lines` non-trailing-blank rows, oldest first.
+    fn tail_lines(&self, lines: usize) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if lines == 0 {
+            return out;
+        }
+
+        let mut rows = self.scrollback.iter().chain(self.cells.iter()).rev();
+
+        // the trailing blanks `plain_lines` drops are the rows a mostly-empty
+        // screen ends with, so skip them before counting
+        for row in rows.by_ref() {
+            let text = row_text(row);
+            if !text.is_empty() {
+                out.push(text);
+                break;
+            }
+        }
+        while out.len() < lines {
+            match rows.next() {
+                Some(row) => out.push(row_text(row)),
+                None => break,
+            }
+        }
+
+        out.reverse();
+        out
+    }
+
     fn plain_lines(&self) -> Vec<String> {
         let mut out: Vec<String> =
             self.scrollback.iter().chain(self.cells.iter()).map(|r| row_text(r)).collect();
@@ -1332,6 +1361,22 @@ mod tests {
         s.feed(b"a\r\n\r\nb");
         assert_eq!(s.to_plain_text(), "a\n\nb");
         assert_eq!(s.tail_text(2), "\nb");
+    }
+
+    #[test]
+    fn the_tail_is_the_end_of_the_plain_text_however_much_is_asked_for() {
+        let mut s = screen();
+        s.feed(b"one\r\ntwo\r\nthree");
+        // the whole thing, the end of it, and none of it
+        assert_eq!(s.tail_text(99), s.to_plain_text());
+        assert_eq!(s.tail_text(2), "two\nthree");
+        assert_eq!(s.tail_text(0), "");
+
+        // and it still starts counting past the blank rows a short screen ends
+        // with, the way plain_lines does
+        let mut short = Screen::new(10, 6);
+        short.feed(b"a\r\nb");
+        assert_eq!(short.tail_text(1), "b");
     }
 
     #[test]
