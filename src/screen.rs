@@ -488,6 +488,12 @@ impl Grid {
         }
         self.wrap_next = false;
 
+        // a screen narrower than the glyph has nowhere to put it: wrapping
+        // would still leave the tail cell off the row
+        if width > self.cols {
+            return;
+        }
+
         // a double-width glyph never straddles the edge
         if self.cx + width > self.cols {
             if !self.autowrap {
@@ -1131,6 +1137,15 @@ mod tests {
         assert_eq!(cursor(&s).1, 5);
         assert_eq!(lines(&s)[0], "漢字x");
         assert!(s.grid.cells[0][1].tail);
+    }
+
+    #[test]
+    fn a_wide_character_on_a_one_column_screen_is_dropped_not_a_panic() {
+        // the console can ask for a single column, and an agent can print cjk
+        // into it — writing the tail cell used to index off the end of the row
+        let mut s = Screen::new(1, 4);
+        s.feed("漢a".as_bytes());
+        assert_eq!(lines(&s)[0], "a");
     }
 
     #[test]
