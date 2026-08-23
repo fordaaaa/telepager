@@ -172,8 +172,8 @@ impl Telegram {
         Ok(())
     }
 
-    /// `question_id` rides along in the callback data so a tap identifies the
-    /// question it answers, rather than relying on the message being unique.
+    /// `question_id` rides in the callback data so a tap identifies its
+    /// question, rather than relying on the message being unique.
     pub async fn send_with_buttons(
         &self,
         chat_id: i64,
@@ -236,10 +236,9 @@ fn is_unmodified(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("message is not modified")
 }
 
-/// Telegram gives one bot token one poller: a second `getUpdates` terminates
-/// the first, and the two then trade this error while messages land on
-/// whichever poll happened to be live. It never resolves by retrying, so it
-/// has to be said out loud rather than swallowed like a dropped connection.
+/// One bot token gets one poller: a second `getUpdates` terminates the first and
+/// the two then trade this error while messages land on whichever poll was live.
+/// Retrying never fixes it, so say it out loud rather than swallowing it.
 pub fn is_conflict(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("terminated by other getUpdates request")
 }

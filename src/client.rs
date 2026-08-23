@@ -89,9 +89,8 @@ impl Client {
     }
 }
 
-/// Make sure a daemon is up, starting one if it isn't, and hand back where it
-/// is. This is what turns `telepager` and `telepager webui` into one command:
-/// whichever you run first brings the app up, the rest just attach.
+/// Make sure a daemon is up, starting one if it isn't, and say where it is.
+/// Whichever command you run first brings the app up; the rest attach.
 pub fn ensure_daemon(config: Option<&PathBuf>) -> Result<ipc::Endpoint> {
     if let Some(ep) = running_endpoint() {
         return Ok(ep);

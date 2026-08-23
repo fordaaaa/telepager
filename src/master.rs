@@ -1,13 +1,10 @@
-//! The master agent: the thing you talk to.
+//! The master agent: the thing you talk to. Message it without addressing a
+//! session and it decides what to do — start a worker, say what the running
+//! ones are doing, kill a stuck one, answer a question.
 //!
-//! You message it without addressing any particular session, and it decides
-//! what to do — start a worker somewhere, tell you what the running ones are
-//! doing, kill one that's stuck, answer a question a worker is blocked on.
-//!
-//! It is a client of core like the UI is, with no privileges the UI doesn't
-//! have. Routing an answer back to the session that asked stays a hashmap
-//! lookup in core; putting a model in that path would only add latency and a
-//! new way to be wrong.
+//! It's a client of core like the UI is, with no extra privileges. Routing an
+//! answer back to the session that asked stays a hashmap lookup in core; a
+//! model in that path would only add latency and a new way to be wrong.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,13 +16,13 @@ use crate::core::{Answer, Core};
 use crate::llm::{Llm, Msg, ToolCall, ToolDef, Turn};
 use crate::session::EventKind;
 
-/// How many tool round trips one message may take before we stop and answer
-/// with what we have. Stops a confused model looping forever on your bill.
+/// Tool round trips one message may take before we answer with what we have.
+/// Stops a confused model looping forever on your bill.
 const MAX_STEPS: usize = 8;
 /// How much conversation to carry. Old turns are dropped from the front.
 const MAX_HISTORY: usize = 60;
-/// How long a shell command gets by default, and at the very most. You're
-/// waiting on it from a phone; anything longer wants to be a worker agent.
+/// How long a shell command gets, by default and at most. You're waiting from a
+/// phone; anything longer wants to be a worker agent.
 const DEFAULT_SHELL_SECONDS: u64 = 120;
 const MAX_SHELL_SECONDS: u64 = 900;
 
@@ -50,9 +47,8 @@ impl Origin {
         }
     }
 
-    /// Only an explicit "ui" is treated as local. Telegram is the gated
-    /// surface, so it's the safe thing to assume when the origin is missing
-    /// or malformed — the callers that are genuinely local always say so.
+    /// Only an explicit "ui" is local. Telegram is the gated surface, so it's
+    /// what to assume when the origin is missing or junk — local callers say so.
     pub fn parse(s: &str) -> Origin {
         match s {
             "ui" => Origin::Ui,
@@ -64,8 +60,8 @@ impl Origin {
 #[derive(Default)]
 pub struct Conversation {
     pub history: Vec<Msg>,
-    /// A CLI backend keeps the real conversation itself; this is the id we
-    /// resume it by. `history` is then only what the console draws.
+    /// A CLI backend keeps the real conversation; this is the id we resume by,
+    /// and `history` is then only what the console draws.
     pub cli_session: Option<String>,
 }
 
@@ -76,9 +72,9 @@ impl Conversation {
             let drop = self.history.len() - MAX_HISTORY;
             self.history.drain(..drop);
 
-            // a conversation has to start on a user turn: anthropic rejects
-            // anything else outright, and gemini's contents are turn-ordered.
-            // a tool result whose call got trimmed is just as broken.
+            // a conversation must start on a user turn — anthropic rejects
+            // anything else and gemini's contents are turn-ordered. a tool
+            // result whose call got trimmed is just as broken.
             while !matches!(self.history.first(), None | Some(Msg::User(_))) {
                 self.history.remove(0);
             }
@@ -334,8 +330,8 @@ pub async fn reply(core: &Arc<Core>, text: &str, origin: Origin) -> Result<Strin
     Ok(final_text)
 }
 
-/// Run one tool call and describe the outcome in a line or two of plain text,
-/// which is what models act on most reliably.
+/// Run one tool call and describe what happened in a line or two of plain text
+/// — that's what models act on most reliably.
 pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) -> String {
     let args = &call.args;
     match call.name.as_str() {
@@ -448,12 +444,9 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
     }
 }
 
-/// Run a shell command, subject to every rule that guards one.
-///
-/// The one place those rules live: the `run_shell` tool and Telegram's `/sh`
-/// both come through here, so neither can be the lenient one.
-///
-/// `dir` empty or absent means the working directory `/cd` set.
+/// Run a shell command, subject to every rule that guards one. The `run_shell`
+/// tool and telegram's `/sh` both come through here, so neither can be the
+/// lenient one. Empty `dir` means whatever `/cd` set.
 pub async fn shell(
     core: &Arc<Core>,
     command: &str,
@@ -489,9 +482,8 @@ pub async fn shell(
         },
     };
 
-    // telegram is remote, so it only reaches allowlisted dirs. the console
-    // isn't gated — opening it means being at the machine. same rule spawning
-    // has always used.
+    // telegram is remote, so allowlisted dirs only. the console isn't gated —
+    // opening it means being at the machine. same rule spawning uses.
     if origin.is_telegram() && !crate::agents::dir_is_allowed(&path, &cfg.allowed_dirs) {
         if cfg.allowed_dirs.is_empty() {
             return format!(
@@ -519,12 +511,10 @@ pub async fn shell(
     }
 }
 
-/// Does this command look like it could destroy something?
-///
-/// A heuristic, and deliberately a jumpy one: a needless confirmation costs a
-/// tap, a missed one costs a directory. It is not a security boundary and
-/// can't be — `x=rm; $x -rf .` walks straight past it, and so does anything
-/// piped through base64. allowed_dirs is the boundary; this is a seatbelt.
+/// Does this command look like it could destroy something? Deliberately jumpy:
+/// a needless confirmation costs a tap, a missed one costs a directory. Not a
+/// security boundary and can't be — `x=rm; $x -rf .` walks straight past it.
+/// allowed_dirs is the boundary; this is a seatbelt.
 pub(crate) fn looks_destructive(command: &str) -> bool {
     let lowered = command.to_lowercase();
     if SQL_DAMAGE.iter().any(|p| lowered.contains(p)) {
@@ -608,11 +598,9 @@ fn stage_is_destructive(words: &[String]) -> bool {
     }
 }
 
-/// A `>` or `>>` pointed at something that isn't /dev/…
-///
-/// `2>&1` and `>/dev/null` are how every second command line is written, so
-/// they don't count. A `>` inside a quoted string does, which is a false
-/// positive we can live with.
+/// A `>` or `>>` pointed at something that isn't /dev/… `2>&1` and `>/dev/null`
+/// are too common to count. A `>` inside a quoted string does count, which is a
+/// false positive we can live with.
 fn writes_to_a_file(stage: &str) -> bool {
     let chars: Vec<char> = stage.chars().collect();
     let mut i = 0;
@@ -640,11 +628,9 @@ fn writes_to_a_file(stage: &str) -> bool {
     false
 }
 
-/// Split a command line into pipelines, each a list of stages.
-///
-/// Just enough shell to see the shape: `;` `&&` `||` `&` and newlines end a
-/// pipeline, `|` ends a stage. Nothing here understands quoting, and it
-/// doesn't need to — the answer is only ever "ask them first".
+/// Split a command line into pipelines, each a list of stages. Just enough
+/// shell to see the shape: `;` `&&` `||` `&` and newlines end a pipeline, `|`
+/// ends a stage. No quoting handling — the answer is only ever "ask first".
 fn pipelines(command: &str) -> Vec<Vec<String>> {
     let mut all = Vec::new();
     let mut pipeline: Vec<String> = Vec::new();

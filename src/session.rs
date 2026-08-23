@@ -1,9 +1,7 @@
-//! Sessions and the event stream.
-//!
-//! A session is one thing telepager is keeping track of: an MCP client that
-//! connected over the local socket (`Attached`), or an agent process telepager
-//! started itself (`Spawned`). Both kinds carry the same record and the same
-//! event log, so the web UI and Telegram render one list rather than two.
+//! Sessions and the event stream. A session is one thing we're tracking: an MCP
+//! client on the local socket (`Attached`), or an agent process we started
+//! (`Spawned`). Same record and event log either way, so the web UI and telegram
+//! render one list rather than two.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -16,8 +14,8 @@ use tokio::sync::broadcast;
 
 use crate::screen;
 
-/// How many output lines a session keeps. Enough to scroll back through a
-/// build, small enough that a runaway agent can't eat the machine's memory.
+/// Output lines a session keeps — enough to scroll back through a build, few
+/// enough that a runaway agent can't eat the machine.
 const MAX_EVENTS_PER_SESSION: usize = 2000;
 
 pub type SessionId = String;
@@ -76,8 +74,8 @@ pub enum EventKind {
     /// A turn of the master agent conversation. `role` is user, master or tool.
     Chat { role: String, text: String },
     Notice { text: String },
-    /// A pty session's screen moved on. Deliberately just the revision: the
-    /// console fetches the diff, so no screen dump goes through the bus.
+    /// A pty session's screen moved on. Just the revision — the console fetches
+    /// the diff, so no screen dump goes through the bus.
     Screen { revision: u64 },
 }
 
@@ -115,8 +113,8 @@ pub struct Session {
 }
 
 impl Session {
-    /// The session list the UI and the master agent both read, without the
-    /// event log — that's fetched per session.
+    /// The session list the UI and master both read, minus the event log —
+    /// that's fetched per session.
     pub fn summary(&self) -> Value {
         json!({
             "id": self.id,
@@ -157,8 +155,8 @@ impl Session {
         out
     }
 
-    /// The tail of this session's output, for the UI terminal pane and for the
-    /// master agent when it wants to know what an agent actually said.
+    /// The tail of this session's output, for the terminal pane and for the
+    /// master when it wants to know what an agent said.
     pub fn output_tail(&self, lines: usize) -> String {
         // a pty session's real output is the screen, not the line log
         if let Some(screen) = &self.screen {
@@ -191,10 +189,9 @@ fn ellipsis(s: &str, limit: usize) -> String {
     s.chars().take(limit).collect::<String>() + "…"
 }
 
-/// The session registry and the event bus in front of it.
-///
-/// Every mutation records an event, so anything watching the stream sees the
-/// same history a late joiner would rebuild from `snapshot`.
+/// The session registry and the event bus in front of it. Every mutation
+/// records an event, so a watcher sees the same history a late joiner rebuilds
+/// from `snapshot`.
 pub struct Registry {
     sessions: BTreeMap<SessionId, Session>,
     /// Ordering key, and what an SSE client sends back as Last-Event-ID.

@@ -14,9 +14,9 @@ enum Startup {
     RunHere,
 }
 
-/// `telepager` and `telepager webui`: be the app, here, until this terminal
-/// closes. Unconfigured is fine — the console serves the setup wizard.
-/// `telepager start` is the one that outlives your shell.
+/// `telepager` and `telepager webui`: be the app until this terminal closes.
+/// Unconfigured is fine, the console serves the wizard. `telepager start` is the
+/// one that outlives your shell.
 pub fn open_console(config: Option<PathBuf>, open: bool) -> Result<()> {
     match startup_for(client::running_endpoint())? {
         // something already brought it up, and a second daemon would split the
@@ -47,8 +47,8 @@ pub fn start_background(config: Option<PathBuf>, open: bool) -> Result<()> {
     Ok(())
 }
 
-/// A daemon that already answers is something to attach to, not an error —
-/// that belongs to `telepager daemon`, which is asked to *be* the daemon.
+/// A daemon that already answers is something to attach to, not an error — only
+/// `telepager daemon`, asked to *be* the daemon, treats it as one.
 fn startup_for(existing: Option<ipc::Endpoint>) -> Result<Startup> {
     match existing {
         Some(ep) => Ok(Startup::Attach(console_url(&ep)?)),
@@ -99,8 +99,8 @@ fn run_in_foreground(config: Option<PathBuf>, open: bool) -> Result<()> {
     })
 }
 
-/// Wait for the endpoint file to name *this* process — anyone else's would
-/// mean attaching to them, and we only get here when nobody answered.
+/// Wait for the endpoint file to name *this* process; anyone else's would mean
+/// attaching to them, and nobody answered on the way here.
 async fn published_endpoint() -> Result<ipc::Endpoint> {
     for _ in 0..300 {
         if let Some(ep) = ipc::read_endpoint() {
@@ -180,9 +180,9 @@ fn terminate(pid: u32) -> Result<()> {
         fn kill(pid: i32, sig: i32) -> i32;
     }
     const SIGTERM: i32 = 15;
-    // just the daemon. agents run in process groups of their own on purpose,
-    // so they are not reachable from here and never were — signalling the
-    // daemon's group would only have hit whatever shell started it.
+    // just the daemon. agents are in process groups of their own on purpose, so
+    // they aren't reachable from here — signalling the daemon's group would only
+    // hit whatever shell started it.
     let failed = unsafe { kill(pid as i32, SIGTERM) } != 0;
     if failed {
         anyhow::bail!("could not stop process {pid}");

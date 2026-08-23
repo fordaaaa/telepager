@@ -1,16 +1,13 @@
-//! Spawning worker agents.
+//! Spawning worker agents — some coding CLI (`claude`, `codex`, whatever you
+//! configured) started in a directory with a task. We own its pipes: stdout and
+//! stderr become session events, stdin stays open for follow-ups.
 //!
-//! A worker agent is just some coding CLI — `claude`, `codex`, `gemini`,
-//! `opencode`, whatever you configured — started in a directory with a task.
-//! telepager owns its pipes: stdout and stderr become session events, stdin
-//! stays open so a follow-up can be typed at it, and the child can be killed.
+//! A `pty` preset gets a real terminal instead, because a tui agent draws
+//! nothing down a pipe; core turns those bytes into a screen. The trade is that
+//! we hold the terminal, so those agents end when we do.
 //!
-//! A `pty` preset gets a real terminal instead — a tui agent draws nothing at
-//! all down a pipe. core turns that byte stream into a screen. The trade is
-//! that telepager holds the terminal, so those agents end when it does.
-//!
-//! This file deliberately knows nothing about the registry or Telegram. It
-//! resolves and launches processes; core wires the output up.
+//! Knows nothing about the registry or telegram on purpose: it launches
+//! processes, core wires the output up.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -41,8 +38,8 @@ pub enum Io {
         stderr: Option<ChildStderr>,
         stdin: Option<ChildStdin>,
     },
-    /// One bidirectional stream, plus the master for resizes. Both ends
-    /// block, so core keeps them off the runtime threads.
+    /// One bidirectional stream, plus the master for resizes. Both ends block,
+    /// so core keeps them off the runtime threads.
     Pty {
         master: Box<dyn MasterPty + Send>,
         reader: Box<dyn Read + Send>,
@@ -87,8 +84,8 @@ impl Handle {
         }
     }
 
-    /// Polled, not blocked on: one implementation covers both kinds, and
-    /// nothing sits on a lock the killer needs.
+    /// Polled rather than blocked on, so nothing sits on a lock the killer
+    /// needs.
     pub async fn wait(&mut self) -> std::io::Result<Exit> {
         loop {
             if let Some(exit) = self.try_wait()? {
@@ -106,12 +103,9 @@ impl Handle {
     }
 }
 
-/// Substitute the placeholders a preset may use in its arguments.
-///
-/// An argument that is exactly `{task}` is replaced as a whole argument, so a
-/// task containing spaces or quotes stays one argument and never touches a
-/// shell. A placeholder embedded in a larger argument is substituted in place,
-/// which is what makes things like `--message={task}` work.
+/// Substitute a preset's placeholders. An argument that is exactly `{task}` is
+/// swapped whole, so spaces and quotes in the task stay one argument and never
+/// meet a shell; embedded ones like `--message={task}` are substituted in place.
 pub fn render_args(args: &[String], task: &str, dir: &Path) -> Vec<String> {
     let dir_text = dir.display().to_string();
     args.iter()
@@ -123,10 +117,8 @@ pub fn render_args(args: &[String], task: &str, dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Find an executable on PATH, the way a shell would.
-///
-/// Used to show only the agents you actually have installed, and to give a
-/// clear error instead of a bare `No such file or directory` from the OS.
+/// Find an executable on PATH, the way a shell would — so the picker shows only
+/// what's installed, and a missing one gets a clear error.
 pub fn which(command: &str) -> Option<PathBuf> {
     // an explicit path is used as given
     if command.contains('/') || command.contains('\\') {
@@ -148,15 +140,11 @@ pub fn which(command: &str) -> Option<PathBuf> {
     None
 }
 
-/// The suffixes to try after a bare command name, in order.
+/// Suffixes to try after a bare command name. Always starts with the empty
+/// string so the name is tried as given — `claude.cmd` already has its
+/// extension and would never be found if we only appended.
 ///
-/// Always starts with the empty string so the name is tried exactly as given:
-/// a command configured as `claude.cmd` already carries its extension and
-/// would never be found if we only ever appended one.
-///
-/// Takes its inputs as arguments rather than reading the environment, so the
-/// Windows branch is testable from any platform and no test has to mutate
-/// global state to reach it.
+/// Takes its inputs as arguments so the windows branch is testable anywhere.
 fn candidate_extensions(windows: bool, pathext: Option<String>) -> Vec<String> {
     let mut all = vec![String::new()];
     if windows {
@@ -189,8 +177,8 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// The agent picker the UI draws: every configured preset, with whether its
-/// command is actually installed on this machine.
+/// The agent picker the UI draws: every preset, plus whether its command is
+/// actually installed here.
 pub fn catalog(agents: &BTreeMap<String, AgentPreset>) -> Vec<Value> {
     let mut out: Vec<Value> = agents
         .iter()
@@ -217,8 +205,8 @@ pub fn catalog(agents: &BTreeMap<String, AgentPreset>) -> Vec<Value> {
     out
 }
 
-/// Expand a leading `~` and make the path absolute, so a directory typed on a
-/// phone resolves the same way it would in a shell.
+/// Expand `~` and make the path absolute, so a directory typed on a phone
+/// resolves like it would in a shell.
 pub fn resolve_dir(input: &str) -> Result<PathBuf> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -250,16 +238,12 @@ pub fn resolve_dir(input: &str) -> Result<PathBuf> {
     Ok(absolute.canonicalize().unwrap_or(absolute))
 }
 
-/// Whether `dir` is inside one of the allowed roots.
+/// Whether `dir` is inside one of the allowed roots. Gates spawning from
+/// telegram only — reaching the local web UI already means being at the machine.
 ///
-/// This gates spawning from Telegram only. The local web UI isn't restricted:
-/// reaching it already means being at the machine with the config file.
-///
-/// Both sides are canonicalized before they're compared. Resolving only the
-/// root would compare paths that went through different amounts of symlink
-/// resolution — on macOS an allowed `/var/…` root becomes `/private/var/…`
-/// while the dir stays `/var/…`, and on Windows canonicalizing adds a `\\?\`
-/// prefix to one side only. Either way an allowed directory reads as denied.
+/// Both sides are canonicalized: resolving only the root compares paths that
+/// went through different amounts of symlink resolution (macos `/var` →
+/// `/private/var`, windows `\\?\` prefixes) and an allowed dir reads as denied.
 pub fn dir_is_allowed(dir: &Path, allowed: &[PathBuf]) -> bool {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     allowed.iter().any(|root| {
@@ -292,11 +276,10 @@ pub fn launch(preset: &AgentPreset, dir: &Path, task: &str) -> Result<Launched> 
     Ok(Launched { child, io, rendered })
 }
 
-/// The pty path, for agents that draw a terminal ui.
-///
-/// portable-pty puts the child in a session of its own with the pty as its
-/// controlling terminal, so a group-wide signal from the agent can't reach the
-/// daemon — what `own_process_group` buys the pipe path, only stronger.
+/// The pty path, for agents that draw a terminal ui. portable-pty gives the
+/// child its own session with the pty as controlling terminal, so a group-wide
+/// signal from the agent can't reach the daemon — same protection
+/// `own_process_group` buys the pipe path, only stronger.
 fn launch_on_pty(
     preset: &AgentPreset,
     program: &Path,
@@ -355,13 +338,10 @@ fn launch_on_pipes(
         .env("NO_COLOR", "1")
         .env("TERM", "dumb");
 
-    // deliberately *not* kill_on_drop. an agent is a long-lived job that
-    // outlives whatever turn started it, and kill_on_drop hands its life to
-    // whoever happens to hold the `Child`: drop the process table, drop the
-    // task that owns it, or let the runtime unwind on the way out of an
-    // unrelated error, and every running agent is SIGKILLed with no session
-    // event and nothing to tell the user why their work stopped. telepager
-    // ends agents in exactly one place — `kill_tree`, from `kill_agent`.
+    // deliberately *not* kill_on_drop: that hands an agent's life to whoever
+    // holds the `Child`, so dropping the process table — or unwinding out of an
+    // unrelated error — SIGKILLs every running agent with nothing to tell the
+    // user why. agents end in one place, `kill_tree` from `kill_agent`.
     for (key, value) in &preset.env {
         cmd.env(key, value);
     }
@@ -380,14 +360,10 @@ fn launch_on_pipes(
     Ok((Handle::Piped(child), io))
 }
 
-/// Put a child in a process group of its own.
-///
-/// Two things depend on this. Killing the child then takes its whole tree with
-/// it — agents shell out constantly — rather than leaving a build running with
-/// nothing reading its output. And, just as important, it means a group-wide
-/// signal the child sends (or that its own supervisor sends on its behalf)
-/// stops at the child instead of travelling up into telepager's group, where
-/// it would hit the daemon and every other agent it is running.
+/// Put a child in a process group of its own. Two things need it: killing the
+/// child takes its whole tree (agents shell out constantly), and a group-wide
+/// signal the child sends stops there instead of travelling up into our group
+/// and hitting the daemon and every other agent.
 pub fn own_process_group(cmd: &mut tokio::process::Command) {
     #[cfg(unix)]
     unsafe {
@@ -410,10 +386,8 @@ fn setpgid_to_self() {
     }
 }
 
-/// SIGTERM a whole process group, given the pid of the process leading it.
-///
-/// Nothing here waits: the caller either has the `Child` and can wait on it,
-/// or has already lost it and only wants the strays gone.
+/// SIGTERM a whole process group, given its leader's pid. Doesn't wait — the
+/// caller either has the `Child` or just wants the strays gone.
 pub fn signal_process_group(pid: u32) {
     #[cfg(unix)]
     {
@@ -430,10 +404,8 @@ pub fn signal_process_group(pid: u32) {
     let _ = pid;
 }
 
-/// Kill a whole process group on unix, or just the child elsewhere.
-///
-/// Agents shell out constantly, so signalling only the parent tends to leave
-/// a build running with nothing reading its output.
+/// Kill a whole process group on unix, or just the child elsewhere. Agents
+/// shell out constantly, so signalling only the parent leaves builds running.
 pub async fn kill_tree(child: &mut Handle) -> Result<()> {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
@@ -566,8 +538,8 @@ mod tests {
     }
 
     // the case that broke ci: macos hands out a `/var/…` temp dir that is really
-    // `/private/var/…`, so a dir and a root that agree can still disagree once
-    // one of them is resolved. a symlinked root reproduces it anywhere.
+    // `/private/var/…`, so a dir and root that agree disagree once one is
+    // resolved. a symlinked root reproduces it anywhere.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_root_still_covers_what_is_under_it() {
@@ -690,9 +662,9 @@ mod tests {
         kill_tree(&mut launched.child).await.unwrap();
     }
 
-    /// A preset whose agent keeps writing to `marker` for a good while, so a
-    /// test can tell "still running" from "was killed and became a zombie" —
-    /// which `kill(pid, 0)` cannot, since a reaped-later corpse still answers.
+    /// A preset whose agent keeps writing to `marker`, so a test can tell
+    /// "still running" from "killed" — `kill(pid, 0)` can't, an unreaped corpse
+    /// still answers.
     #[cfg(unix)]
     fn ticker(marker: &Path) -> AgentPreset {
         AgentPreset {
@@ -710,11 +682,9 @@ mod tests {
         std::fs::read_to_string(marker).map(|t| t.lines().count()).unwrap_or(0)
     }
 
-    // regression: launch() armed kill_on_drop(true), so an agent's life was
-    // owned by whoever happened to hold its `Child`. dropping the process
-    // table — or unwinding out of an unrelated error on the way to the
-    // runtime being dropped — SIGKILLed every running agent, with no session
-    // event and nothing to tell the user why their work stopped.
+    // regression: launch() armed kill_on_drop(true), so dropping the process
+    // table — or unwinding out of an unrelated error — SIGKILLed every running
+    // agent, with nothing to tell the user why.
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_the_handle_does_not_kill_a_running_agent() {

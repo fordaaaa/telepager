@@ -76,10 +76,9 @@ pub fn clear_endpoint() {
     let _ = std::fs::remove_file(state_path());
 }
 
-/// Clear the endpoint file only when it still describes this process. A daemon
-/// that failed to start must not delete the address of the one that is running
-/// — every mcp shim and the master agent's bridge resolve the daemon through
-/// this file, and without it they can't reach anything.
+/// Clear the endpoint file only if it still describes this process. A daemon
+/// that failed to start must not delete the running one's address — every mcp
+/// shim and the master's bridge resolve the daemon through this file.
 pub fn clear_endpoint_if_ours() {
     if read_endpoint().map(|e| e.pid) == Some(std::process::id()) {
         clear_endpoint();
@@ -97,8 +96,8 @@ pub fn session_label() -> String {
 pub fn new_token() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
-    // two rounds of the os-seeded hasher, plenty for a value that only lives
-    // in a 0600 file on the same machine
+    // two rounds of the os-seeded hasher, plenty for a value that lives in a
+    // 0600 file on this machine
     let a = RandomState::new().build_hasher().finish();
     let b = RandomState::new().build_hasher().finish();
     format!("{a:016x}{b:016x}")

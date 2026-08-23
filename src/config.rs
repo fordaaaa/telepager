@@ -18,11 +18,8 @@ struct RawConfig {
     permissions: Option<Permissions>,
 }
 
-/// What telepager is allowed to do beyond starting worker agents.
-///
-/// Everything a person has to grant lives here, and everything but the
-/// confirmation prompt is off until they do. An install that upgrades into
-/// this gains nothing until someone ticks a box.
+/// What telepager may do beyond starting worker agents. Everything but the
+/// confirmation prompt is off until someone ticks a box, upgrades included.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Permissions {
@@ -40,16 +37,13 @@ impl Default for Permissions {
     }
 }
 
-/// Which backend the master agent runs on.
+/// Which backend the master agent runs on. Most are HTTP APIs whose wire
+/// formats differ enough to name, though everything openai-shaped (openrouter,
+/// groq, together, lm studio, vllm, ollama's /v1) is one variant with a
+/// base_url.
 ///
-/// Most are HTTP APIs, where the wire formats differ enough to be worth naming
-/// — though everything OpenAI-shaped (openrouter, groq, together, lm studio,
-/// vllm, ollama's /v1) is one variant with a base_url.
-///
-/// The last two are different in kind: they drive a coding CLI that is already
-/// logged in, so they need no API key at all. `claude-code` uses your Claude
-/// Code subscription, `opencode` whatever opencode is configured with —
-/// including its free models.
+/// The last two are different in kind: they drive an already logged-in coding
+/// CLI, so they need no api key at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Provider {
@@ -78,9 +72,8 @@ impl Provider {
         }
     }
 
-    /// Every other env var worth checking before giving up on a key. Lets
-    /// someone with only OPENROUTER_API_KEY set get a working master agent
-    /// without writing any config at all.
+    /// Other env vars worth checking before giving up on a key, so someone with
+    /// just OPENROUTER_API_KEY set gets a working master with no config.
     pub fn fallback_key_envs(self) -> &'static [&'static str] {
         match self {
             Provider::Anthropic => &["CLAUDE_API_KEY"],
@@ -125,8 +118,8 @@ impl Provider {
         }
     }
 
-    /// Ollama runs on your machine and the CLI backends carry their own login,
-    /// so a missing key is normal for all three.
+    /// Ollama is local and the CLI backends carry their own login, so a missing
+    /// key is normal for those.
     pub fn needs_key(self) -> bool {
         !matches!(self, Provider::Ollama | Provider::ClaudeCode | Provider::Opencode)
     }
@@ -176,11 +169,11 @@ pub struct MasterConfig {
     /// Read the key from this env var instead of the provider default.
     pub api_key_env: Option<String>,
     pub base_url: Option<String>,
-    /// Appended to the built-in system prompt rather than replacing it, so
-    /// personal instructions can't accidentally delete the tool contract.
+    /// Appended to the built-in system prompt, not replacing it, so personal
+    /// instructions can't delete the tool contract.
     pub system: Option<String>,
     pub max_tokens: u32,
-    /// Override the binary a CLI backend runs, if it isn't on PATH under the
+    /// Override the binary a CLI backend runs, if it's not on PATH under the
     /// usual name.
     pub command: Option<String>,
     /// Extra arguments appended to a CLI backend's command line.
@@ -260,10 +253,9 @@ impl MasterConfig {
     }
 }
 
-/// A worker agent: some coding CLI we can spawn in a directory with a task.
-/// `{task}` in an arg is replaced with the task text; an arg that is exactly
-/// `{task}` and nothing else is replaced as a whole argument, so tasks with
-/// spaces and quotes survive without a shell.
+/// A worker agent: some coding CLI we spawn in a directory with a task.
+/// `{task}` in an arg is substituted; an arg that is exactly `{task}` is swapped
+/// whole, so tasks with spaces and quotes survive without a shell.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentPreset {
@@ -276,16 +268,14 @@ pub struct AgentPreset {
     /// Whether this agent keeps reading stdin after it starts, which decides
     /// if "send a follow-up" is offered for its sessions.
     pub interactive: bool,
-    /// Run it on a real terminal, so the console can draw its screen instead of
-    /// a line log. Off by default, and the reason is worth knowing: telepager
-    /// holds the terminal, so a pty agent dies when telepager does. A piped one
-    /// keeps going. Turn it on for a tui agent you want to watch.
+    /// Run it on a real terminal, so the console draws its screen instead of a
+    /// line log. Off by default because we hold the terminal: a pty agent dies
+    /// when telepager does, a piped one keeps going.
     pub pty: bool,
 }
 
-/// The coding CLIs telepager knows how to drive out of the box. Anything on
-/// PATH shows up in the UI with no configuration; anything else can be added
-/// under `agents` in the config file.
+/// The coding CLIs we know out of the box. Anything on PATH shows up in the UI
+/// with no configuration; add the rest under `agents` in the config.
 pub fn builtin_agents() -> BTreeMap<String, AgentPreset> {
     let mut m = BTreeMap::new();
     // `watch` picks the pair that go together: a real terminal to draw on, and
@@ -346,18 +336,16 @@ pub struct Config {
     pub ask_timeout_seconds: u64,
     pub master: MasterConfig,
     pub agents: BTreeMap<String, AgentPreset>,
-    /// Directories Telegram is allowed to spawn agents in. Empty means
-    /// Telegram cannot spawn anything; the local web UI is not restricted,
-    /// since reaching it already means being at the machine.
+    /// Directories telegram may spawn agents in; empty means it can't spawn at
+    /// all. The local web UI isn't restricted — reaching it means being here.
     pub allowed_dirs: Vec<PathBuf>,
     pub ui_port: u16,
     pub permissions: Permissions,
 }
 
 impl Config {
-    /// Every chat we page, primary one first. `chat_id` stays the default so
-    /// old config files keep working; the rest of the allowlist gets the same
-    /// messages, which is the point of allowing them.
+    /// Every chat we page, primary first. `chat_id` stays the default so old
+    /// config files keep working; the rest get the same messages.
     pub fn chat_ids(&self) -> Vec<i64> {
         let mut ids = vec![self.chat_id];
         for id in &self.allowed_user_ids {
@@ -370,8 +358,8 @@ impl Config {
 }
 
 // %APPDATA%\telepager on windows, ~/Library/Application Support on mac,
-// $XDG_CONFIG_HOME or ~/.config on linux. ~/.config stays as a fallback
-// everywhere unix since that's what the readme has always said.
+// $XDG_CONFIG_HOME or ~/.config on linux. ~/.config stays a fallback across
+// unix because that's what the readme has always said.
 fn config_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
 
@@ -427,8 +415,8 @@ pub fn target_path(explicit: Option<&Path>) -> PathBuf {
     })
 }
 
-/// Read the config file as raw JSON, so a caller can edit one key and write
-/// the rest back untouched.
+/// The config file as raw JSON, so a caller can edit one key and write the rest
+/// back untouched.
 fn read_doc(path: &Path) -> Result<serde_json::Value> {
     match std::fs::read_to_string(path) {
         Ok(text) if text.trim().is_empty() => Ok(serde_json::json!({})),
@@ -582,9 +570,8 @@ pub fn load(explicit: Option<&Path>) -> Result<Config> {
     })
 }
 
-/// Like `load`, but a missing or half-finished config is `None` rather than an
-/// error. The app has to be able to start unconfigured — that's the whole
-/// point of the setup page being served by the running app.
+/// Like `load`, but a missing or half-finished config is `None`, not an error.
+/// The app has to start unconfigured — that's how it can serve its setup page.
 pub fn load_optional(explicit: Option<&Path>) -> Option<Config> {
     load(explicit).ok()
 }

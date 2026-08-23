@@ -1,9 +1,7 @@
-//! The background process everything else talks to.
-//!
-//! It runs three things over one [`Core`]: the local socket MCP shims connect
-//! to, the Telegram poller, and the web console. Any of them can be the only
-//! one in use — the app starts even with no Telegram token, because serving
-//! its own setup page is how it gets one.
+//! The background process everything else talks to: the local socket for MCP
+//! shims, the telegram poller and the web console, all over one [`Core`]. Any
+//! one of them can be the only one in use — with no token we still come up, so
+//! the setup page can hand us one.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,12 +20,10 @@ use crate::telegram::{IncomingMessage, Telegram};
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn run(config: Option<std::path::PathBuf>, open_browser: bool) -> Result<()> {
-    // one daemon per machine, or telegram breaks in a way nothing reports:
-    // both poll getUpdates with the same bot token, telegram terminates one
-    // poll for the other, and each message lands on whichever daemon happened
-    // to have the live request. the newer daemon also overwrites the endpoint
-    // file, so `telepager master-mcp` — how a cli-backed master agent reaches
-    // its tools — resolves to the daemon that didn't get the message.
+    // one daemon per machine, or telegram breaks silently: two getUpdates polls
+    // on one bot token means each message lands on whichever daemon had the live
+    // request, and the newer one overwrites the endpoint file so `master-mcp`
+    // resolves to the daemon that didn't get it.
     refuse_if_already_running(crate::client::running_endpoint())?;
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -37,8 +33,8 @@ pub fn run(config: Option<std::path::PathBuf>, open_browser: bool) -> Result<()>
     })
 }
 
-/// An endpoint that still answers and isn't ours means another daemon owns
-/// this machine's bot token and endpoint file, so we must not start.
+/// An endpoint that answers and isn't ours means another daemon already owns
+/// this machine's bot token and endpoint file.
 fn refuse_if_already_running(existing: Option<Endpoint>) -> Result<()> {
     let Some(ep) = existing else { return Ok(()) };
     // a daemon re-reading its own endpoint is not a second daemon
@@ -78,10 +74,9 @@ pub async fn serve_all(core: Arc<Core>, open_browser: bool) -> Result<()> {
 
     loop {
         // one bad accept is not a reason to end the app. a peer that hung up
-        // between connecting and being accepted, or a moment with no file
-        // descriptors left, used to take the daemon down through this `?` —
-        // and with it the telegram poller, the console and every session it
-        // was holding, right in the middle of somebody's work.
+        // before being accepted, or a moment with no fds, used to take the
+        // daemon down through this `?` — poller, console and live sessions
+        // with it.
         let (stream, _) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
@@ -101,15 +96,13 @@ pub async fn serve_all(core: Arc<Core>, open_browser: bool) -> Result<()> {
     }
 }
 
-/// Poll Telegram for as long as there's a token, restarting when the config
-/// changes underneath us — which is what makes the setup page take effect
-/// without anyone restarting anything.
+/// Poll telegram for as long as there's a token, restarting when the config
+/// changes under us — that's what makes the setup page take effect live.
 async fn telegram_loop(core: Arc<Core>) {
     loop {
-        // register for the next config change *before* looking at the current
-        // config. notify_waiters wakes only already-registered waiters and
-        // stores no permit, so checking first would let a token saved in the
-        // gap go unnoticed and leave this loop asleep forever.
+        // register for the next change *before* reading the config:
+        // notify_waiters wakes only already-registered waiters and stores no
+        // permit, so a token saved in the gap would leave us asleep forever.
         let changed = core.config_changed.notified();
         tokio::pin!(changed);
 
@@ -153,9 +146,9 @@ async fn poll_updates(core: Arc<Core>, tg: Arc<Telegram>) {
             offset = update.update_id + 1;
 
             if let Some(msg) = update.message {
-                // handled off the poll loop: a message that blocks — a shell
-                // command, a master turn, anything that asks a question — must
-                // not stop us reading the tap that answers it
+                // off the poll loop: a message that blocks — shell command,
+                // master turn, anything that asks — must not stop us reading
+                // the tap that answers it
                 tokio::spawn(handle_message(core.clone(), msg));
                 continue;
             }
@@ -223,9 +216,9 @@ async fn route_message(core: &Arc<Core>, msg: &IncomingMessage, text: &str) -> R
         }
     }
 
-    // a bare message answers the one waiting question only when it plainly is
-    // an answer. everything used to be swallowed here, so anything said to the
-    // master while an unrelated worker was blocked never reached it.
+    // a bare message answers the waiting question only when it plainly is an
+    // answer. this used to swallow everything, so anything said to the master
+    // while an unrelated worker was blocked never reached it.
     if let Some((qid, options)) = core.only_pending_question().await {
         if let Some(answer) = as_answer(text, &options) {
             return Routing::Answer(qid, answer);
@@ -235,8 +228,8 @@ async fn route_message(core: &Arc<Core>, msg: &IncomingMessage, text: &str) -> R
     Routing::Master
 }
 
-/// A typed message read as an answer: one of the options, or the number
-/// Telegram put on its button. Anything else isn't an answer.
+/// A typed message read as an answer: one of the options, or the number on its
+/// button. Anything else isn't one.
 fn as_answer(text: &str, options: &[String]) -> Option<Answer> {
     let text = text.trim().to_lowercase();
     if let Some(i) = options.iter().position(|o| o.trim().to_lowercase() == text) {
@@ -370,8 +363,8 @@ async fn answer_command(core: &Arc<Core>, rest: &str) -> String {
     }
 }
 
-/// `/cd <dir>` — where later `/sh` commands run. Telegram is remote, so the
-/// directory has to be one you allowed.
+/// `/cd <dir>` — where later `/sh` runs. Telegram is remote, so it has to be an
+/// allowed directory.
 async fn cd_command(core: &Arc<Core>, rest: &str) -> String {
     if rest.is_empty() {
         return match core.work_dir().await {
@@ -531,7 +524,7 @@ async fn allowed(core: &Arc<Core>, user_id: i64) -> bool {
         .unwrap_or(false)
 }
 
-/// One MCP shim's connection, for as long as its client is alive.
+/// One MCP shim's connection, for as long as its client lives.
 async fn serve_client(core: Arc<Core>, stream: TcpStream, token: String) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
@@ -554,9 +547,8 @@ async fn serve_client(core: Arc<Core>, stream: TcpStream, token: String) -> Resu
         .await;
     log::info!("session connected: {label} ({session})");
 
-    // whatever happens from here — a clean goodbye, a killed client, a write
-    // that fails mid-reply — the session has to be marked finished, or it
-    // stays live forever and prune() will never collect it
+    // however this ends — goodbye, killed client, a write that fails mid-reply
+    // — the session must be marked finished or prune() never collects it
     let result = serve_requests(&core, &session, &mut lines, &mut write).await;
 
     log::info!("session gone: {label} ({session})");
@@ -564,8 +556,8 @@ async fn serve_client(core: Arc<Core>, stream: TcpStream, token: String) -> Resu
     result
 }
 
-/// The request loop, split out so its caller can close the session on every
-/// exit path including the error ones.
+/// Split out so the caller can close the session on every exit path, errors
+/// included.
 async fn serve_requests(
     core: &Arc<Core>,
     session: &str,
@@ -640,9 +632,8 @@ mod tests {
 
     #[test]
     fn a_second_daemon_refuses_to_start_while_another_one_answers() {
-        // this is what split a bot token in two: both daemons polled, telegram
-        // handed each message to one of them, and the newer one's endpoint file
-        // sent the master agent's mcp bridge to the wrong daemon
+        // this is what split a bot token in two: both daemons polled, and the
+        // newer one's endpoint file sent the mcp bridge to the wrong daemon
         let err = refuse_if_already_running(Some(endpoint(4756))).unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("already running"), "{text}");
@@ -789,8 +780,8 @@ mod tests {
         assert_eq!(as_prompt("deploy", ""), "deploy");
     }
 
-    /// A core with a real config file — needed by anything that saves — and a
-    /// fake Telegram, so nothing reaches the network.
+    /// Real config file (anything that saves needs one) plus a fake telegram,
+    /// so nothing reaches the network.
     async fn configured(name: &str, permissions: crate::config::Permissions, allowed: Vec<PathBuf>)
         -> (Arc<Core>, PathBuf, tokio::task::JoinHandle<()>)
     {

@@ -1,12 +1,9 @@
-//! The tools a CLI-backed master agent reaches telepager through.
+//! The tools a CLI-backed master agent reaches telepager through. When the
+//! master runs on Claude Code or opencode the agent loop lives inside that CLI,
+//! so we hand it an MCP server — this one, spawned as `telepager master-mcp`.
 //!
-//! When the master agent runs on Claude Code or opencode rather than a raw
-//! API, the agent loop lives inside that CLI. It still needs telepager's tools
-//! — start an agent, list sessions, kill one — so telepager hands it an MCP
-//! server: this one, spawned as `telepager master-mcp`.
-//!
-//! It owns no state. Every call is proxied to the running app's console API,
-//! so there is still exactly one implementation of each tool.
+//! It owns no state: every call is proxied to the running app's console API, so
+//! each tool still has exactly one implementation.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -122,9 +119,9 @@ pub fn run() -> Result<()> {
         http: reqwest::Client::new(),
         base: format!("http://127.0.0.1:{port}"),
         key,
-        // an absent origin means gated, matching Origin::parse. defaulting
-        // to the local surface here would quietly exempt a telegram-driven
-        // agent from allowed_dirs whenever the env var failed to arrive.
+        // an absent origin means gated, matching Origin::parse. defaulting to
+        // local here would quietly exempt a telegram-driven agent from
+        // allowed_dirs whenever the env var failed to arrive.
         origin: std::env::var(ORIGIN_ENV)
             .unwrap_or_else(|_| crate::master::Origin::Telegram.as_str().to_string()),
     };

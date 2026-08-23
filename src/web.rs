@@ -1,9 +1,7 @@
-//! The local web console, and the setup page that comes before it.
-//!
-//! One server on loopback serves both: if there's no Telegram token yet you
-//! get the wizard, and the moment it's saved the same page turns into the
-//! console. That's what makes `telepager` a single command — the app is always
-//! runnable, and configuring it is something you do from inside it.
+//! The local web console, and the setup page that comes before it. One loopback
+//! server does both: no token yet and you get the wizard, and the moment it's
+//! saved the same page becomes the console. That's what makes `telepager` one
+//! command — you configure the app from inside it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,19 +25,17 @@ const PAGE: &str = include_str!("web_page.html");
 /// browser request doesn't look hung.
 const DETECT_POLL_SECONDS: u64 = 15;
 const MAX_BODY: usize = 256 * 1024;
-/// How long a connection gets to send its request line, headers and body.
-/// Only covers the read: an event stream is meant to stay open afterwards.
+/// How long a connection gets to send request line, headers and body. Read
+/// only — an event stream is meant to stay open afterwards.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-/// Ceiling on connections being served at once, so idle sockets can't exhaust
-/// file descriptors. Generous — a console tab uses one stream plus short calls.
+/// Ceiling on connections at once, so idle sockets can't exhaust fds. Generous
+/// — a console tab uses one stream plus short calls.
 const MAX_CONNECTIONS: usize = 64;
 /// How much history a freshly opened page is given.
 const SNAPSHOT_EVENTS: usize = 400;
 
-/// Bind the console and start serving. Returns where it landed.
-///
-/// `port_override` is `--port`; 0 means "use the configured one, or any free
-/// port". A port that's taken never stops the app coming up.
+/// Bind the console and start serving, returning where it landed.
+/// `port_override` is `--port`; 0 means the configured port, or any free one.
 pub async fn start(core: Arc<Core>, open_browser: bool, port_override: u16) -> Result<UiInfo> {
     let port = match port_override {
         0 => core.config().await.map(|c| c.ui_port).unwrap_or(0),
@@ -92,7 +88,7 @@ pub async fn start(core: Arc<Core>, open_browser: bool, port_override: u16) -> R
                 }
                 // one bad accept isn't the end of the console. returning here
                 // left the app running with a port nothing answered on, which
-                // reads to the user as telepager having quit
+                // looks to the user like telepager quit
                 Err(e) => {
                     log::warn!("console accept failed: {e:#}");
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -104,8 +100,8 @@ pub async fn start(core: Arc<Core>, open_browser: bool, port_override: u16) -> R
     Ok(info)
 }
 
-/// Run the console in the foreground, for `telepager setup` on a machine
-/// where no daemon should be left behind.
+/// Run the console in the foreground, for `telepager setup` where no daemon
+/// should be left behind.
 pub fn run_standalone(config: Option<std::path::PathBuf>, port: u16, open: bool) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -313,8 +309,8 @@ async fn state(core: &Arc<Core>) -> Result<Value> {
     }))
 }
 
-/// The session list, each marked with whether telepager still holds a live
-/// process for it — which is what decides if "kill" and stdin are offered.
+/// The session list, each marked with whether we still hold a live process for
+/// it — that's what decides if "kill" and stdin are offered.
 async fn sessions_with_liveness(core: &Arc<Core>) -> Vec<Value> {
     let mut out = Vec::new();
     for mut summary in core.sessions().await {
@@ -330,8 +326,8 @@ async fn sessions_with_liveness(core: &Arc<Core>) -> Vec<Value> {
     out
 }
 
-/// Where the master agent's key is coming from, so the UI can say so without
-/// ever showing the key itself.
+/// Where the master's key comes from, so the UI can say so without showing the
+/// key itself.
 fn master_key_source(master: &MasterConfig) -> Option<String> {
     if master.provider.is_cli() {
         return Some(format!(
@@ -524,11 +520,9 @@ async fn spawn(core: &Arc<Core>, body: &Value) -> Result<Value> {
     Ok(json!({ "session": id }))
 }
 
-/// Run one master-agent tool and hand back its text.
-///
-/// This is how a CLI-backed master agent (Claude Code, opencode) reaches
-/// telepager: `telepager master-mcp` exposes these as MCP tools and proxies
-/// each call here, so there is still only one implementation of them.
+/// Run one master-agent tool and hand back its text. `telepager master-mcp`
+/// exposes these over MCP and proxies each call here, so a cli-backed master
+/// shares the one implementation.
 async fn run_tool(core: &Arc<Core>, body: &Value) -> Result<Value> {
     let name = str_field(body, "name")?.to_string();
     let args = body.get("args").cloned().unwrap_or_else(|| json!({}));
@@ -577,8 +571,8 @@ async fn save_dirs(core: &Arc<Core>, body: &Value) -> Result<Value> {
     Ok(json!({ "ok": true, "count": dirs.len() }))
 }
 
-/// Grant or revoke what telepager may do. A field left out keeps its value,
-/// so the console can save one checkbox without knowing about the rest.
+/// Grant or revoke what telepager may do. A missing field keeps its value, so
+/// the console can save one checkbox without knowing the rest.
 async fn save_permissions(core: &Arc<Core>, body: &Value) -> Result<Value> {
     let existing = core.config().await.map(|c| c.permissions).unwrap_or_default();
     let flag = |name: &str, current: bool| body.get(name).and_then(|v| v.as_bool()).unwrap_or(current);
@@ -605,8 +599,8 @@ async fn save_permissions(core: &Arc<Core>, body: &Value) -> Result<Value> {
     Ok(json!({ "ok": true, "permissions": permissions }))
 }
 
-/// Server-sent events: the snapshot the page needs to draw itself, then
-/// everything that happens afterwards.
+/// Server-sent events: the snapshot the page draws itself from, then everything
+/// that happens after.
 async fn stream_events(core: Arc<Core>, mut stream: TcpStream, req: &Request) -> Result<()> {
     let session = query_param(&req.target, "session");
     let mut rx = core.subscribe().await;
@@ -762,11 +756,9 @@ fn query_param(target: &str, name: &str) -> Option<String> {
     })
 }
 
-/// Enough of percent decoding for a session id or a path in a query string.
-///
-/// Works on bytes throughout. Slicing the &str by byte offsets would panic
-/// whenever an escape landed mid-character, on input that reaches us before
-/// any authentication.
+/// Enough percent decoding for a session id or a path in a query string. Works
+/// on bytes: slicing the &str by byte offsets panics when an escape lands
+/// mid-character, on input that reaches us before any auth.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -797,7 +789,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The two hex digits following a `%`, if both are really there and really hex.
+/// The two hex digits after a `%`, if they're both there and both hex.
 fn hex_pair(bytes: &[u8], at: usize) -> Option<u8> {
     let hi = hex_digit(*bytes.get(at + 1)?)?;
     let lo = hex_digit(*bytes.get(at + 2)?)?;

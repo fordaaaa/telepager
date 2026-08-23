@@ -1,9 +1,7 @@
-//! One interface over the model APIs the master agent can run on.
-//!
-//! Anthropic, OpenAI (and everything OpenAI-shaped — openrouter, groq,
-//! together, lm studio, vllm), Google Gemini and Ollama each want a different
-//! request body and hand back a different response shape. The differences are
-//! all in `encode`/`decode`; everything above this file works in terms of
+//! One interface over the model APIs the master agent can run on. Anthropic,
+//! openai-shaped (openrouter, groq, together, lm studio, vllm), gemini and
+//! ollama each want a different request body and hand back a different shape.
+//! All of that lives in `encode`/`decode`; everything above works in terms of
 //! [`Msg`], [`ToolDef`] and [`Turn`].
 
 use anyhow::{bail, Context, Result};
@@ -95,8 +93,7 @@ impl Llm {
         format!("{}/{}", self.provider.as_str(), self.model)
     }
 
-    /// Keys leak through reqwest's error messages when they ride in the url,
-    /// which is exactly what Gemini does.
+    /// Keys ride in the url for gemini, and reqwest prints urls in its errors.
     fn scrub(&self, e: anyhow::Error) -> anyhow::Error {
         let Some(key) = self.key.as_deref().filter(|k| k.len() > 6) else {
             return e;
@@ -478,8 +475,8 @@ fn has_function_response(content: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Gemini's schema dialect rejects the JSON Schema keywords the other two
-/// ignore, so drop the ones we might emit.
+/// Gemini's schema dialect rejects JSON Schema keywords the others just ignore,
+/// so drop the ones we emit.
 fn strip_schema_for_gemini(schema: &Value) -> Value {
     match schema {
         Value::Object(map) => {

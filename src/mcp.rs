@@ -50,7 +50,7 @@ impl Server {
         }
     }
 
-    // the daemon does the work, this carries the request over and waits.
+    // the daemon does the work; this carries the request over and waits.
     // block_in_place keeps the blocking socket read off the async executor.
     async fn forward(&self, req: Request) -> String {
         let mut guard = self.client.lock().await;

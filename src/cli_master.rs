@@ -1,13 +1,11 @@
 //! Running the master agent on a coding CLI instead of a raw model API.
 //!
-//! `claude` and `opencode` are already logged in — a Claude Code subscription,
-//! or opencode's own credentials including its free models — so pointing the
-//! master agent at one means no API key anywhere. The agent loop then lives
-//! inside that CLI, and it reaches telepager's tools over MCP, through the
-//! `telepager master-mcp` bridge.
+//! `claude` and `opencode` are already logged in, so pointing the master at one
+//! means no api key anywhere. The agent loop then lives inside that CLI and
+//! reaches our tools over MCP through the `telepager master-mcp` bridge.
 //!
-//! What this file does: build the command, run it, and pull the reply and the
-//! session id back out of whatever it printed.
+//! This file builds the command, runs it, and digs the reply and session id out
+//! of whatever it printed.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -24,16 +22,16 @@ use crate::core::{Core, Fanout};
 use crate::master::Origin;
 use crate::session::EventKind;
 
-/// A master turn can involve several tool calls and a lot of thinking, but it
-/// shouldn't run forever — you're waiting on it from a phone.
+/// A turn can involve several tool calls and a lot of thinking, but you're
+/// waiting on it from a phone.
 const TURN_TIMEOUT_SECONDS: u64 = 300;
 
-/// How often the status line may be edited. Telegram rate limits edits, and a
-/// busy turn emits events faster than anyone reads them.
+/// How often the status line may be edited — telegram rate limits edits, and a
+/// busy turn emits events faster than anyone reads.
 const STATUS_TICK: Duration = Duration::from_millis(1200);
 
-/// The MCP server name the CLI sees. Also what its tools get prefixed with,
-/// which is why `--allowedTools mcp__telepager` works.
+/// The MCP server name the CLI sees, and the prefix on its tools — which is why
+/// `--allowedTools mcp__telepager` works.
 const SERVER_NAME: &str = "telepager";
 
 pub async fn reply(core: &Arc<Core>, cfg: &Config, text: &str, origin: Origin) -> Result<String> {
@@ -69,9 +67,9 @@ pub async fn reply(core: &Arc<Core>, cfg: &Config, text: &str, origin: Origin) -
 
     log::debug!("master agent: {} {:?}", program.display(), plan.args);
 
-    // say something before the cli has: on a phone a silent turn is
-    // indistinguishable from the bot ignoring you. the console shows the
-    // conversation itself, so it doesn't need the status line.
+    // say something before the cli has: on a phone a silent turn looks exactly
+    // like the bot ignoring you. the console shows the conversation, so it
+    // doesn't need this.
     let status = match origin {
         Origin::Telegram => core.thinking(None, "thinking…", &Fanout::default()).await.1,
         Origin::Ui => Fanout::default(),
@@ -147,13 +145,12 @@ struct Plan {
     env: Vec<(String, String)>,
 }
 
-/// Build the master CLI's command, without running it.
+/// Build the master CLI's command without running it.
 ///
-/// The CLI goes in a process group of its own, exactly like a worker agent.
-/// Left in telepager's group it is a sibling of the daemon, so any group-wide
-/// signal it or its supervisor sends — the usual way a node CLI takes its
-/// tool subprocesses down when a turn ends — lands on the daemon and every
-/// agent the daemon is running, not just on the CLI's own tree.
+/// Its own process group, like a worker agent: left in ours it's a sibling of
+/// the daemon, so a group-wide signal it sends — how a node cli usually takes
+/// its tool subprocesses down at the end of a turn — hits the daemon and every
+/// agent too.
 fn build_command(program: &Path, plan: &Plan, workdir: &Path) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(&plan.args)
@@ -172,15 +169,13 @@ fn build_command(program: &Path, plan: &Plan, workdir: &Path) -> tokio::process:
 
 /// Run one turn of the master CLI, giving up after `limit`.
 ///
-/// On a timeout the whole group goes, not just the CLI. `kill_on_drop` only
-/// reaches the process we spawned, and by then that process has children of
-/// its own — at minimum a `telepager master-mcp` bridge holding a connection
-/// to us — which would otherwise be orphaned and left running for good, one
-/// fresh set per turn that ran long.
+/// On a timeout the whole group goes, not just the CLI: `kill_on_drop` reaches
+/// only the process we spawned, and by then it has children — at minimum a
+/// `master-mcp` bridge holding a connection to us — that would be orphaned for
+/// good, a fresh set per overrun turn.
 ///
-/// With a `progress` channel, stdout lines are handed over as they arrive so
-/// something can be said while the turn runs. Without one this is the plain
-/// collect-at-the-end it has always been.
+/// With a `progress` channel, stdout lines are handed over as they arrive;
+/// without one this just collects at the end.
 async fn run_cli(
     program: &Path,
     plan: &Plan,
@@ -241,8 +236,8 @@ async fn drive(
     })
 }
 
-/// Keep one status line up to date from the CLI's event stream, and hand it
-/// back so the caller can take it down.
+/// Keep a status line up to date from the CLI's event stream, handing it back so
+/// the caller can take it down.
 async fn narrate(
     core: Arc<Core>,
     mut status: crate::core::Fanout,
@@ -433,8 +428,8 @@ fn parse_claude(stdout: &str) -> Parsed {
 }
 
 /// `claude --output-format stream-json` prints one event per line, ending with
-/// the same result object the plain json format prints. `None` means it wasn't
-/// a stream at all, so the caller can fall back.
+/// the same result object plain json gives. `None` means it wasn't a stream, so
+/// the caller can fall back.
 fn parse_claude_stream(stdout: &str) -> Option<Parsed> {
     let mut parsed = Parsed::default();
     let mut assistant = String::new();
@@ -515,8 +510,8 @@ fn parse_opencode(stdout: &str) -> Parsed {
     Parsed { text: text.trim().to_string(), session }
 }
 
-/// Somewhere neutral for the master to run: not a project directory, so it
-/// can't wander into editing one, and stable so `--resume` keeps working.
+/// Somewhere neutral to run: not a project directory, so it can't wander into
+/// editing one, and stable so `--resume` keeps working.
 fn master_workdir() -> Result<PathBuf> {
     let base = dirs::cache_dir()
         .or_else(dirs::home_dir)
@@ -738,10 +733,9 @@ mod tests {
         unsafe { getpgrp() as u32 }
     }
 
-    // regression: the master cli was left in telepager's own process group, so
-    // a group-wide signal from it — how a node cli usually takes its tool
-    // subprocesses down at the end of a turn — reached the daemon and every
-    // agent the daemon was running.
+    // regression: the master cli was left in telepager's process group, so a
+    // group-wide signal from it — how a node cli takes its tool subprocesses
+    // down at the end of a turn — reached the daemon and every agent.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_master_cli_runs_in_a_process_group_of_its_own() {
@@ -760,10 +754,9 @@ mod tests {
         assert_ne!(printed, our_process_group(), "the cli shares telepager's group");
     }
 
-    // regression: a turn that ran long was abandoned with only kill_on_drop,
-    // which SIGKILLs the cli and nothing else. its `telepager master-mcp`
-    // bridge, and anything else it had started, were orphaned and left running
-    // for good — one fresh set every time a turn overran.
+    // regression: an overrunning turn was abandoned with only kill_on_drop,
+    // which SIGKILLs the cli and nothing else — its `master-mcp` bridge and
+    // anything else it started were orphaned for good, one set per overrun.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_turn_that_overruns_takes_the_clis_children_with_it() {

@@ -126,9 +126,8 @@ fn finish(result: anyhow::Result<()>) -> ExitCode {
     }
 }
 
-/// Rust ignores SIGPIPE, so `telepager status | head` panics on the first
-/// write after head exits. Put the default handler back and we exit quietly
-/// like every other command line tool.
+/// Rust ignores SIGPIPE, so `telepager status | head` panics on the first write
+/// after head exits. Put the default handler back and we exit quietly.
 #[cfg(unix)]
 fn restore_sigpipe() {
     unsafe extern "C" {

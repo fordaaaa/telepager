@@ -1,9 +1,6 @@
-//! The one thing that owns everything.
-//!
-//! Core holds the Telegram connection, the session registry, the processes we
-//! spawned and the master agent's conversation. The IPC socket, the web UI and
-//! the Telegram poller are all clients of it, so there is exactly one place
-//! where a question gets routed or an agent gets started.
+//! The one thing that owns everything: telegram, sessions, spawned processes,
+//! the master's conversation. ipc, web and the telegram poller are all clients
+//! of it, so routing a question or starting an agent happens in one place.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -31,12 +28,11 @@ pub const MAX_OPTIONS: usize = 20;
 const KEEP_FINISHED: usize = 30;
 /// Output lines quoted back to Telegram when an agent finishes.
 const EXIT_TAIL_LINES: usize = 15;
-/// How much of a shell command's output is quoted back. All of it is in the
-/// session log either way, so this only caps what a chatty command puts on
-/// someone's phone.
+/// How much of a shell command's output is quoted back. It's all in the session
+/// log either way; this just caps what lands on someone's phone.
 const SHELL_TAIL_LINES: usize = 40;
 const SHELL_TAIL_CHARS: usize = 3000;
-/// How often a busy screen may say it changed. A tui redraws faster than
+/// How often a busy screen may say it changed — a tui redraws faster than
 /// anyone reads, and the bus is shared.
 const SCREEN_TICK: Duration = Duration::from_millis(80);
 
@@ -51,16 +47,14 @@ struct Pending {
     session: SessionId,
     question: String,
     options: Vec<String>,
-    /// The Telegram messages carrying the buttons — one per chat, so a tap
-    /// from any of them finds the question.
+    /// The messages carrying the buttons, one per chat, so a tap from any of
+    /// them finds the question.
     tg_messages: Fanout,
     tx: oneshot::Sender<Answer>,
 }
 
-/// Where one outbound message landed: a Telegram message id per chat.
-///
-/// Everything the bot says goes to every allowed user, so a status line being
-/// edited in place is several messages, not one.
+/// Where one outbound message landed: a message id per chat. Everything goes to
+/// every allowed user, so a status line being edited is several messages.
 #[derive(Debug, Clone, Default)]
 pub struct Fanout {
     sent: Vec<(i64, i64)>,
@@ -85,14 +79,12 @@ impl Fanout {
     }
 }
 
-/// A running agent process, kept so it can be written to and killed.
-///
-/// The child sits behind its own lock so the reaper can poll it without
-/// holding the whole process table while an agent runs for an hour.
+/// A running agent process, kept so it can be written to and killed. The child
+/// has its own lock so the reaper can poll it without holding the whole table.
 struct AgentProcess {
     child: Arc<Mutex<Handle>>,
-    /// Behind its own lock, so writing to an agent that has stopped reading
-    /// can't hold up the whole process table while the pipe buffer is full.
+    /// Own lock: writing to an agent that stopped reading must not wedge the
+    /// whole process table while the pipe buffer is full.
     input: AgentInput,
     /// The pty master, for resizes.
     pty: Option<Arc<std::sync::Mutex<Box<dyn MasterPty + Send>>>>,
@@ -122,8 +114,8 @@ impl UiInfo {
 pub struct Core {
     /// An explicit --config, carried so saves land in the same file.
     pub config_path: Option<PathBuf>,
-    /// None until Telegram is set up. The app runs unconfigured on purpose:
-    /// that's what lets it serve its own setup page.
+    /// None until telegram is set up — running unconfigured is what lets us
+    /// serve the setup page.
     cfg: RwLock<Option<Config>>,
     tg: RwLock<Option<Arc<Telegram>>>,
     registry: Mutex<Registry>,
@@ -136,8 +128,8 @@ pub struct Core {
     /// Woken when the config changes, so the Telegram poller restarts.
     pub config_changed: Notify,
     ui: RwLock<Option<UiInfo>>,
-    /// Where `/sh` runs, set by `/cd`. Lives here rather than in a global so
-    /// tests get their own, and so it dies with the daemon.
+    /// Where `/sh` runs, set by `/cd`. Here rather than a global so tests get
+    /// their own and it dies with the daemon.
     work_dir: RwLock<Option<PathBuf>>,
 }
 
@@ -187,8 +179,8 @@ impl Core {
         self.tg.read().await.clone()
     }
 
-    /// Re-read the config file and swap in a fresh Telegram client. Called
-    /// after the setup page writes a token, so nothing has to be restarted.
+    /// Re-read the config and swap in a fresh telegram client, so the setup
+    /// page takes effect without a restart.
     pub async fn reload_config(&self) -> bool {
         let fresh = config::load_optional(self.config_path.as_deref());
         let changed = match (&fresh, &*self.cfg.read().await) {
@@ -292,11 +284,9 @@ impl Core {
 
     // -------------------------------------------------------- broadcasting
 
-    /// Send one message to every allowed user.
-    ///
-    /// The single place the fan-out happens. One chat failing — they blocked
-    /// the bot, or never said hello to it — must not stop the others, so a
-    /// failure is logged and the rest still go out.
+    /// Send one message to every allowed user. One chat failing — blocked the
+    /// bot, never said hello — must not stop the others, so it's logged and the
+    /// rest still go out.
     pub async fn broadcast(&self, text: &str) -> (String, Fanout) {
         let (Some(tg), Some(cfg)) = (self.telegram().await, self.config().await) else {
             return ("not set up yet — run `telepager setup`".into(), Fanout::default());
@@ -356,8 +346,8 @@ impl Core {
         ("sent".into(), out)
     }
 
-    /// Take a broadcast message back down. Used for the master's status line,
-    /// which is scaffolding — once the answer arrives it's just noise.
+    /// Take a broadcast message back down — the master's status line is just
+    /// noise once the answer arrives.
     pub async fn erase(&self, sent: &Fanout) {
         let Some(tg) = self.telegram().await else { return };
         for (chat, id) in &sent.sent {
@@ -407,8 +397,8 @@ impl Core {
         self.broadcast_edit(previous, &decorate(&label, &format!("💭 {text}"))).await
     }
 
-    /// Ask the user something and block until they answer, from either front
-    /// end. Returns the answer text, or an explanation of why there isn't one.
+    /// Ask the user something and block until either front end answers. Returns
+    /// the answer, or why there isn't one.
     pub async fn ask(&self, session: &str, question: &str, options: &[String]) -> String {
         if options.is_empty() {
             return "need at least one option".into();
@@ -511,8 +501,8 @@ impl Core {
             .map(|(id, _)| id.clone())
     }
 
-    /// Resolve which question a tap meant: the id the button carried if it's
-    /// still waiting, otherwise whichever question that message belongs to.
+    /// Which question a tap meant: the id on the button if it's still waiting,
+    /// else whichever question that message belongs to.
     pub async fn question_for_message_or(&self, qid: &str, message_id: Option<i64>) -> Option<String> {
         if self.pending.lock().await.contains_key(qid) {
             return Some(qid.to_string());
@@ -523,8 +513,8 @@ impl Core {
         }
     }
 
-    /// The only pending question, when there's exactly one, with its options —
-    /// what a typed reply in Telegram might be answering.
+    /// The only pending question, if there's exactly one — what a typed reply
+    /// might be answering.
     pub async fn only_pending_question(&self) -> Option<(String, Vec<String>)> {
         let pending = self.pending.lock().await;
         if pending.len() != 1 {
@@ -657,14 +647,11 @@ impl Core {
         Ok(id)
     }
 
-    /// Run a shell command in a directory, as a session.
+    /// Run a shell command as a session, so it shows up in `list_sessions`, the
+    /// console's terminal pane, and `/kill`.
     ///
-    /// The caller decides whether it's allowed to run at all — this is the
-    /// mechanism, not the gate. `confirm` is a question to ask before starting;
-    /// a "no" means the command never runs.
-    ///
-    /// It becomes a real session, so it shows up in `list_sessions` and in the
-    /// console's terminal pane, and `/kill` can stop it.
+    /// This is the mechanism, not the gate — the caller decides whether it may
+    /// run. `confirm` is asked first; a "no" means it never starts.
     pub async fn run_shell(
         self: &Arc<Self>,
         command: &str,
@@ -906,8 +893,8 @@ impl Core {
         self.processes.lock().await.contains_key(id)
     }
 
-    /// Wire a core straight to a config and a Telegram client, so a test needs
-    /// neither a config file nor the real api.
+    /// Wire a core straight to a config and client, so a test needs neither a
+    /// config file nor the real api.
     #[cfg(test)]
     pub async fn attach(&self, cfg: Config, tg: Telegram) {
         *self.cfg.write().await = Some(cfg);
@@ -957,11 +944,9 @@ async fn pty_write(
     .context("writing to the agent")?
 }
 
-/// Feed a pty into a session's screen.
-///
-/// The read blocks, so it gets a thread of its own and hands chunks over.
-/// Screen events are coalesced — a redrawing tui would otherwise put a
-/// revision per frame on the shared bus.
+/// Feed a pty into a session's screen. The read blocks, so it gets its own
+/// thread. Screen events are coalesced or a redrawing tui puts a revision per
+/// frame on the shared bus.
 async fn pump_pty(core: Arc<Core>, id: SessionId, screen: screen::Shared, mut reader: Box<dyn std::io::Read + Send>) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || {
@@ -1095,9 +1080,8 @@ pub(crate) mod tests {
     /// Chat ids a fake Telegram was asked to send to, in order.
     pub(crate) type Seen = Arc<std::sync::Mutex<Vec<i64>>>;
 
-    /// A stand-in Telegram api on localhost. It accepts messages for `good`
-    /// and refuses every other chat, which is how a test gets a chat that has
-    /// blocked the bot without one.
+    /// A stand-in telegram api on localhost: accepts `good`, refuses every
+    /// other chat — that's how a test gets a chat that has blocked the bot.
     pub(crate) async fn fake_telegram(good: i64) -> (String, Seen, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1258,9 +1242,8 @@ pub(crate) mod tests {
         assert_eq!(url, "http://127.0.0.1:4321/?k=abc");
     }
 
-    /// A core with a real config file, so `spawn_agent` works. The agent
-    /// named "sleeper" never reads its stdin, which is the shape that used to
-    /// wedge the process table.
+    /// A core with a real config file, so `spawn_agent` works. "sleeper" never
+    /// reads its stdin — the shape that used to wedge the process table.
     fn configured_core(name: &str) -> (Arc<Core>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("telepager-core-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1312,9 +1295,8 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A core whose only agent keeps appending to a file, so a test can tell
-    /// "still running" apart from "killed": a killed process is still a pid
-    /// until someone reaps it, but it stops ticking.
+    /// A core whose only agent keeps appending to a file: a killed process is
+    /// still a pid until it's reaped, but it stops ticking.
     #[cfg(unix)]
     fn ticking_core(name: &str) -> (Arc<Core>, PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!("telepager-core-{name}-{}", std::process::id()));
