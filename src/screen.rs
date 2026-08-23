@@ -598,14 +598,45 @@ fn row_text(row: &[Cell]) -> String {
     out
 }
 
+/// vte's own cap on how many parameters a csi can carry.
+const MAX_PARAMS: usize = 32;
+
 /// A csi's parameters, flattened so `38:5:1` and `38;5;1` read the same.
-fn args(params: &vte::Params) -> Vec<Vec<u16>> {
-    params.iter().map(|p| p.to_vec()).collect()
+///
+/// Borrowed and stack-held: this runs for every escape sequence a redrawing
+/// tui emits, and the `Vec<Vec<u16>>` it used to build was a heap allocation
+/// per parameter before dispatch had even looked at the action.
+struct Args<'a> {
+    slots: [&'a [u16]; MAX_PARAMS],
+    len: usize,
+}
+
+impl<'a> Args<'a> {
+    fn new(params: &'a vte::Params) -> Self {
+        let mut slots = [&[][..]; MAX_PARAMS];
+        let mut len = 0;
+        for p in params.iter() {
+            if len == MAX_PARAMS {
+                break;
+            }
+            slots[len] = p;
+            len += 1;
+        }
+        Args { slots, len }
+    }
+}
+
+impl<'a> std::ops::Deref for Args<'a> {
+    type Target = [&'a [u16]];
+
+    fn deref(&self) -> &Self::Target {
+        &self.slots[..self.len]
+    }
 }
 
 /// One parameter; 0 and absent both mean the default, as they do everywhere
 /// this is used.
-fn arg(all: &[Vec<u16>], index: usize, default: usize) -> usize {
+fn arg(all: &[&[u16]], index: usize, default: usize) -> usize {
     match all.get(index).and_then(|p| p.first()).copied() {
         Some(0) | None => default,
         Some(v) => v as usize,
@@ -671,7 +702,7 @@ impl vte::Perform for Grid {
         if ignore {
             return;
         }
-        let all = args(params);
+        let all = Args::new(params);
         let private = intermediates.first() == Some(&b'?');
 
         // a different namespace entirely
@@ -679,7 +710,7 @@ impl vte::Perform for Grid {
             match action {
                 'h' | 'l' => {
                     let on = action == 'h';
-                    for p in &all {
+                    for p in all.iter() {
                         match p.first().copied().unwrap_or(0) {
                             7 => self.autowrap = on,
                             25 => self.visible = on,
@@ -853,7 +884,7 @@ impl vte::Perform for Grid {
 
 impl Grid {
     /// Select graphic rendition — colours and attributes.
-    fn sgr(&mut self, all: &[Vec<u16>]) {
+    fn sgr(&mut self, all: &[&[u16]]) {
         if all.is_empty() {
             self.pen = Pen::default();
             return;
@@ -880,14 +911,25 @@ impl Grid {
                     let (color, used) = if param.len() > 1 {
                         (extended(&param[1..]), 0)
                     } else {
-                        let rest: Vec<u16> =
-                            all[i + 1..].iter().filter_map(|p| p.first().copied()).collect();
+                        // 2;r;g;b is the longest form `extended` reads
+                        let mut buf = [0u16; 4];
+                        let mut n = 0;
+                        for p in &all[i + 1..] {
+                            match (n < buf.len(), p.first()) {
+                                (true, Some(v)) => {
+                                    buf[n] = *v;
+                                    n += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        let rest = &buf[..n];
                         let used = match rest.first() {
                             Some(5) => 2,
                             Some(2) => 4,
                             _ => 0,
                         };
-                        (extended(&rest), used)
+                        (extended(rest), used)
                     };
                     if let Some(color) = color {
                         if code == 38 {
