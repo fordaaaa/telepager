@@ -15,6 +15,29 @@ struct RawConfig {
     agents: Option<BTreeMap<String, AgentPreset>>,
     allowed_dirs: Option<Vec<PathBuf>>,
     ui_port: Option<u16>,
+    permissions: Option<Permissions>,
+}
+
+/// What telepager is allowed to do beyond starting worker agents.
+///
+/// Everything a person has to grant lives here, and everything but the
+/// confirmation prompt is off until they do. An install that upgrades into
+/// this gains nothing until someone ticks a box.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Permissions {
+    /// May the master agent run shell commands at all.
+    pub shell: bool,
+    /// May settings be changed from Telegram.
+    pub remote_control: bool,
+    /// Ask before running anything that looks destructive.
+    pub confirm_destructive: bool,
+}
+
+impl Default for Permissions {
+    fn default() -> Self {
+        Self { shell: false, remote_control: false, confirm_destructive: true }
+    }
 }
 
 /// Which backend the master agent runs on.
@@ -309,6 +332,7 @@ pub struct Config {
     /// since reaching it already means being at the machine.
     pub allowed_dirs: Vec<PathBuf>,
     pub ui_port: u16,
+    pub permissions: Permissions,
 }
 
 impl Config {
@@ -462,6 +486,18 @@ pub fn save_allowed_dirs(explicit: Option<&Path>, dirs: &[PathBuf]) -> Result<Pa
     Ok(path)
 }
 
+/// Replace the permissions block, leaving the rest of the file alone.
+pub fn save_permissions(explicit: Option<&Path>, permissions: &Permissions) -> Result<PathBuf> {
+    let path = target_path(explicit);
+    let mut doc = read_doc(&path)?;
+    let obj = doc
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+    obj.insert("permissions".into(), serde_json::to_value(permissions)?);
+    write_doc(&path, &doc)?;
+    Ok(path)
+}
+
 pub fn load(explicit: Option<&Path>) -> Result<Config> {
     let file = resolve_config_path(explicit);
 
@@ -523,6 +559,7 @@ pub fn load(explicit: Option<&Path>) -> Result<Config> {
         agents,
         allowed_dirs: raw.allowed_dirs.unwrap_or_default(),
         ui_port: raw.ui_port.unwrap_or(0),
+        permissions: raw.permissions.unwrap_or_default(),
     })
 }
 
@@ -601,6 +638,7 @@ mod tests {
             agents: Default::default(),
             allowed_dirs: Vec::new(),
             ui_port: 0,
+            permissions: Default::default(),
         };
         assert_eq!(cfg.chat_ids(), vec![8, 7, 9]);
 
@@ -745,6 +783,68 @@ mod tests {
             ..MasterConfig::default()
         };
         assert_eq!(present.is_usable(), crate::agents::which("sh").is_some());
+    }
+
+    #[test]
+    fn nothing_is_granted_until_someone_grants_it() {
+        let p = Permissions::default();
+        assert!(!p.shell);
+        assert!(!p.remote_control);
+        // the one that's on by default is the one that asks first
+        assert!(p.confirm_destructive);
+    }
+
+    // a config file written before permissions existed has to keep working,
+    // and has to keep meaning "nothing granted"
+    #[test]
+    fn an_old_config_file_still_loads_with_everything_off() {
+        let dir = scratch("perms-old");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"bot_token":"t","allowed_user_ids":[1],"ui_port":123}"#).unwrap();
+
+        let cfg = load(Some(&path)).unwrap();
+        assert!(!cfg.permissions.shell);
+        assert!(!cfg.permissions.remote_control);
+        assert!(cfg.permissions.confirm_destructive);
+        assert_eq!(cfg.ui_port, 123);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_half_written_permissions_block_fills_in_the_rest() {
+        let dir = scratch("perms-partial");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"bot_token":"t","allowed_user_ids":[1],"permissions":{"shell":true}}"#,
+        )
+        .unwrap();
+
+        let cfg = load(Some(&path)).unwrap();
+        assert!(cfg.permissions.shell);
+        assert!(!cfg.permissions.remote_control);
+        assert!(cfg.permissions.confirm_destructive);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_permissions_leaves_the_rest_of_the_file_alone() {
+        let dir = scratch("perms-save");
+        let path = dir.join("config.json");
+        save(Some(&path), "tok", &[1]).unwrap();
+
+        save_permissions(
+            Some(&path),
+            &Permissions { shell: true, remote_control: true, confirm_destructive: false },
+        )
+        .unwrap();
+
+        let cfg = load(Some(&path)).unwrap();
+        assert_eq!(cfg.token, "tok");
+        assert!(cfg.permissions.shell);
+        assert!(cfg.permissions.remote_control);
+        assert!(!cfg.permissions.confirm_destructive);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

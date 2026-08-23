@@ -153,7 +153,10 @@ async fn poll_updates(core: Arc<Core>, tg: Arc<Telegram>) {
             offset = update.update_id + 1;
 
             if let Some(msg) = update.message {
-                handle_message(&core, msg).await;
+                // handled off the poll loop: a message that blocks — a shell
+                // command, a master turn, anything that asks a question — must
+                // not stop us reading the tap that answers it
+                tokio::spawn(handle_message(core.clone(), msg));
                 continue;
             }
 
@@ -245,7 +248,8 @@ fn as_answer(text: &str, options: &[String]) -> Option<Answer> {
     }
 }
 
-async fn handle_message(core: &Arc<Core>, msg: IncomingMessage) {
+async fn handle_message(core: Arc<Core>, msg: IncomingMessage) {
+    let core = &core;
     let Some(from) = &msg.from else { return };
     if !allowed(core, from.id).await {
         log::warn!("ignoring a message from {}", from.id);
@@ -313,6 +317,19 @@ async fn handle_command(core: &Arc<Core>, command: &str) {
             None => "Not set up yet.".into(),
         },
         "a" | "answer" => answer_command(core, rest).await,
+        "sh" | "run" => master::shell(core, rest, None, None, Origin::Telegram).await,
+        "cd" => cd_command(core, rest).await,
+        "settings" => settings_command(core).await,
+        "kill" => {
+            if rest.is_empty() {
+                "Say which session, e.g. /kill s3.".into()
+            } else {
+                match core.kill_agent(rest).await {
+                    Ok(()) => format!("Killed {rest}."),
+                    Err(e) => format!("Could not: {e:#}"),
+                }
+            }
+        }
         // anything else is just talk aimed at the master agent, argument and all
         _ => match master::reply(core, &as_prompt(name, rest), Origin::Telegram).await {
             Ok(text) => text,
@@ -353,6 +370,139 @@ async fn answer_command(core: &Arc<Core>, rest: &str) -> String {
     }
 }
 
+/// `/cd <dir>` — where later `/sh` commands run. Telegram is remote, so the
+/// directory has to be one you allowed.
+async fn cd_command(core: &Arc<Core>, rest: &str) -> String {
+    if rest.is_empty() {
+        return match core.work_dir().await {
+            Some(p) => format!("Working directory is {}.", p.display()),
+            None => "Say which directory, e.g. /cd ~/code/api.".into(),
+        };
+    }
+
+    let Some(cfg) = core.config().await else {
+        return "Not set up yet.".into();
+    };
+    let path = match crate::agents::resolve_dir(rest) {
+        Ok(p) => p,
+        Err(e) => return format!("Could not use that directory: {e:#}"),
+    };
+
+    if !crate::agents::dir_is_allowed(&path, &cfg.allowed_dirs) {
+        if cfg.allowed_dirs.is_empty() {
+            return format!(
+                "no directories are allowed from telegram yet. add them in the \
+                 console, or set allowed_dirs in {}.",
+                crate::config::first_candidate()
+            );
+        }
+        return format!("{} is not in allowed_dirs.", path.display());
+    }
+
+    core.set_work_dir(path.clone()).await;
+    format!("Working directory is now {}.", path.display())
+}
+
+/// The question `/settings` asks belongs to no session — it's about the app.
+const SETTINGS_SESSION: &str = "settings";
+
+/// `/settings` — what's granted, and, when remote control is on, buttons to
+/// change it.
+async fn settings_command(core: &Arc<Core>) -> String {
+    let Some(cfg) = core.config().await else {
+        return "Not set up yet.".into();
+    };
+    let summary = settings_summary(&cfg, core.work_dir().await.as_deref());
+
+    if !cfg.permissions.remote_control {
+        return format!(
+            "{summary}\n\nchanging these from telegram is off — turn remote control \
+             on in the console's Settings."
+        );
+    }
+
+    // the summary first, then the buttons, so the question has its context
+    core.broadcast(&summary).await;
+    let options = vec![
+        toggle_label("shell access", cfg.permissions.shell),
+        toggle_label("confirm destructive", cfg.permissions.confirm_destructive),
+        toggle_label("remote control", cfg.permissions.remote_control),
+        "leave it".to_string(),
+    ];
+    let answer = core.ask(SETTINGS_SESSION, "change what?", &options).await;
+    apply_setting(core, cfg.permissions, &answer).await
+}
+
+fn settings_summary(cfg: &crate::config::Config, work_dir: Option<&std::path::Path>) -> String {
+    let dirs = if cfg.allowed_dirs.is_empty() {
+        "  none — telegram can't run or start anything".to_string()
+    } else {
+        cfg.allowed_dirs
+            .iter()
+            .map(|d| format!("  • {}", d.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "⚙️ settings\n\n\
+         shell access: {}\n\
+         remote control: {}\n\
+         confirm destructive: {}\n\n\
+         directories telegram may use:\n{dirs}\n\n\
+         working directory: {}\n\
+         master agent: {}",
+        on_off(cfg.permissions.shell),
+        on_off(cfg.permissions.remote_control),
+        on_off(cfg.permissions.confirm_destructive),
+        work_dir.map(|p| p.display().to_string()).unwrap_or_else(|| "not set — /cd somewhere".into()),
+        cfg.master.provider.as_str(),
+    )
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn toggle_label(what: &str, on: bool) -> String {
+    format!("turn {what} {}", if on { "off" } else { "on" })
+}
+
+/// Apply whichever toggle the tap picked, and say what everything is now.
+async fn apply_setting(
+    core: &Arc<Core>,
+    mut permissions: crate::config::Permissions,
+    answer: &str,
+) -> String {
+    let answer = answer.to_lowercase();
+    if answer.contains("shell access") {
+        permissions.shell = !permissions.shell;
+    } else if answer.contains("confirm destructive") {
+        permissions.confirm_destructive = !permissions.confirm_destructive;
+    } else if answer.contains("remote control") {
+        permissions.remote_control = !permissions.remote_control;
+    } else {
+        return "Left them alone.".into();
+    }
+
+    if let Err(e) = crate::config::save_permissions(core.config_path.as_deref(), &permissions) {
+        return format!("Could not save that: {e:#}");
+    }
+    core.reload_config().await;
+
+    // everyone allowed hears it, because reply_to_telegram broadcasts
+    format!(
+        "⚙️ changed from telegram — shell access {}, remote control {}, confirm destructive {}",
+        on_off(permissions.shell),
+        on_off(permissions.remote_control),
+        on_off(permissions.confirm_destructive),
+    )
+}
+
 const HELP: &str = "\
 telepager — talk to me and I'll run agents on your machine.
 
@@ -360,6 +510,10 @@ Just say what you want, e.g. \"start claude in ~/code/api and make the tests pas
 or \"what's running?\".
 
 /a <text>  answer the question something is waiting on
+/sh <cmd>  run a command in the working directory
+/cd <dir>  set that working directory
+/kill <s>  stop a running session
+/settings  what's granted, and change it if remote control is on
 /status    what every session is doing
 /agents    which agent CLIs are installed
 /new       forget our conversation so far
@@ -633,6 +787,133 @@ mod tests {
     fn an_unknown_command_keeps_its_argument() {
         assert_eq!(as_prompt("deploy", "the api"), "deploy the api");
         assert_eq!(as_prompt("deploy", ""), "deploy");
+    }
+
+    /// A core with a real config file — needed by anything that saves — and a
+    /// fake Telegram, so nothing reaches the network.
+    async fn configured(name: &str, permissions: crate::config::Permissions, allowed: Vec<PathBuf>)
+        -> (Arc<Core>, PathBuf, tokio::task::JoinHandle<()>)
+    {
+        let dir = std::env::temp_dir().join(format!("telepager-daemon-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        crate::config::save(Some(&path), "1:fake", &[7]).unwrap();
+
+        let (base, _seen, server) = crate::core::tests::fake_telegram(7).await;
+        let c = Core::new(Some(path.clone()));
+        let cfg = crate::config::Config {
+            permissions,
+            allowed_dirs: allowed,
+            ..crate::core::tests::config_for(&[7])
+        };
+        c.attach(cfg, crate::telegram::Telegram::with_base(&base)).await;
+        (c, dir, server)
+    }
+
+    #[tokio::test]
+    async fn the_new_commands_do_not_panic_with_no_config() {
+        let c = core();
+        handle_command(&c, "sh echo hi").await;
+        handle_command(&c, "cd /tmp").await;
+        handle_command(&c, "settings").await;
+        handle_command(&c, "kill s9").await;
+    }
+
+    #[tokio::test]
+    async fn cd_is_held_to_the_allowlist() {
+        let root = std::env::temp_dir().join(format!("telepager-cd-{}", std::process::id()));
+        let inside = root.join("project");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let (c, dir, server) = configured("cd", Default::default(), vec![]).await;
+        assert!(cd_command(&c, inside.to_str().unwrap()).await.contains("no directories are allowed"));
+        assert!(c.work_dir().await.is_none());
+        server.abort();
+
+        let (c, dir2, server) = configured("cd2", Default::default(), vec![root.clone()]).await;
+        assert!(cd_command(&c, inside.to_str().unwrap()).await.contains("now"));
+        assert_eq!(c.work_dir().await.unwrap(), inside.canonicalize().unwrap());
+        // somewhere real, but not allowed
+        assert!(cd_command(&c, "/etc").await.contains("not in allowed_dirs"));
+        // and a directory that isn't one
+        assert!(cd_command(&c, "/telepager-nope").await.contains("Could not use"));
+
+        server.abort();
+        for d in [root, dir, dir2] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_are_read_only_until_remote_control_is_on() {
+        let (c, dir, server) = configured("settings-ro", Default::default(), vec![]).await;
+        let out = settings_command(&c).await;
+
+        assert!(out.contains("shell access: off"), "{out}");
+        assert!(out.contains("remote control: off"), "{out}");
+        assert!(out.contains("confirm destructive: on"), "{out}");
+        assert!(out.contains("changing these from telegram is off"), "{out}");
+        // nothing was asked, so nothing could have been changed
+        assert!(c.pending_questions().await.is_empty());
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remote_control_lets_a_tap_grant_shell_access() {
+        let permissions = crate::config::Permissions {
+            remote_control: true,
+            ..Default::default()
+        };
+        let (c, dir, server) = configured("settings-rw", permissions, vec![]).await;
+        let path = dir.join("config.json");
+
+        let asked = {
+            let c = c.clone();
+            tokio::spawn(async move { settings_command(&c).await })
+        };
+        let qid = crate::core::tests::waiting_question(&c).await;
+        // the first option is the shell toggle
+        c.answer(&qid, Answer::Tapped(0)).await;
+
+        let out = asked.await.unwrap();
+        assert!(out.contains("shell access on"), "{out}");
+        // and it's in the file, not just in memory
+        assert!(crate::config::load(Some(&path)).unwrap().permissions.shell);
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn leaving_settings_alone_changes_nothing() {
+        let permissions = crate::config::Permissions {
+            remote_control: true,
+            ..Default::default()
+        };
+        let (c, dir, server) = configured("settings-leave", permissions, vec![]).await;
+
+        let out = apply_setting(&c, Default::default(), "leave it").await;
+        assert_eq!(out, "Left them alone.");
+        assert!(!crate::config::load(Some(&dir.join("config.json"))).unwrap().permissions.shell);
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_help_lists_the_commands_that_exist() {
+        for command in ["/sh", "/cd", "/kill", "/settings", "/a", "/status"] {
+            assert!(HELP.contains(command), "{command} isn't in the help");
+        }
+    }
+
+    #[test]
+    fn a_toggle_offers_the_opposite_of_what_is_set() {
+        assert_eq!(toggle_label("shell access", false), "turn shell access on");
+        assert_eq!(toggle_label("shell access", true), "turn shell access off");
     }
 
     #[tokio::test]

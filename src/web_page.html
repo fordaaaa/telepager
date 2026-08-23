@@ -123,6 +123,8 @@
   .hint a { color: var(--accent); }
   .hint.bad { color: var(--bad); }
   .field { margin-bottom: var(--s4); }
+  .check { display: flex; gap: var(--s2); align-items: center; font-weight: 400; margin-bottom: var(--s2); }
+  .check input { width: auto; margin: 0; }
   .row { display: flex; gap: var(--s2); flex-wrap: wrap; align-items: center; }
   .grow { flex: 1; min-width: 0; }
   .note:not(:empty) { margin-top: var(--s3); font-size: 14px; }
@@ -607,6 +609,18 @@
     <div class="note" id="masterNote"></div>
 
     <div class="sep"></div>
+
+    <div class="field">
+      <label>What telepager may do</label>
+      <label class="check"><input type="checkbox" id="permShell"> Run shell commands</label>
+      <label class="check"><input type="checkbox" id="permRemote"> Let Telegram change these settings</label>
+      <label class="check"><input type="checkbox" id="permConfirm"> Ask first when a command looks destructive</label>
+      <p class="hint">
+        All off until you say otherwise. Commands from Telegram only run in the
+        directories below, and every run is announced to everyone allowed.
+      </p>
+    </div>
+    <div class="note" id="permNote"></div>
 
     <div class="field">
       <label for="dirs">Directories Telegram may start agents in</label>
@@ -1415,10 +1429,15 @@ $("openSettings").onclick = () => {
   $("keyHint").textContent = m.key_source
     ? "Currently using a key from " + m.key_source + "."
     : "No key found yet.";
+  const perms = state.permissions || {};
+  $("permShell").checked = !!perms.shell;
+  $("permRemote").checked = !!perms.remote_control;
+  $("permConfirm").checked = perms.confirm_destructive !== false;
   $("dirs").value = (state.allowed_dirs || []).join("\n");
   $("registerCmd").textContent = state.register_command || "";
   $("configPath").textContent = state.config_path || "";
   note($("masterNote"), "");
+  note($("permNote"), "");
   note($("dirsNote"), "");
   $("settingsDialog").showModal();
 };
@@ -1436,6 +1455,15 @@ $("settingsSave").onclick = async () => {
       system: $("system").value,
     });
     note($("masterNote"), r.ready ? "Using " + r.model + "." : (r.problem || "Saved."), r.ready ? "ok" : "bad");
+
+    const p = await api("/api/permissions", {
+      shell: $("permShell").checked,
+      remote_control: $("permRemote").checked,
+      confirm_destructive: $("permConfirm").checked,
+    });
+    note($("permNote"), p.permissions.shell
+      ? "Shell commands are on."
+      : "Shell commands are off.", p.permissions.shell ? "ok" : "");
 
     const dirs = $("dirs").value.split("\n").map((s) => s.trim()).filter(Boolean);
     const d = await api("/api/dirs", { dirs });

@@ -246,6 +246,7 @@ async fn route(core: &Arc<Core>, path: &str, body: Value) -> Result<Value> {
             Ok(json!({ "ok": delivered }))
         }
         "/api/dirs" => save_dirs(core, &body).await,
+        "/api/permissions" => save_permissions(core, &body).await,
 
         // the bridge a cli-backed master agent calls its tools through
         "/api/tool" => run_tool(core, &body).await,
@@ -286,6 +287,7 @@ async fn state(core: &Arc<Core>) -> Result<Value> {
             .as_ref()
             .map(|c| c.allowed_dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>())
             .unwrap_or_default(),
+        "permissions": cfg.as_ref().map(|c| c.permissions.clone()).unwrap_or_default(),
         "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
         "home": dirs::home_dir().map(|p| p.display().to_string()),
         "master": {
@@ -573,6 +575,34 @@ async fn save_dirs(core: &Arc<Core>, body: &Value) -> Result<Value> {
     config::save_allowed_dirs(core.config_path.as_deref(), &dirs)?;
     core.reload_config().await;
     Ok(json!({ "ok": true, "count": dirs.len() }))
+}
+
+/// Grant or revoke what telepager may do. A field left out keeps its value,
+/// so the console can save one checkbox without knowing about the rest.
+async fn save_permissions(core: &Arc<Core>, body: &Value) -> Result<Value> {
+    let existing = core.config().await.map(|c| c.permissions).unwrap_or_default();
+    let flag = |name: &str, current: bool| body.get(name).and_then(|v| v.as_bool()).unwrap_or(current);
+
+    let permissions = config::Permissions {
+        shell: flag("shell", existing.shell),
+        remote_control: flag("remote_control", existing.remote_control),
+        confirm_destructive: flag("confirm_destructive", existing.confirm_destructive),
+    };
+
+    config::save_permissions(core.config_path.as_deref(), &permissions)?;
+    core.reload_config().await;
+
+    // a grant is worth hearing about wherever you are, not just where you
+    // ticked the box
+    if permissions.shell != existing.shell || permissions.remote_control != existing.remote_control {
+        core.announce(format!(
+            "⚙️ changed in the console — shell access {}, remote control {}",
+            if permissions.shell { "on" } else { "off" },
+            if permissions.remote_control { "on" } else { "off" },
+        ));
+    }
+
+    Ok(json!({ "ok": true, "permissions": permissions }))
 }
 
 /// Server-sent events: the snapshot the page needs to draw itself, then
@@ -1002,6 +1032,38 @@ mod tests {
         let c = core();
         let out = run_tool(&c, &json!({ "name": "nonsense", "args": {} })).await.unwrap();
         assert!(out["result"].as_str().unwrap().contains("no tool called"));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_install_is_granted_nothing() {
+        let s = state(&core()).await.unwrap();
+        assert_eq!(s["permissions"]["shell"], false);
+        assert_eq!(s["permissions"]["remote_control"], false);
+        assert_eq!(s["permissions"]["confirm_destructive"], true);
+    }
+
+    #[tokio::test]
+    async fn saving_one_permission_leaves_the_others_where_they_were() {
+        let dir = std::env::temp_dir().join(format!("telepager-web-perms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        config::save(Some(&path), "1:fake", &[7]).unwrap();
+        let c = Core::new(Some(path.clone()));
+
+        let out = save_permissions(&c, &json!({ "shell": true })).await.unwrap();
+        assert_eq!(out["permissions"]["shell"], true);
+        // the ones the console didn't send keep their values
+        assert_eq!(out["permissions"]["confirm_destructive"], true);
+        assert_eq!(out["permissions"]["remote_control"], false);
+
+        let saved = config::load(Some(&path)).unwrap().permissions;
+        assert!(saved.shell);
+        assert!(saved.confirm_destructive);
+
+        // and the token is still there
+        assert_eq!(config::load(Some(&path)).unwrap().token, "1:fake");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

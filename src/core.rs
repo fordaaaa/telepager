@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,11 @@ pub const MAX_OPTIONS: usize = 20;
 const KEEP_FINISHED: usize = 30;
 /// Output lines quoted back to Telegram when an agent finishes.
 const EXIT_TAIL_LINES: usize = 15;
+/// How much of a shell command's output is quoted back. All of it is in the
+/// session log either way, so this only caps what a chatty command puts on
+/// someone's phone.
+const SHELL_TAIL_LINES: usize = 40;
+const SHELL_TAIL_CHARS: usize = 3000;
 /// How often a busy screen may say it changed. A tui redraws faster than
 /// anyone reads, and the bus is shared.
 const SCREEN_TICK: Duration = Duration::from_millis(80);
@@ -130,6 +136,18 @@ pub struct Core {
     /// Woken when the config changes, so the Telegram poller restarts.
     pub config_changed: Notify,
     ui: RwLock<Option<UiInfo>>,
+    /// Where `/sh` runs, set by `/cd`. Lives here rather than in a global so
+    /// tests get their own, and so it dies with the daemon.
+    work_dir: RwLock<Option<PathBuf>>,
+}
+
+/// What a shell command did.
+pub struct ShellRun {
+    pub session: SessionId,
+    /// One line: how it ended.
+    pub outcome: String,
+    /// The tail of what it printed, capped.
+    pub output: String,
 }
 
 impl Core {
@@ -151,6 +169,7 @@ impl Core {
             master: Mutex::new(crate::master::Conversation::default()),
             config_changed: Notify::new(),
             ui: RwLock::new(None),
+            work_dir: RwLock::new(None),
         })
     }
 
@@ -197,6 +216,15 @@ impl Core {
 
     pub async fn ui(&self) -> Option<UiInfo> {
         self.ui.read().await.clone()
+    }
+
+    /// Where `/sh` runs. Its caller has already checked the allowlist.
+    pub async fn set_work_dir(&self, dir: PathBuf) {
+        *self.work_dir.write().await = Some(dir);
+    }
+
+    pub async fn work_dir(&self) -> Option<PathBuf> {
+        self.work_dir.read().await.clone()
     }
 
     // ---------------------------------------------------------- sessions
@@ -629,6 +657,143 @@ impl Core {
         Ok(id)
     }
 
+    /// Run a shell command in a directory, as a session.
+    ///
+    /// The caller decides whether it's allowed to run at all — this is the
+    /// mechanism, not the gate. `confirm` is a question to ask before starting;
+    /// a "no" means the command never runs.
+    ///
+    /// It becomes a real session, so it shows up in `list_sessions` and in the
+    /// console's terminal pane, and `/kill` can stop it.
+    pub async fn run_shell(
+        self: &Arc<Self>,
+        command: &str,
+        dir: &Path,
+        timeout: Duration,
+        confirm: Option<&str>,
+    ) -> Result<ShellRun> {
+        if command.trim().is_empty() {
+            bail!("the command is empty");
+        }
+
+        let label = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "shell".into());
+        let id = self
+            .open_session(
+                Kind::Spawned,
+                label,
+                Some(dir.to_path_buf()),
+                Some("shell".into()),
+                Some(command.to_string()),
+            )
+            .await;
+
+        self.record(Some(&id), EventKind::Notice { text: format!("$ {command}") }).await;
+        // whichever surface ran it, everyone sees it
+        self.announce(format!("🖥 shell in {} as {id}\n\n$ {command}", dir.display()));
+
+        if let Some(question) = confirm {
+            let answer = self.ask(&id, question, &["yes".into(), "no".into()]).await;
+            if !answer.trim().eq_ignore_ascii_case("yes") {
+                self.record(Some(&id), EventKind::Notice { text: "not run".into() }).await;
+                self.close_session(&id, None).await;
+                return Ok(ShellRun {
+                    session: id,
+                    outcome: format!("not run — you said: {answer}"),
+                    output: String::new(),
+                });
+            }
+        }
+
+        self.set_state(&id, State::Working).await;
+
+        let mut cmd = shell_command(command);
+        cmd.current_dir(dir)
+            // nothing to type at it, and an inherited stdin would be the
+            // daemon's terminal
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("NO_COLOR", "1")
+            .env("TERM", "dumb");
+        // its own group, like every other child: so the timeout can take the
+        // whole tree, and so a signal it sends can't reach the daemon
+        agents::own_process_group(&mut cmd);
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let reason = format!("{e}");
+                self.registry.lock().await.fail(&id, &reason);
+                return Err(e).context("starting a shell");
+            }
+        };
+
+        let pumps = (
+            child.stdout.take().map(|out| tokio::spawn(pump(self.clone(), id.clone(), "stdout", out))),
+            child.stderr.take().map(|err| tokio::spawn(pump(self.clone(), id.clone(), "stderr", err))),
+        );
+
+        let child = Arc::new(Mutex::new(Handle::Piped(child)));
+        self.processes.lock().await.insert(
+            id.clone(),
+            AgentProcess {
+                child: child.clone(),
+                // stdin is closed, so there's nothing to type at
+                input: AgentInput::Pipe(Arc::new(Mutex::new(None))),
+                pty: None,
+            },
+        );
+
+        let finish = async {
+            if let Some(h) = pumps.0 {
+                let _ = h.await;
+            }
+            if let Some(h) = pumps.1 {
+                let _ = h.await;
+            }
+            // polled, not awaited, so kill_agent can take the lock meanwhile
+            loop {
+                match child.lock().await.try_wait() {
+                    Ok(Some(exit)) => return exit.code,
+                    Ok(None) => {}
+                    Err(e) => {
+                        log::debug!("waiting on a shell command failed: {e:#}");
+                        return None;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+
+        let mut run = std::pin::pin!(finish);
+        let (code, outcome) = tokio::select! {
+            code = &mut run => (code, match code {
+                Some(0) => "exit 0".to_string(),
+                Some(c) => format!("exit {c}"),
+                None => "stopped".to_string(),
+            }),
+            _ = tokio::time::sleep(timeout) => {
+                // the whole group, or a build carries on with nobody reading it
+                if let Err(e) = agents::kill_tree(&mut *child.lock().await).await {
+                    log::debug!("could not kill {id}: {e:#}");
+                }
+                // let the pumps hand over what it managed to print
+                let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+                (None, format!("timed out after {}s, killed", timeout.as_secs()))
+            }
+        };
+
+        self.processes.lock().await.remove(&id);
+        self.record(Some(&id), EventKind::Notice { text: outcome.clone() }).await;
+        self.close_session(&id, code).await;
+
+        let output = self.output_tail(&id, SHELL_TAIL_LINES).await.unwrap_or_default();
+        Ok(ShellRun { session: id, outcome, output: tail_chars(&output, SHELL_TAIL_CHARS) })
+    }
+
     /// A pty session's screen: all of it, or what changed since `since`.
     pub async fn screen_view(&self, id: &str, since: Option<u64>) -> Result<Value> {
         let screen = self
@@ -888,6 +1053,35 @@ async fn reap(core: Arc<Core>, id: SessionId, child: Arc<Mutex<Handle>>, agent: 
     core.send(Some(&id), &text).await;
 }
 
+/// The command that runs a command line, per platform.
+fn shell_command(command: &str) -> tokio::process::Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = tokio::process::Command::new("cmd");
+        cmd.arg("/C").arg(command);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    }
+}
+
+/// The last `limit` characters, on a line boundary where there is one.
+fn tail_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let kept: String = text.chars().skip(text.chars().count() - limit).collect();
+    let kept = match kept.find('\n') {
+        Some(i) => &kept[i + 1..],
+        None => kept.as_str(),
+    };
+    format!("…\n{kept}")
+}
+
 // so you can tell which project is talking when more than one is
 pub fn decorate(label: &str, text: &str) -> String {
     format!("📁 {label}\n{text}")
@@ -966,6 +1160,7 @@ pub(crate) mod tests {
             agents: Default::default(),
             allowed_dirs: Vec::new(),
             ui_port: 0,
+            permissions: Default::default(),
         }
     }
 
@@ -1345,6 +1540,133 @@ pub(crate) mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("no question was ever waiting");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shell_command_becomes_a_session_with_its_output_and_exit_code() {
+        if crate::agents::which("sh").is_none() {
+            return;
+        }
+        let c = core();
+        let run = c
+            .run_shell("echo hello; exit 3", &std::env::temp_dir(), Duration::from_secs(10), None)
+            .await
+            .unwrap();
+
+        assert_eq!(run.outcome, "exit 3");
+        assert!(run.output.contains("hello"), "{}", run.output);
+        // it's a real session, so the console and list_sessions can see it
+        assert!(c.session_lines().await.iter().any(|l| l.contains(&run.session)));
+        assert!(!c.is_running(&run.session).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_that_is_not_confirmed_never_runs() {
+        if crate::agents::which("sh").is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("telepager-confirm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran");
+
+        // an unconfigured core can't ask anyone, which is not a yes
+        let c = core();
+        let run = c
+            .run_shell(
+                &format!("touch {}", marker.display()),
+                &dir,
+                Duration::from_secs(10),
+                Some("really?"),
+            )
+            .await
+            .unwrap();
+
+        assert!(run.outcome.starts_with("not run"), "{}", run.outcome);
+        assert!(!marker.exists(), "the command ran without a yes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirming_lets_it_run() {
+        if crate::agents::which("sh").is_none() {
+            return;
+        }
+        let (c, _seen, server) = wired_core(&[7]).await;
+        let runner = {
+            let c = c.clone();
+            tokio::spawn(async move {
+                c.run_shell("echo yes", &std::env::temp_dir(), Duration::from_secs(10), Some("really?"))
+                    .await
+                    .unwrap()
+            })
+        };
+
+        let qid = waiting_question(&c).await;
+        assert!(c.answer(&qid, Answer::Tapped(0)).await);
+
+        let run = runner.await.unwrap();
+        assert_eq!(run.outcome, "exit 0");
+        server.abort();
+    }
+
+    // the timeout has to take the whole group: the direct child here is an `sh`
+    // sitting in a sleep, and the thing still writing is a subshell it
+    // backgrounded. killing only the child leaves that ticking away.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_takes_the_whole_process_group() {
+        if crate::agents::which("sh").is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("telepager-shtimeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ticks");
+        let ticks = || std::fs::read_to_string(&marker).map(|t| t.lines().count()).unwrap_or(0);
+
+        let c = core();
+        let command = format!(
+            "(i=0; while [ $i -lt 30 ]; do echo $i >> {}; i=$((i+1)); sleep 1; done) & sleep 30",
+            marker.display()
+        );
+        let run = c
+            .run_shell(&command, &dir, Duration::from_secs(2), None)
+            .await
+            .unwrap();
+
+        assert!(run.outcome.contains("timed out"), "{}", run.outcome);
+        let before = ticks();
+        assert!(before > 0, "the command never started");
+
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(ticks(), before, "the backgrounded child survived the timeout");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_empty_command_is_refused() {
+        assert!(core().run_shell("   ", &std::env::temp_dir(), Duration::from_secs(1), None).await.is_err());
+    }
+
+    #[test]
+    fn a_long_tail_is_cut_on_a_line_boundary() {
+        assert_eq!(tail_chars("short", 20), "short");
+        let cut = tail_chars("aaaa\nbbbb\ncccc", 9);
+        assert_eq!(cut, "…\ncccc");
+        // nothing to cut on is still cut
+        assert!(tail_chars(&"x".repeat(50), 10).starts_with('…'));
+    }
+
+    #[tokio::test]
+    async fn the_working_directory_is_remembered() {
+        let c = core();
+        assert!(c.work_dir().await.is_none());
+        c.set_work_dir(PathBuf::from("/tmp")).await;
+        assert_eq!(c.work_dir().await, Some(PathBuf::from("/tmp")));
     }
 
     #[tokio::test]

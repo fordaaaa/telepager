@@ -10,6 +10,7 @@
 //! new way to be wrong.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -23,6 +24,10 @@ use crate::session::EventKind;
 const MAX_STEPS: usize = 8;
 /// How much conversation to carry. Old turns are dropped from the front.
 const MAX_HISTORY: usize = 60;
+/// How long a shell command gets by default, and at the very most. You're
+/// waiting on it from a phone; anything longer wants to be a worker agent.
+const DEFAULT_SHELL_SECONDS: u64 = 120;
+const MAX_SHELL_SECONDS: u64 = 900;
 
 /// Where a message came from, which decides what spawning is allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,8 +140,9 @@ pub(crate) fn system_prompt(extra: Option<&str>) -> String {
            a directory they named is fine; killing something they didn't mention is not.\n\
          - When you start a worker, say which agent and which directory in your reply, \
            so they can catch a mistake.\n\
-         - You cannot run shell commands yourself. If something needs a command run, \
-           start a worker agent with that as its task.\n\
+         - run_shell runs a command on that machine, but only if they've turned \
+           shell access on. If it says it's off, tell them rather than trying again. \
+           Anything long-running is better as a worker agent than a shell command.\n\
          - If a tool fails, say so plainly and what you'd try instead. Don't retry the \
            same call twice.",
     );
@@ -176,6 +182,23 @@ pub(crate) fn tools() -> Vec<ToolDef> {
                     "task": { "type": "string", "description": "what the agent should do" },
                 },
                 "required": ["agent", "dir", "task"],
+            }),
+        },
+        ToolDef {
+            name: "run_shell".into(),
+            description: "Run a shell command on the machine and hand back what it \
+                          printed. Off unless the person has granted shell access. \
+                          Use it for quick things — anything long-running should be a \
+                          worker agent instead."
+                .into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "the command line to run" },
+                    "dir": { "type": "string", "description": "absolute path to run it in" },
+                    "timeout_seconds": { "type": "integer", "description": "how long to let it run, default 120" },
+                },
+                "required": ["command", "dir"],
             }),
         },
         ToolDef {
@@ -375,6 +398,13 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
             }
         }
 
+        "run_shell" => {
+            let command = str_arg(args, "command");
+            let dir = str_arg(args, "dir");
+            let seconds = args["timeout_seconds"].as_u64();
+            shell(core, &command, Some(&dir), seconds, origin).await
+        }
+
         "read_output" => {
             let session = str_arg(args, "session");
             let lines = args["lines"].as_u64().unwrap_or(60).clamp(1, 400) as usize;
@@ -416,6 +446,284 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
 
         other => format!("There's no tool called {other}."),
     }
+}
+
+/// Run a shell command, subject to every rule that guards one.
+///
+/// The one place those rules live: the `run_shell` tool and Telegram's `/sh`
+/// both come through here, so neither can be the lenient one.
+///
+/// `dir` empty or absent means the working directory `/cd` set.
+pub async fn shell(
+    core: &Arc<Core>,
+    command: &str,
+    dir: Option<&str>,
+    timeout_seconds: Option<u64>,
+    origin: Origin,
+) -> String {
+    let Some(cfg) = core.config().await else {
+        return "telepager isn't set up yet.".into();
+    };
+
+    if !cfg.permissions.shell {
+        return format!(
+            "shell access is off. turn it on in the console's Settings, or set \
+             permissions.shell to true in {}.",
+            crate::config::first_candidate()
+        );
+    }
+
+    let command = command.trim();
+    if command.is_empty() {
+        return "say what to run.".into();
+    }
+
+    let path = match dir.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => match crate::agents::resolve_dir(d) {
+            Ok(p) => p,
+            Err(e) => return format!("Could not use that directory: {e:#}"),
+        },
+        None => match core.work_dir().await {
+            Some(p) => p,
+            None => return "say which directory to run in, or set one with /cd first.".into(),
+        },
+    };
+
+    // telegram is remote, so it only reaches allowlisted dirs. the console
+    // isn't gated — opening it means being at the machine. same rule spawning
+    // has always used.
+    if origin.is_telegram() && !crate::agents::dir_is_allowed(&path, &cfg.allowed_dirs) {
+        if cfg.allowed_dirs.is_empty() {
+            return format!(
+                "running commands from telegram is off until you allow some \
+                 directories. add them in the console, or set allowed_dirs in {}.",
+                crate::config::first_candidate()
+            );
+        }
+        return format!("{} is not in allowed_dirs.", path.display());
+    }
+
+    let confirm = (cfg.permissions.confirm_destructive && looks_destructive(command)).then(|| {
+        format!("this looks destructive. run it in {}?\n\n$ {command}", path.display())
+    });
+
+    let seconds = timeout_seconds.unwrap_or(DEFAULT_SHELL_SECONDS);
+    let timeout = Duration::from_secs(seconds.clamp(1, MAX_SHELL_SECONDS));
+
+    match core.run_shell(command, &path, timeout, confirm.as_deref()).await {
+        Ok(run) if run.output.trim().is_empty() => {
+            format!("{} ({}, no output)", run.outcome, run.session)
+        }
+        Ok(run) => format!("{} ({})\n\n{}", run.outcome, run.session, run.output),
+        Err(e) => format!("Could not run it: {e:#}"),
+    }
+}
+
+/// Does this command look like it could destroy something?
+///
+/// A heuristic, and deliberately a jumpy one: a needless confirmation costs a
+/// tap, a missed one costs a directory. It is not a security boundary and
+/// can't be — `x=rm; $x -rf .` walks straight past it, and so does anything
+/// piped through base64. allowed_dirs is the boundary; this is a seatbelt.
+pub(crate) fn looks_destructive(command: &str) -> bool {
+    let lowered = command.to_lowercase();
+    if SQL_DAMAGE.iter().any(|p| lowered.contains(p)) {
+        return true;
+    }
+
+    for pipeline in pipelines(command) {
+        let names: Vec<String> = pipeline.iter().map(|s| command_name(&words(s))).collect();
+
+        // curl … | sh, the classic
+        if let Some(fetched) = names.iter().position(|n| FETCHERS.contains(&n.as_str())) {
+            if names.iter().skip(fetched + 1).any(|n| INTERPRETERS.contains(&n.as_str())) {
+                return true;
+            }
+        }
+
+        for stage in &pipeline {
+            if writes_to_a_file(stage) || stage_is_destructive(&words(stage)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Things that damage a database, wherever they turn up in the line.
+const SQL_DAMAGE: &[&str] = &["drop table", "drop database", "truncate table", "delete from"];
+const FETCHERS: &[&str] = &["curl", "wget", "fetch"];
+const INTERPRETERS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "python", "python3", "perl", "ruby", "node"];
+/// Commands with no harmless use of their own.
+const ALWAYS: &[&str] = &[
+    "dd", "fdisk", "parted", "shred", "wipefs", "mkswap", "srm", "unlink", "rmdir", "truncate",
+    "sudo", "doas", "su", "shutdown", "reboot", "halt", "poweroff",
+    "kill", "killall", "pkill", "userdel", "groupdel", "dropdb",
+];
+
+fn stage_is_destructive(words: &[String]) -> bool {
+    let name = command_name(words);
+    if name.is_empty() {
+        return false;
+    }
+    if ALWAYS.contains(&name.as_str()) || name.starts_with("mkfs") {
+        return true;
+    }
+
+    let args: Vec<String> = words.iter().skip(1).map(|w| w.to_lowercase()).collect();
+    let sub = args.iter().find(|a| !a.starts_with('-')).cloned().unwrap_or_default();
+    let long = |flag: &str| args.iter().any(|a| a == flag);
+    // -rf is two flags in one, so short flags are looked for by letter
+    let short = |c: char| {
+        args.iter()
+            .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(c))
+    };
+
+    match name.as_str() {
+        // deleting a file is the thing being asked about, flags or not
+        "rm" => true,
+        "mv" => short('f') || long("--force"),
+        "chmod" | "chown" | "chgrp" => short('r') || long("--recursive"),
+        "find" => args.iter().any(|a| a == "-delete" || a == "-exec" || a == "-execdir"),
+        "git" => match sub.as_str() {
+            "push" => short('f') || long("--force") || long("--force-with-lease"),
+            "reset" => long("--hard"),
+            "clean" => short('f') || short('x') || short('d'),
+            // flags are matched lowercased, so -D and -d are the same here.
+            // both delete a branch, so that's the answer we wanted anyway
+            "branch" => short('d'),
+            "stash" => args.iter().any(|a| a == "drop" || a == "clear"),
+            _ => false,
+        },
+        "docker" | "podman" => {
+            matches!(sub.as_str(), "rm" | "rmi" | "kill" | "prune" | "down")
+                || args.iter().any(|a| a == "prune" || a == "down")
+        }
+        "kubectl" => sub == "delete",
+        "helm" => matches!(sub.as_str(), "uninstall" | "delete"),
+        "terraform" => sub == "destroy" || (sub == "apply" && long("-auto-approve")),
+        "systemctl" | "service" => matches!(sub.as_str(), "stop" | "restart" | "disable" | "mask"),
+        "npm" | "yarn" | "pnpm" | "cargo" => sub == "publish",
+        _ => false,
+    }
+}
+
+/// A `>` or `>>` pointed at something that isn't /dev/…
+///
+/// `2>&1` and `>/dev/null` are how every second command line is written, so
+/// they don't count. A `>` inside a quoted string does, which is a false
+/// positive we can live with.
+fn writes_to_a_file(stage: &str) -> bool {
+    let chars: Vec<char> = stage.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '>' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        while chars.get(i) == Some(&'>') {
+            i += 1;
+        }
+        while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+            i += 1;
+        }
+        let target: String = chars[i..]
+            .iter()
+            .take_while(|c| !c.is_whitespace())
+            .collect();
+        if !target.is_empty() && !target.starts_with('&') && !target.trim_matches('"').starts_with("/dev/") {
+            return true;
+        }
+        i += target.chars().count();
+    }
+    false
+}
+
+/// Split a command line into pipelines, each a list of stages.
+///
+/// Just enough shell to see the shape: `;` `&&` `||` `&` and newlines end a
+/// pipeline, `|` ends a stage. Nothing here understands quoting, and it
+/// doesn't need to — the answer is only ever "ask them first".
+fn pipelines(command: &str) -> Vec<Vec<String>> {
+    let mut all = Vec::new();
+    let mut pipeline: Vec<String> = Vec::new();
+    let mut stage = String::new();
+    let chars: Vec<char> = command.chars().collect();
+    let mut i = 0;
+
+    let end_stage = |stage: &mut String, pipeline: &mut Vec<String>| {
+        if !stage.trim().is_empty() {
+            pipeline.push(std::mem::take(stage));
+        } else {
+            stage.clear();
+        }
+    };
+
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match c {
+            '|' if next == Some('|') => {
+                end_stage(&mut stage, &mut pipeline);
+                all.push(std::mem::take(&mut pipeline));
+                i += 2;
+            }
+            '&' if next == Some('&') => {
+                end_stage(&mut stage, &mut pipeline);
+                all.push(std::mem::take(&mut pipeline));
+                i += 2;
+            }
+            '|' => {
+                end_stage(&mut stage, &mut pipeline);
+                i += 1;
+            }
+            // the & in `2>&1` belongs to the redirect, not to us
+            '&' if stage.trim_end().ends_with('>') => {
+                stage.push(c);
+                i += 1;
+            }
+            ';' | '\n' | '&' => {
+                end_stage(&mut stage, &mut pipeline);
+                all.push(std::mem::take(&mut pipeline));
+                i += 1;
+            }
+            _ => {
+                stage.push(c);
+                i += 1;
+            }
+        }
+    }
+
+    end_stage(&mut stage, &mut pipeline);
+    all.push(pipeline);
+    all.retain(|p| !p.is_empty());
+    all
+}
+
+fn words(stage: &str) -> Vec<String> {
+    stage
+        .split_whitespace()
+        .map(|w| w.trim_matches(['"', '\'', '(']).to_string())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// The command a stage runs: leading `VAR=value` assignments dropped, a path
+/// reduced to its last component, lowercased.
+fn command_name(words: &[String]) -> String {
+    let is_assignment = |w: &str| match w.split_once('=') {
+        Some((name, _)) => !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_'),
+        None => false,
+    };
+    let Some(first) = words.iter().find(|w| !is_assignment(w)) else {
+        return String::new();
+    };
+    first
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(first)
+        .to_lowercase()
 }
 
 fn str_arg(args: &Value, name: &str) -> String {
@@ -588,6 +896,217 @@ mod tests {
         )
         .await;
         assert!(out.contains("hasn't produced any output"), "{out}");
+    }
+
+    /// A core whose config grants what the test is about.
+    async fn granted(
+        shell: bool,
+        confirm: bool,
+        allowed: Vec<PathBuf>,
+    ) -> (Arc<Core>, tokio::task::JoinHandle<()>) {
+        let (base, _seen, server) = crate::core::tests::fake_telegram(7).await;
+        let c = core();
+        let cfg = crate::config::Config {
+            permissions: crate::config::Permissions {
+                shell,
+                remote_control: false,
+                confirm_destructive: confirm,
+            },
+            allowed_dirs: allowed,
+            ..crate::core::tests::config_for(&[7])
+        };
+        c.attach(cfg, crate::telegram::Telegram::with_base(&base)).await;
+        (c, server)
+    }
+
+    #[tokio::test]
+    async fn shell_access_is_off_until_it_is_granted() {
+        let (c, server) = granted(false, true, vec![]).await;
+        let tmp = std::env::temp_dir();
+        let out = shell(&c, "echo hi", tmp.to_str(), None, Origin::Ui).await;
+
+        assert!(out.contains("shell access is off"), "{out}");
+        // and it says where to turn it on, from either surface
+        assert!(out.contains("Settings"), "{out}");
+        assert!(out.contains("config.json"), "{out}");
+
+        let from_phone = shell(&c, "echo hi", tmp.to_str(), None, Origin::Telegram).await;
+        assert!(from_phone.contains("shell access is off"), "{from_phone}");
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn telegram_only_reaches_allowed_dirs_and_the_console_is_not_gated() {
+        if crate::agents::which("sh").is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("telepager-shell-allow-{}", std::process::id()));
+        let inside = root.join("project");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        // granted, but with nothing allowed: telegram still can't run anything
+        let (c, server) = granted(true, false, vec![]).await;
+        let out = shell(&c, "echo hi", inside.to_str(), None, Origin::Telegram).await;
+        assert!(out.contains("until you allow some directories"), "{out}");
+        server.abort();
+
+        let (c, server) = granted(true, false, vec![root.clone()]).await;
+        assert!(shell(&c, "echo hi", inside.to_str(), None, Origin::Telegram)
+            .await
+            .contains("exit 0"));
+        // a sibling of the allowed root is still out
+        let outside = std::env::temp_dir();
+        let refused = shell(&c, "echo hi", outside.to_str(), None, Origin::Telegram).await;
+        assert!(refused.contains("not in allowed_dirs"), "{refused}");
+        // the console isn't held to the allowlist — reaching it means being there
+        assert!(shell(&c, "echo hi", outside.to_str(), None, Origin::Ui)
+            .await
+            .contains("exit 0"));
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_destructive_command_is_confirmed_first_and_no_means_no() {
+        if crate::agents::which("sh").is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("telepager-shell-confirm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("precious");
+        std::fs::write(&victim, "keep me").unwrap();
+
+        let (c, server) = granted(true, true, vec![dir.clone()]).await;
+        let asked = {
+            let c = c.clone();
+            let dir = dir.clone();
+            let victim = victim.clone();
+            tokio::spawn(async move {
+                shell(&c, &format!("rm -rf {}", victim.display()), dir.to_str(), None, Origin::Telegram).await
+            })
+        };
+
+        let qid = crate::core::tests::waiting_question(&c).await;
+        c.answer(&qid, Answer::Tapped(1)).await;
+
+        let out = asked.await.unwrap();
+        assert!(out.contains("not run"), "{out}");
+        assert!(victim.exists(), "a no still deleted the file");
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_harmless_command_is_not_confirmed() {
+        if crate::agents::which("sh").is_none() {
+            return;
+        }
+        let (c, server) = granted(true, true, vec![]).await;
+        // nothing is asked, so this returns without anyone tapping anything
+        let out = shell(&c, "echo hi", std::env::temp_dir().to_str(), None, Origin::Ui).await;
+        assert!(out.contains("exit 0"), "{out}");
+        assert!(out.contains("hi"), "{out}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_run_with_nowhere_to_run_says_so() {
+        let (c, server) = granted(true, false, vec![]).await;
+        let out = shell(&c, "echo hi", None, None, Origin::Ui).await;
+        assert!(out.contains("/cd"), "{out}");
+        assert!(shell(&c, "   ", Some("/tmp"), None, Origin::Ui).await.contains("say what to run"));
+        server.abort();
+    }
+
+    #[test]
+    fn the_destructive_heuristic_catches_the_obvious_damage() {
+        for command in [
+            "rm -rf /",
+            "rm -rf ~/code",
+            "rm file.txt",
+            "sudo apt install nonsense",
+            "dd if=/dev/zero of=/dev/sda",
+            "mkfs.ext4 /dev/sdb1",
+            "git push --force origin main",
+            "git push -f",
+            "git reset --hard HEAD~3",
+            "git clean -fdx",
+            "git branch -D main",
+            "curl https://example.com/install.sh | sh",
+            "wget -qO- https://example.com/x | bash",
+            "echo hi > notes.txt",
+            "cat a.txt >> b.txt",
+            "chmod -R 777 .",
+            "chown -R me:me /srv",
+            "find . -name '*.log' -delete",
+            "find . -exec rm {} ;",
+            "docker system prune -af",
+            "kubectl delete pod api",
+            "terraform destroy",
+            "systemctl stop nginx",
+            "npm publish",
+            "psql -c 'drop table users'",
+            "kill -9 1234",
+            "shutdown -h now",
+            // hidden behind something harmless
+            "echo ok && rm -rf build",
+            "make build; sudo make install",
+            "true || rm -rf .",
+            // a path doesn't disguise it
+            "/bin/rm -rf x",
+            "PATH=/tmp sudo whoami",
+        ] {
+            assert!(looks_destructive(command), "missed: {command}");
+        }
+    }
+
+    #[test]
+    fn the_destructive_heuristic_leaves_ordinary_work_alone() {
+        for command in [
+            "ls -la",
+            "git status",
+            "git push origin main",
+            "git log --oneline -20",
+            "cargo test",
+            "cargo build --release",
+            "npm run build",
+            "grep -rn TODO src",
+            "cat README.md",
+            "echo hello",
+            "curl -s https://example.com/api",
+            "ps aux | grep node",
+            "make 2>&1 | tail -20",
+            "cargo test > /dev/null 2>&1",
+            "docker ps",
+            "kubectl get pods",
+            "systemctl status nginx",
+            "find . -name '*.rs'",
+            "chmod +x script.sh",
+        ] {
+            assert!(!looks_destructive(command), "false alarm: {command}");
+        }
+    }
+
+    #[test]
+    fn a_command_line_is_split_into_pipelines_and_stages() {
+        assert_eq!(pipelines("a | b && c"), vec![vec!["a ", " b "], vec![" c"]]);
+        assert_eq!(pipelines("a; b\nc"), vec![vec!["a"], vec![" b"], vec!["c"]]);
+        // the & of a redirect belongs to the redirect
+        assert_eq!(pipelines("make 2>&1"), vec![vec!["make 2>&1"]]);
+        assert_eq!(pipelines("sleep 1 & rm x").len(), 2);
+    }
+
+    #[test]
+    fn the_command_name_ignores_env_and_paths() {
+        assert_eq!(command_name(&words("FOO=1 BAR=2 /usr/bin/rm -rf x")), "rm");
+        assert_eq!(command_name(&words("RM")), "rm");
+        assert_eq!(command_name(&words("")), "");
     }
 
     #[tokio::test]
