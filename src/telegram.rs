@@ -33,9 +33,25 @@ pub struct Update {
 
 #[derive(Debug, Deserialize)]
 pub struct IncomingMessage {
+    #[serde(default)]
+    pub message_id: i64,
+    pub chat: Option<Chat>,
     pub from: Option<User>,
     pub text: Option<String>,
     pub reply_to_message: Option<SentMessage>,
+}
+
+impl IncomingMessage {
+    /// Where this message is, so it can be taken back down again.
+    pub fn location(&self) -> Option<(i64, i64)> {
+        let chat = self.chat.as_ref().map(|c| c.id).or_else(|| self.from.as_ref().map(|u| u.id))?;
+        (self.message_id != 0).then_some((chat, self.message_id))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Chat {
+    pub id: i64,
 }
 
 #[derive(Debug, Deserialize)]

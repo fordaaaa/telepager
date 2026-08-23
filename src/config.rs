@@ -104,6 +104,23 @@ impl Provider {
         }
     }
 
+    /// A provider, or one of the services that speak another's API from a
+    /// different address. Naming one of those picks the provider and the
+    /// address together, which is the part that's easy to get wrong by hand.
+    pub fn named(name: &str) -> Option<(Provider, Option<&'static str>)> {
+        let name = name.trim().to_lowercase();
+        let base = match name.as_str() {
+            "openrouter" => "https://openrouter.ai/api/v1",
+            "groq" => "https://api.groq.com/openai/v1",
+            "together" => "https://api.together.xyz/v1",
+            _ => {
+                let provider = serde_json::from_value(serde_json::json!(name)).ok()?;
+                return Some((provider, None));
+            }
+        };
+        Some((Provider::Openai, Some(base)))
+    }
+
     /// Whether this backend is a coding CLI rather than an HTTP API.
     pub fn is_cli(self) -> bool {
         matches!(self, Provider::ClaudeCode | Provider::Opencode)
@@ -741,6 +758,22 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("api_key"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn naming_a_service_picks_the_provider_and_the_address_together() {
+        let (provider, base) = Provider::named("openrouter").unwrap();
+        assert_eq!(provider, Provider::Openai);
+        assert_eq!(base, Some("https://openrouter.ai/api/v1"));
+
+        // a plain provider name has no address of its own to add
+        let (provider, base) = Provider::named("Anthropic").unwrap();
+        assert_eq!(provider, Provider::Anthropic);
+        assert_eq!(base, None);
+
+        // and the aliases serde already knows still work
+        assert_eq!(Provider::named("claude").unwrap().0, Provider::ClaudeCode);
+        assert!(Provider::named("nonesuch").is_none());
     }
 
     #[test]

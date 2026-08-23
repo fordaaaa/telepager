@@ -362,6 +362,19 @@ impl Core {
         }
     }
 
+    /// Take one message back down, wherever it came from. A key someone typed
+    /// shouldn't stay in the chat history.
+    pub async fn unsend(&self, chat: i64, message_id: i64) -> bool {
+        let Some(tg) = self.telegram().await else { return false };
+        match tg.delete_message(chat, message_id).await {
+            Ok(()) => true,
+            Err(e) => {
+                log::debug!("could not delete a message: {e:#}");
+                false
+            }
+        }
+    }
+
     /// Tell everyone something without making the caller wait on Telegram.
     pub fn announce(self: &Arc<Self>, text: String) {
         let core = self.clone();

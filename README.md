@@ -102,6 +102,7 @@ Anything that isn't one of these goes to it, argument and all:
 | `/status` | what every session is doing |
 | `/agents` | which agent CLIs are installed |
 | `/model <m>` | which model the master thinks on |
+| `/key <k>` | give it an api key for a provider |
 | `/a <text>` | answer whatever is waiting on you |
 | `/sh <cmd>` | run a command in the working directory |
 | `/cd <dir>` | set that working directory |
@@ -139,7 +140,12 @@ environment, for the master agent and for `claude` workers alike. Set
 | `gemini` | `GEMINI_API_KEY` | or `GOOGLE_API_KEY` |
 | `ollama` | — | runs locally, no key |
 
-Set it in the console's **Settings**, or in the config:
+Set it in the console's **Settings**, in the config, or from your phone —
+`/key openrouter sk-or-…` switches provider, key and address in one go, and
+`groq` and `together` work the same way. telepager deletes the message you
+typed it in; if you'd rather nothing secret went through Telegram at all,
+`/key env OPENROUTER_API_KEY` reads it from the environment instead, and
+`/key` on its own says what's set without ever printing it.
 
 ```json
 {
@@ -274,6 +280,9 @@ Also read from `./telepager.config.json`; `--config PATH` overrides the lookup.
 - Prefer `TELEGRAM_BOT_TOKEN` over the plaintext config; the file is `0600`.
   Anyone with the bot token can act as your bot.
 - Telegram isn't end-to-end encrypted — don't page real secrets through it.
+  A key sent with `/key` reaches Telegram's servers before it reaches you;
+  telepager deletes the message afterwards, which is tidying, not secrecy.
+  `/key env NAME` keeps the key off the wire entirely.
 - Turning `shell` on means whoever has your Telegram can run commands as you.
   `allowed_dirs` is the boundary; the destructive-command prompt is a seatbelt,
   not a fence — a shell inside an allowed directory can still reach the rest of

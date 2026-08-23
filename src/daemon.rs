@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::config::{MasterConfig, Provider};
 use crate::core::{Answer, Core, Fanout};
 use crate::ipc::{self, Endpoint, Request, Response};
 use crate::master::{self, Origin};
@@ -261,7 +262,7 @@ async fn handle_message(core: Arc<Core>, msg: IncomingMessage) {
                 reply_to_telegram(core, "That question isn't waiting any more.").await;
             }
         }
-        Routing::Command(command) => handle_command(core, &command).await,
+        Routing::Command(command) => handle_command(core, &command, msg.location()).await,
         Routing::Master => {
             let answer = match master::reply(core, &text, Origin::Telegram).await {
                 Ok(text) => text,
@@ -272,7 +273,9 @@ async fn handle_message(core: Arc<Core>, msg: IncomingMessage) {
     }
 }
 
-async fn handle_command(core: &Arc<Core>, command: &str) {
+/// `where_said` is the message the command arrived in, so one carrying a
+/// secret can be taken back down.
+async fn handle_command(core: &Arc<Core>, command: &str, where_said: Option<(i64, i64)>) {
     let (name, rest) = command.split_once(char::is_whitespace).unwrap_or((command, ""));
     let rest = rest.trim();
 
@@ -310,6 +313,7 @@ async fn handle_command(core: &Arc<Core>, command: &str) {
             None => "Not set up yet.".into(),
         },
         "model" => model_command(core, rest).await,
+        "key" | "apikey" => key_command(core, rest, where_said).await,
         "a" | "answer" => answer_command(core, rest).await,
         "sh" | "run" => master::shell(core, rest, None, None, Origin::Telegram).await,
         "cd" => cd_command(core, rest).await,
@@ -466,6 +470,139 @@ fn model_examples(provider: crate::config::Provider) -> &'static str {
     }
 }
 
+/// `/key` — hand telepager an api key for a model provider. Changing this is
+/// remote control, and the message it arrives in gets deleted.
+async fn key_command(core: &Arc<Core>, rest: &str, where_said: Option<(i64, i64)>) -> String {
+    let Some(cfg) = core.config().await else {
+        return "Not set up yet.".into();
+    };
+    let master = &cfg.master;
+
+    if rest.is_empty() {
+        return format!("{}\n\n{KEY_HELP}", key_summary(master));
+    }
+
+    if !cfg.permissions.remote_control {
+        return format!(
+            "{}\n\nchanging it from telegram is off — turn remote control on in \
+             the console's Settings.",
+            key_summary(master)
+        );
+    }
+
+    let (word, remainder) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let remainder = remainder.trim();
+
+    // the forms that name no secret leave no trace to clean up
+    let housekeeping = ["clear", "forget", "env"].iter().any(|w| word.eq_ignore_ascii_case(w));
+    let taken_down = match where_said {
+        Some((chat, id)) if !housekeeping => core.unsend(chat, id).await,
+        _ => false,
+    };
+    let note = |text: String| match (housekeeping, taken_down) {
+        (true, _) => text,
+        (false, true) => format!("{text}\n\n(deleted the message you typed it in)"),
+        (false, false) => format!("{text}\n\n⚠️ delete the message you typed it in — I couldn't."),
+    };
+
+    // /key clear — forget the one that's saved
+    if word.eq_ignore_ascii_case("clear") || word.eq_ignore_ascii_case("forget") {
+        let updated = MasterConfig { api_key: None, api_key_env: None, ..master.clone() };
+        return match save(core, &updated).await {
+            Err(e) => e,
+            Ok(()) => format!("Forgot it. {}", key_summary(&updated)),
+        };
+    }
+
+    // /key env NAME — read it from the environment instead of storing it
+    if word.eq_ignore_ascii_case("env") {
+        if remainder.is_empty() {
+            return "Say which variable, e.g. /key env OPENROUTER_API_KEY.".into();
+        }
+        let updated = MasterConfig {
+            api_key: None,
+            api_key_env: Some(remainder.to_string()),
+            ..master.clone()
+        };
+        return match save(core, &updated).await {
+            Err(e) => e,
+            Ok(()) => key_summary(&updated),
+        };
+    }
+
+    // /key <provider> <secret>, or /key <secret> for the provider in use
+    let (provider, base_url, secret) = match Provider::named(word) {
+        Some(_) if remainder.is_empty() => {
+            return format!("Say the key too, e.g. /key {word} sk-….");
+        }
+        Some((provider, base)) => (provider, base.map(str::to_string), remainder),
+        None => (master.provider, master.base_url.clone(), rest),
+    };
+
+    if provider.is_cli() {
+        return format!("{} signs in itself — it has no key to give.", provider.as_str());
+    }
+
+    let switched = provider != master.provider;
+    let updated = MasterConfig {
+        provider,
+        // a model name means nothing to a provider that never heard of it
+        model: if switched { String::new() } else { master.model.clone() },
+        api_key: Some(secret.to_string()),
+        api_key_env: None,
+        base_url,
+        ..master.clone()
+    };
+    match save(core, &updated).await {
+        Err(e) => e,
+        Ok(()) => {
+            if switched {
+                // a session id or half a tool call means nothing to the next one
+                core.master.lock().await.clear();
+            }
+            note(key_summary(&updated))
+        }
+    }
+}
+
+/// Save a master block and pick the config back up, or say why not.
+async fn save(core: &Arc<Core>, master: &MasterConfig) -> std::result::Result<(), String> {
+    if let Err(e) = crate::config::save_master(core.config_path.as_deref(), master) {
+        return Err(format!("Could not save that: {e:#}"));
+    }
+    core.reload_config().await;
+    Ok(())
+}
+
+/// What's set, without ever saying the key itself.
+fn key_summary(master: &MasterConfig) -> String {
+    let provider = master.provider.as_str();
+    if master.provider.is_cli() {
+        return format!("The master agent is on {provider}, which signs in itself.");
+    }
+    let source = if master.api_key.as_deref().map(str::trim).is_some_and(|k| !k.is_empty()) {
+        "a key you gave me".to_string()
+    } else if let Some(name) = master.api_key_env.as_deref().filter(|n| !n.trim().is_empty()) {
+        format!("${name}")
+    } else if master.resolve_key().is_some() {
+        format!("${}", master.provider.default_key_env())
+    } else {
+        "no key at all".to_string()
+    };
+    format!(
+        "The master agent is on {provider} at {}, using {source}.",
+        master.base_url_or_default()
+    )
+}
+
+const KEY_HELP: &str = "\
+/key <secret> saves one for the provider in use.
+/key openrouter <secret> switches provider and address in one go — groq and \
+together work the same way, as do anthropic, openai, gemini and ollama.
+/key env OPENROUTER_API_KEY reads it from the environment instead, so nothing \
+secret goes through telegram.
+/key clear forgets it.";
+
 /// The question `/settings` asks belongs to no session — it's about the app.
 const SETTINGS_SESSION: &str = "settings";
 
@@ -574,6 +711,7 @@ or \"what's running?\".
 
 /a <text>  answer the question something is waiting on
 /model <m> which model I think on, e.g. /model opus
+/key <k>   an api key for a provider, e.g. /key openrouter sk-…
 /sh <cmd>  run a command in the working directory
 /cd <dir>  set that working directory
 /kill <s>  stop a running session
@@ -685,6 +823,8 @@ mod tests {
 
     fn message(text: &str, reply_to: Option<i64>) -> IncomingMessage {
         IncomingMessage {
+            message_id: 0,
+            chat: None,
             from: None,
             text: Some(text.to_string()),
             reply_to_message: reply_to.map(|message_id| SentMessage { message_id }),
@@ -758,10 +898,10 @@ mod tests {
         let c = core();
         // reaching telegram is a no-op unconfigured; this is checking it
         // doesn't panic on the way
-        handle_command(&c, "help").await;
-        handle_command(&c, "status").await;
-        handle_command(&c, "agents").await;
-        handle_command(&c, "ui").await;
+        handle_command(&c, "help", None).await;
+        handle_command(&c, "status", None).await;
+        handle_command(&c, "agents", None).await;
+        handle_command(&c, "ui", None).await;
     }
 
     #[tokio::test]
@@ -769,7 +909,7 @@ mod tests {
         let c = core();
         c.master.lock().await.push(crate::llm::Msg::User("hello".into()));
         assert!(!c.master.lock().await.transcript().is_empty());
-        handle_command(&c, "new").await;
+        handle_command(&c, "new", None).await;
         assert!(c.master.lock().await.transcript().is_empty());
     }
 
@@ -876,11 +1016,12 @@ mod tests {
     #[tokio::test]
     async fn the_new_commands_do_not_panic_with_no_config() {
         let c = core();
-        handle_command(&c, "sh echo hi").await;
-        handle_command(&c, "cd /tmp").await;
-        handle_command(&c, "settings").await;
-        handle_command(&c, "model opus").await;
-        handle_command(&c, "kill s9").await;
+        handle_command(&c, "sh echo hi", None).await;
+        handle_command(&c, "cd /tmp", None).await;
+        handle_command(&c, "settings", None).await;
+        handle_command(&c, "model opus", None).await;
+        handle_command(&c, "key openrouter sk-nope", None).await;
+        handle_command(&c, "kill s9", None).await;
     }
 
     #[tokio::test]
@@ -989,6 +1130,94 @@ mod tests {
         let back = model_command(&c, "default").await;
         assert!(back.contains("whatever claude is set to"), "{back}");
         assert!(crate::config::load(Some(&path)).unwrap().master.model.is_empty());
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_key_is_read_only_until_remote_control_is_on() {
+        let (c, dir, server) = configured("key-ro", Default::default(), vec![]).await;
+        let path = dir.join("config.json");
+
+        let out = key_command(&c, "", None).await;
+        assert!(out.contains("signs in itself"), "{out}");
+
+        let refused = key_command(&c, "openrouter sk-or-secret", None).await;
+        assert!(refused.contains("changing it from telegram is off"), "{refused}");
+        assert!(crate::config::load(Some(&path)).unwrap().master.api_key.is_none());
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn naming_a_service_sets_its_address_along_with_the_key() {
+        let permissions = crate::config::Permissions {
+            remote_control: true,
+            ..Default::default()
+        };
+        let (c, dir, server) = configured("key-service", permissions.clone(), vec![]).await;
+        let path = dir.join("config.json");
+        crate::config::save_permissions(Some(&path), &permissions).unwrap();
+
+        let out = key_command(&c, "openrouter sk-or-secret", None).await;
+        // the reply says where it's pointed, and never the key itself
+        assert!(out.contains("openrouter.ai"), "{out}");
+        assert!(!out.contains("sk-or-secret"), "{out}");
+
+        let saved = crate::config::load(Some(&path)).unwrap().master;
+        assert_eq!(saved.provider.as_str(), "openai");
+        assert_eq!(saved.api_key.as_deref(), Some("sk-or-secret"));
+        assert_eq!(saved.base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+        // an old model name means nothing to a provider that never heard of it
+        assert!(saved.model.is_empty());
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_key_can_live_in_the_environment_instead() {
+        let permissions = crate::config::Permissions {
+            remote_control: true,
+            ..Default::default()
+        };
+        let (c, dir, server) = configured("key-env", permissions.clone(), vec![]).await;
+        let path = dir.join("config.json");
+        crate::config::save_permissions(Some(&path), &permissions).unwrap();
+
+        key_command(&c, "openrouter sk-or-secret", None).await;
+        let out = key_command(&c, "env OPENROUTER_API_KEY", None).await;
+        assert!(out.contains("$OPENROUTER_API_KEY"), "{out}");
+
+        let saved = crate::config::load(Some(&path)).unwrap().master;
+        assert!(saved.api_key.is_none(), "the stored key should be gone");
+        assert_eq!(saved.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+
+        // and clearing takes both away
+        let out = key_command(&c, "clear", None).await;
+        assert!(out.contains("Forgot it"), "{out}");
+        let saved = crate::config::load(Some(&path)).unwrap().master;
+        assert!(saved.api_key_env.is_none());
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_cli_backend_has_no_key_to_give() {
+        let permissions = crate::config::Permissions {
+            remote_control: true,
+            ..Default::default()
+        };
+        let (c, dir, server) = configured("key-cli", permissions.clone(), vec![]).await;
+        let path = dir.join("config.json");
+        crate::config::save_permissions(Some(&path), &permissions).unwrap();
+
+        let out = key_command(&c, "claude-code sk-nope", None).await;
+        assert!(out.contains("signs in itself"), "{out}");
+        assert!(crate::config::load(Some(&path)).unwrap().master.api_key.is_none());
 
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
