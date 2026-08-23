@@ -37,7 +37,7 @@ jobs:
             os: windows-latest
             ext: .exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify Cargo.toml version matches the tag
         shell: bash
@@ -75,7 +75,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/telepager${{ matrix.ext }}" \
              "dist/telepager-${{ matrix.target }}${{ matrix.ext }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: telepager-${{ matrix.target }}
           path: dist/*
@@ -85,7 +85,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: staged
 
@@ -105,7 +105,7 @@ jobs:
             dist/telepager-*
 
       # the npm job needs the binaries to build the per-platform packages
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -115,9 +115,9 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
@@ -125,7 +125,7 @@ jobs:
       # trusted publishing needs a recent npm
       - run: npm install -g npm@latest
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
