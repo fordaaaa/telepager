@@ -143,6 +143,8 @@ pub async fn reply(core: &Arc<Core>, cfg: &Config, text: &str, origin: Origin) -
 struct Plan {
     args: Vec<String>,
     env: Vec<(String, String)>,
+    /// Variables to take away from the child before `env` is applied.
+    unset: Vec<String>,
 }
 
 /// Build the master CLI's command without running it.
@@ -160,6 +162,10 @@ fn build_command(program: &Path, plan: &Plan, workdir: &Path) -> tokio::process:
         .stderr(Stdio::piped())
         .env("NO_COLOR", "1")
         .kill_on_drop(true);
+    // removals first, so a plan can put something back deliberately
+    for key in &plan.unset {
+        cmd.env_remove(key);
+    }
     for (key, value) in &plan.env {
         cmd.env(key, value);
     }
@@ -343,7 +349,30 @@ fn claude_plan(
     }
 
     args.extend(master.args.iter().cloned());
-    Plan { args, env: Vec::new() }
+
+    // claude code takes an api key out of the environment over the login you
+    // did in the terminal, and headless it never says so. picking this
+    // provider means "use my login", so a key only rides along when the config
+    // asked for one by name.
+    let (env, unset) = match named_key(master) {
+        Some(key) => (vec![("ANTHROPIC_API_KEY".to_string(), key)], Vec::new()),
+        None => (
+            Vec::new(),
+            vec!["ANTHROPIC_API_KEY".to_string(), "ANTHROPIC_AUTH_TOKEN".to_string()],
+        ),
+    };
+
+    Plan { args, env, unset }
+}
+
+/// A key the config actually asked for, rather than one that happens to be
+/// exported. Only the first kind should reach a cli that has its own login.
+fn named_key(master: &crate::config::MasterConfig) -> Option<String> {
+    if let Some(key) = master.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        return Some(key.to_string());
+    }
+    let name = master.api_key_env.as_deref().map(str::trim).filter(|n| !n.is_empty())?;
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 fn opencode_plan(
@@ -399,6 +428,8 @@ fn opencode_plan(
     Plan {
         args,
         env: vec![("OPENCODE_CONFIG_CONTENT".into(), config)],
+        // opencode carries its own logins, and none of them are ours to strip
+        unset: Vec::new(),
     }
 }
 
@@ -595,6 +626,27 @@ mod tests {
     }
 
     #[test]
+    fn an_exported_api_key_does_not_reach_claude_code() {
+        // the whole point of this backend is the login, and claude code would
+        // quietly prefer the key
+        let plan = claude_plan(&exe(), &master(Provider::ClaudeCode), "s", "t", None, Origin::Ui);
+        assert!(plan.unset.contains(&"ANTHROPIC_API_KEY".to_string()));
+        assert!(plan.unset.contains(&"ANTHROPIC_AUTH_TOKEN".to_string()));
+        assert!(plan.env.is_empty());
+    }
+
+    #[test]
+    fn a_key_the_config_asked_for_is_handed_over() {
+        let with_key = MasterConfig {
+            api_key: Some("sk-test".into()),
+            ..master(Provider::ClaudeCode)
+        };
+        let plan = claude_plan(&exe(), &with_key, "s", "t", None, Origin::Ui);
+        assert_eq!(plan.env, vec![("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())]);
+        assert!(plan.unset.is_empty());
+    }
+
+    #[test]
     fn opencode_carries_its_config_inline_so_the_users_file_is_untouched() {
         let plan = opencode_plan(&exe(), &master(Provider::Opencode), "SYS", "do it", None, Origin::Ui);
 
@@ -722,7 +774,7 @@ mod tests {
 
     #[cfg(unix)]
     fn shell_plan(script: &str) -> Plan {
-        Plan { args: vec!["-c".into(), script.into()], env: Vec::new() }
+        Plan { args: vec!["-c".into(), script.into()], env: Vec::new(), unset: Vec::new() }
     }
 
     #[cfg(unix)]
