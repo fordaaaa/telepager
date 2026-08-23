@@ -141,6 +141,30 @@ Or a model API directly, set via env var or in the console's **Settings**:
 `{task}` is passed as a single argument — no shell, so quotes and semicolons
 in a task are inert.
 
+Set `"pty": true` to run an agent on a real terminal, so the console draws its
+screen instead of a line log. The `-tui` presets do this. The trade: telepager
+holds that terminal, so a `pty` agent ends when telepager does, while a piped
+one keeps going without it.
+
+### Shell access
+
+Off until you turn it on, in the console's settings or in the config:
+
+```json
+{
+  "permissions": {
+    "shell": false,
+    "remote_control": false,
+    "confirm_destructive": true
+  }
+}
+```
+
+`shell` lets the master agent run commands — from Telegram only inside
+`allowed_dirs`. `remote_control` lets these settings be changed from Telegram.
+`confirm_destructive` asks first when a command looks like it deletes
+something. Every run is announced to everyone on the allowlist.
+
 ## As an MCP server
 
 Let an agent page *you*:
@@ -196,6 +220,10 @@ Also read from `./telepager.config.json`; `--config PATH` overrides the lookup.
 - Prefer `TELEGRAM_BOT_TOKEN` over the plaintext config; the file is `0600`.
   Anyone with the bot token can act as your bot.
 - Telegram isn't end-to-end encrypted — don't page real secrets through it.
+- Turning `shell` on means whoever has your Telegram can run commands as you.
+  `allowed_dirs` is the boundary; the destructive-command prompt is a seatbelt,
+  not a fence — a shell inside an allowed directory can still reach the rest of
+  your machine.
 - Keys are scrubbed from every error before it's logged or sent anywhere.
 
 To keep the old, inert pager-only behavior: leave `allowed_dirs` empty and
@@ -209,6 +237,8 @@ skip configuring a master agent.
   agent may leave grandchildren behind.
 - `telepager start` leaves a process running after your terminal is gone;
   `telepager stop` ends it.
+- An agent on a `pty` ends when telepager does. Use the headless presets for
+  anything that should outlive it.
 
 ## License
 
