@@ -196,11 +196,11 @@ impl Screen {
         self.grid.plain_lines().join("\n")
     }
 
-    /// The last `lines` lines of `to_plain_text`.
+    /// The last `lines` lines of `to_plain_text`. Walks back from the end
+    /// rather than rendering all of scrollback to keep a handful of rows —
+    /// the master polls this while a worker runs.
     pub fn tail_text(&self, lines: usize) -> String {
-        let all = self.grid.plain_lines();
-        let start = all.len().saturating_sub(lines);
-        all[start..].join("\n")
+        self.grid.tail_lines(lines).join("\n")
     }
 
     /// Lines that scrolled off the top since the last call, so the line-based
@@ -488,6 +488,12 @@ impl Grid {
         }
         self.wrap_next = false;
 
+        // a screen narrower than the glyph has nowhere to put it: wrapping
+        // would still leave the tail cell off the row
+        if width > self.cols {
+            return;
+        }
+
         // a double-width glyph never straddles the edge
         if self.cx + width > self.cols {
             if !self.autowrap {
@@ -535,6 +541,35 @@ impl Grid {
 
     /// Scrollback and screen as text, minus the empty tail a mostly-blank
     /// screen is full of.
+    /// The last `lines` non-trailing-blank rows, oldest first.
+    fn tail_lines(&self, lines: usize) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if lines == 0 {
+            return out;
+        }
+
+        let mut rows = self.scrollback.iter().chain(self.cells.iter()).rev();
+
+        // the trailing blanks `plain_lines` drops are the rows a mostly-empty
+        // screen ends with, so skip them before counting
+        for row in rows.by_ref() {
+            let text = row_text(row);
+            if !text.is_empty() {
+                out.push(text);
+                break;
+            }
+        }
+        while out.len() < lines {
+            match rows.next() {
+                Some(row) => out.push(row_text(row)),
+                None => break,
+            }
+        }
+
+        out.reverse();
+        out
+    }
+
     fn plain_lines(&self) -> Vec<String> {
         let mut out: Vec<String> =
             self.scrollback.iter().chain(self.cells.iter()).map(|r| row_text(r)).collect();
@@ -592,14 +627,45 @@ fn row_text(row: &[Cell]) -> String {
     out
 }
 
+/// vte's own cap on how many parameters a csi can carry.
+const MAX_PARAMS: usize = 32;
+
 /// A csi's parameters, flattened so `38:5:1` and `38;5;1` read the same.
-fn args(params: &vte::Params) -> Vec<Vec<u16>> {
-    params.iter().map(|p| p.to_vec()).collect()
+///
+/// Borrowed and stack-held: this runs for every escape sequence a redrawing
+/// tui emits, and the `Vec<Vec<u16>>` it used to build was a heap allocation
+/// per parameter before dispatch had even looked at the action.
+struct Args<'a> {
+    slots: [&'a [u16]; MAX_PARAMS],
+    len: usize,
+}
+
+impl<'a> Args<'a> {
+    fn new(params: &'a vte::Params) -> Self {
+        let mut slots = [&[][..]; MAX_PARAMS];
+        let mut len = 0;
+        for p in params.iter() {
+            if len == MAX_PARAMS {
+                break;
+            }
+            slots[len] = p;
+            len += 1;
+        }
+        Args { slots, len }
+    }
+}
+
+impl<'a> std::ops::Deref for Args<'a> {
+    type Target = [&'a [u16]];
+
+    fn deref(&self) -> &Self::Target {
+        &self.slots[..self.len]
+    }
 }
 
 /// One parameter; 0 and absent both mean the default, as they do everywhere
 /// this is used.
-fn arg(all: &[Vec<u16>], index: usize, default: usize) -> usize {
+fn arg(all: &[&[u16]], index: usize, default: usize) -> usize {
     match all.get(index).and_then(|p| p.first()).copied() {
         Some(0) | None => default,
         Some(v) => v as usize,
@@ -665,7 +731,7 @@ impl vte::Perform for Grid {
         if ignore {
             return;
         }
-        let all = args(params);
+        let all = Args::new(params);
         let private = intermediates.first() == Some(&b'?');
 
         // a different namespace entirely
@@ -673,7 +739,7 @@ impl vte::Perform for Grid {
             match action {
                 'h' | 'l' => {
                     let on = action == 'h';
-                    for p in &all {
+                    for p in all.iter() {
                         match p.first().copied().unwrap_or(0) {
                             7 => self.autowrap = on,
                             25 => self.visible = on,
@@ -847,7 +913,7 @@ impl vte::Perform for Grid {
 
 impl Grid {
     /// Select graphic rendition — colours and attributes.
-    fn sgr(&mut self, all: &[Vec<u16>]) {
+    fn sgr(&mut self, all: &[&[u16]]) {
         if all.is_empty() {
             self.pen = Pen::default();
             return;
@@ -874,14 +940,25 @@ impl Grid {
                     let (color, used) = if param.len() > 1 {
                         (extended(&param[1..]), 0)
                     } else {
-                        let rest: Vec<u16> =
-                            all[i + 1..].iter().filter_map(|p| p.first().copied()).collect();
+                        // 2;r;g;b is the longest form `extended` reads
+                        let mut buf = [0u16; 4];
+                        let mut n = 0;
+                        for p in &all[i + 1..] {
+                            match (n < buf.len(), p.first()) {
+                                (true, Some(v)) => {
+                                    buf[n] = *v;
+                                    n += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        let rest = &buf[..n];
                         let used = match rest.first() {
                             Some(5) => 2,
                             Some(2) => 4,
                             _ => 0,
                         };
-                        (extended(&rest), used)
+                        (extended(rest), used)
                     };
                     if let Some(color) = color {
                         if code == 38 {
@@ -1134,6 +1211,15 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_character_on_a_one_column_screen_is_dropped_not_a_panic() {
+        // the console can ask for a single column, and an agent can print cjk
+        // into it — writing the tail cell used to index off the end of the row
+        let mut s = Screen::new(1, 4);
+        s.feed("漢a".as_bytes());
+        assert_eq!(lines(&s)[0], "a");
+    }
+
+    #[test]
     fn combining_marks_do_not_consume_a_column() {
         let mut s = screen();
         s.feed("e\u{0301}x".as_bytes());
@@ -1275,6 +1361,22 @@ mod tests {
         s.feed(b"a\r\n\r\nb");
         assert_eq!(s.to_plain_text(), "a\n\nb");
         assert_eq!(s.tail_text(2), "\nb");
+    }
+
+    #[test]
+    fn the_tail_is_the_end_of_the_plain_text_however_much_is_asked_for() {
+        let mut s = screen();
+        s.feed(b"one\r\ntwo\r\nthree");
+        // the whole thing, the end of it, and none of it
+        assert_eq!(s.tail_text(99), s.to_plain_text());
+        assert_eq!(s.tail_text(2), "two\nthree");
+        assert_eq!(s.tail_text(0), "");
+
+        // and it still starts counting past the blank rows a short screen ends
+        // with, the way plain_lines does
+        let mut short = Screen::new(10, 6);
+        short.feed(b"a\r\nb");
+        assert_eq!(short.tail_text(1), "b");
     }
 
     #[test]

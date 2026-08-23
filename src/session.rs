@@ -377,8 +377,9 @@ impl Registry {
         self.sessions.remove(id).is_some()
     }
 
-    /// Append an event to a session's log and publish it on the bus.
-    pub fn record(&mut self, session: Option<&str>, kind: EventKind) -> Event {
+    /// Append an event to a session's log and publish it on the bus. Returns
+    /// the sequence number it was given.
+    pub fn record(&mut self, session: Option<&str>, kind: EventKind) -> u64 {
         let event = Event {
             seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
             session: session.map(str::to_string),
@@ -386,42 +387,51 @@ impl Registry {
             kind,
         };
 
+        let seq = event.seq;
+        // no subscribers is the normal case when nothing has the ui open, so
+        // the bus gets the copy and the log keeps the original
+        let _ = self.tx.send(event.clone());
+
         match session.and_then(|id| self.sessions.get_mut(id)) {
             Some(s) => {
-                s.events.push_back(event.clone());
+                s.events.push_back(event);
                 while s.events.len() > MAX_EVENTS_PER_SESSION {
                     s.events.pop_front();
                 }
             }
             None => {
-                self.recent.push_back(event.clone());
+                self.recent.push_back(event);
                 while self.recent.len() > 200 {
                     self.recent.pop_front();
                 }
             }
         }
 
-        // no subscribers is the normal case when nothing has the ui open
-        let _ = self.tx.send(event.clone());
-        event
+        seq
     }
 
     /// Everything a page needs to draw itself on first load.
     pub fn snapshot(&self, session: Option<&str>, limit: usize) -> Vec<Event> {
-        let mut events: Vec<Event> = match session {
-            Some(id) => self.sessions.get(id).map(|s| s.events.iter().cloned().collect()).unwrap_or_default(),
+        // only the tail is ever returned, and this runs under the lock every
+        // output line takes — so clone what's returned, not the whole log
+        match session {
+            Some(id) => self
+                .sessions
+                .get(id)
+                .map(|s| s.events.iter().rev().take(limit).rev().cloned().collect())
+                .unwrap_or_default(),
             None => {
-                let mut all: Vec<Event> = self.recent.iter().cloned().collect();
+                // each log is already ordered by seq, so nothing outside a
+                // log's own last `limit` can make the merged cut
+                let mut all: Vec<&Event> = self.recent.iter().rev().take(limit).rev().collect();
                 for s in self.sessions.values() {
-                    all.extend(s.events.iter().cloned());
+                    all.extend(s.events.iter().rev().take(limit).rev());
                 }
                 all.sort_by_key(|e| e.seq);
-                all
+                let start = all.len().saturating_sub(limit);
+                all[start..].iter().map(|e| (*e).clone()).collect()
             }
-        };
-        let start = events.len().saturating_sub(limit);
-        events.drain(..start);
-        events
+        }
     }
 }
 
@@ -547,7 +557,7 @@ mod tests {
         let b = r.open(Kind::Attached, "b".into(), None, None, None);
         let first = r.record(Some(&a), EventKind::Notice { text: "1".into() });
         let second = r.record(Some(&b), EventKind::Notice { text: "2".into() });
-        assert!(second.seq > first.seq);
+        assert!(second > first);
     }
 
     #[test]
@@ -575,6 +585,31 @@ mod tests {
 
         let just_a = r.snapshot(Some(&a), 100);
         assert!(just_a.iter().all(|e| e.session.as_deref() == Some(a.as_str())));
+    }
+
+    #[test]
+    fn snapshot_returns_the_newest_events_up_to_the_limit() {
+        let mut r = registry();
+        let a = r.open(Kind::Attached, "a".into(), None, None, None);
+        let b = r.open(Kind::Attached, "b".into(), None, None, None);
+        for i in 0..20 {
+            r.record(Some(&a), EventKind::Notice { text: format!("a{i}") });
+            r.record(Some(&b), EventKind::Notice { text: format!("b{i}") });
+        }
+
+        let merged = r.snapshot(None, 5);
+        assert_eq!(merged.len(), 5);
+        // the newest five overall, still in order
+        let seqs: Vec<u64> = merged.iter().map(|e| e.seq).collect();
+        let mut sorted = seqs.clone();
+        sorted.sort();
+        assert_eq!(seqs, sorted);
+        assert_eq!(merged.last().map(|e| e.seq), Some(r.seq.load(Ordering::Relaxed)));
+
+        let just_a = r.snapshot(Some(&a), 5);
+        assert_eq!(just_a.len(), 5);
+        assert!(just_a.iter().all(|e| e.session.as_deref() == Some(a.as_str())));
+        assert!(matches!(&just_a[0].kind, EventKind::Notice { text } if text == "a15"));
     }
 
     #[test]

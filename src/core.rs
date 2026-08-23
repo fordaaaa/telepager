@@ -125,6 +125,10 @@ pub struct Core {
     next_question: Mutex<u64>,
     /// The master agent's conversation, if it's been used.
     pub master: Mutex<crate::master::Conversation>,
+    /// Held for a whole master turn. Telegram runs a task per message, and two
+    /// turns pushing into one history interleave into an ordering no provider
+    /// will accept back.
+    pub master_turn: Mutex<()>,
     /// Woken when the config changes, so the Telegram poller restarts.
     pub config_changed: Notify,
     ui: RwLock<Option<UiInfo>>,
@@ -159,6 +163,7 @@ impl Core {
             processes: Mutex::new(HashMap::new()),
             next_question: Mutex::new(0),
             master: Mutex::new(crate::master::Conversation::default()),
+            master_turn: Mutex::new(()),
             config_changed: Notify::new(),
             ui: RwLock::new(None),
             work_dir: RwLock::new(None),
