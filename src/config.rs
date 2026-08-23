@@ -276,6 +276,11 @@ pub struct AgentPreset {
     /// Whether this agent keeps reading stdin after it starts, which decides
     /// if "send a follow-up" is offered for its sessions.
     pub interactive: bool,
+    /// Run it on a real terminal, so the console can draw its screen instead of
+    /// a line log. Off by default, and the reason is worth knowing: telepager
+    /// holds the terminal, so a pty agent dies when telepager does. A piped one
+    /// keeps going. Turn it on for a tui agent you want to watch.
+    pub pty: bool,
 }
 
 /// The coding CLIs telepager knows how to drive out of the box. Anything on
@@ -283,7 +288,9 @@ pub struct AgentPreset {
 /// under `agents` in the config file.
 pub fn builtin_agents() -> BTreeMap<String, AgentPreset> {
     let mut m = BTreeMap::new();
-    let mut add = |name: &str, command: &str, args: &[&str], description: &str| {
+    // `watch` picks the pair that go together: a real terminal to draw on, and
+    // stdin left open so you can type a follow-up at it.
+    let mut add = |name: &str, command: &str, args: &[&str], watch: bool, description: &str| {
         m.insert(
             name.to_string(),
             AgentPreset {
@@ -291,31 +298,43 @@ pub fn builtin_agents() -> BTreeMap<String, AgentPreset> {
                 args: args.iter().map(|s| s.to_string()).collect(),
                 description: description.to_string(),
                 env: BTreeMap::new(),
-                interactive: false,
+                interactive: watch,
+                pty: watch,
             },
         );
     };
 
-    add("claude", "claude", &["-p", "{task}", "--permission-mode", "acceptEdits"],
+    add("claude", "claude", &["-p", "{task}", "--permission-mode", "acceptEdits"], false,
         "Claude Code, headless");
-    add("codex", "codex", &["exec", "--full-auto", "{task}"],
+    add("codex", "codex", &["exec", "--full-auto", "{task}"], false,
         "OpenAI Codex CLI");
-    add("gemini", "gemini", &["-y", "-p", "{task}"],
+    add("gemini", "gemini", &["-y", "-p", "{task}"], false,
         "Google Gemini CLI");
-    add("opencode", "opencode", &["run", "{task}"],
+    add("opencode", "opencode", &["run", "{task}"], false,
         "opencode, any model it's configured with");
-    add("cursor", "cursor-agent", &["-p", "{task}", "--force"],
+    add("cursor", "cursor-agent", &["-p", "{task}", "--force"], false,
         "Cursor CLI agent");
-    add("amp", "amp", &["-x", "{task}"],
+    add("amp", "amp", &["-x", "{task}"], false,
         "Sourcegraph Amp");
-    add("aider", "aider", &["--yes", "--no-check-update", "--message", "{task}"],
+    add("aider", "aider", &["--yes", "--no-check-update", "--message", "{task}"], false,
         "aider, any model it's configured with");
-    add("crush", "crush", &["run", "{task}"],
+    add("crush", "crush", &["run", "{task}"], false,
         "Charm Crush");
-    add("qwen", "qwen", &["-y", "-p", "{task}"],
+    add("qwen", "qwen", &["-y", "-p", "{task}"], false,
         "Qwen Code CLI");
-    add("goose", "goose", &["run", "-t", "{task}"],
+    add("goose", "goose", &["run", "-t", "{task}"], false,
         "Block Goose");
+
+    // the same agents, but on screen. telepager holds the terminal, so unlike
+    // the headless ones above these end when telepager does.
+    add("claude-tui", "claude", &["{task}"], true,
+        "Claude Code, on screen — ends when telepager does");
+    add("codex-tui", "codex", &["{task}"], true,
+        "Codex, on screen — ends when telepager does");
+    add("gemini-tui", "gemini", &["-i", "{task}"], true,
+        "Gemini, on screen — ends when telepager does");
+    add("opencode-tui", "opencode", &["{task}"], true,
+        "opencode, on screen — ends when telepager does");
     m
 }
 

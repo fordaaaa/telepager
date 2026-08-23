@@ -1398,7 +1398,8 @@ pub(crate) mod tests {
                     "tui": {
                         "command": "sh",
                         "args": ["-c", "printf 'hello\\r\\n'; sleep 20"],
-                        "interactive": true
+                        "interactive": true,
+                        "pty": true
                     }
                 }
             })

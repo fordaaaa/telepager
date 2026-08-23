@@ -5,8 +5,9 @@
 //! telepager owns its pipes: stdout and stderr become session events, stdin
 //! stays open so a follow-up can be typed at it, and the child can be killed.
 //!
-//! An `interactive` preset gets a real pty instead — a tui agent draws nothing
-//! at all down a pipe. core turns that byte stream into a screen.
+//! A `pty` preset gets a real terminal instead — a tui agent draws nothing at
+//! all down a pipe. core turns that byte stream into a screen. The trade is
+//! that telepager holds the terminal, so those agents end when it does.
 //!
 //! This file deliberately knows nothing about the registry or Telegram. It
 //! resolves and launches processes; core wires the output up.
@@ -202,6 +203,7 @@ pub fn catalog(agents: &BTreeMap<String, AgentPreset>) -> Vec<Value> {
                 "installed": found.is_some(),
                 "path": found.map(|p| p.display().to_string()),
                 "interactive": preset.interactive,
+                "pty": preset.pty,
             })
         })
         .collect();
@@ -281,7 +283,7 @@ pub fn launch(preset: &AgentPreset, dir: &Path, task: &str) -> Result<Launched> 
     let mut rendered = vec![preset.command.clone()];
     rendered.extend(args.clone());
 
-    let (child, io) = if preset.interactive {
+    let (child, io) = if preset.pty {
         launch_on_pty(preset, &program, &args, dir)?
     } else {
         launch_on_pipes(preset, &program, &args, dir)?
@@ -641,6 +643,7 @@ mod tests {
             // both of these only answer the way we want on a tty
             args: vec!["-c".into(), "tty > /dev/null && echo yes; echo $TERM".into()],
             interactive: true,
+            pty: true,
             ..AgentPreset::default()
         };
         let mut launched = launch(&p, &std::env::temp_dir(), "").unwrap();
@@ -672,6 +675,7 @@ mod tests {
             command: "sh".into(),
             args: vec!["-c".into(), "sleep 30".into()],
             interactive: true,
+            pty: true,
             ..AgentPreset::default()
         };
         let mut launched = launch(&p, &std::env::temp_dir(), "").unwrap();
