@@ -377,8 +377,9 @@ impl Registry {
         self.sessions.remove(id).is_some()
     }
 
-    /// Append an event to a session's log and publish it on the bus.
-    pub fn record(&mut self, session: Option<&str>, kind: EventKind) -> Event {
+    /// Append an event to a session's log and publish it on the bus. Returns
+    /// the sequence number it was given.
+    pub fn record(&mut self, session: Option<&str>, kind: EventKind) -> u64 {
         let event = Event {
             seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
             session: session.map(str::to_string),
@@ -386,24 +387,27 @@ impl Registry {
             kind,
         };
 
+        let seq = event.seq;
+        // no subscribers is the normal case when nothing has the ui open, so
+        // the bus gets the copy and the log keeps the original
+        let _ = self.tx.send(event.clone());
+
         match session.and_then(|id| self.sessions.get_mut(id)) {
             Some(s) => {
-                s.events.push_back(event.clone());
+                s.events.push_back(event);
                 while s.events.len() > MAX_EVENTS_PER_SESSION {
                     s.events.pop_front();
                 }
             }
             None => {
-                self.recent.push_back(event.clone());
+                self.recent.push_back(event);
                 while self.recent.len() > 200 {
                     self.recent.pop_front();
                 }
             }
         }
 
-        // no subscribers is the normal case when nothing has the ui open
-        let _ = self.tx.send(event.clone());
-        event
+        seq
     }
 
     /// Everything a page needs to draw itself on first load.
@@ -553,7 +557,7 @@ mod tests {
         let b = r.open(Kind::Attached, "b".into(), None, None, None);
         let first = r.record(Some(&a), EventKind::Notice { text: "1".into() });
         let second = r.record(Some(&b), EventKind::Notice { text: "2".into() });
-        assert!(second.seq > first.seq);
+        assert!(second > first);
     }
 
     #[test]
