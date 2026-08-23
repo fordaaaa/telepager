@@ -825,10 +825,13 @@ mod tests {
         let (c, dir2, server) = configured("cd2", Default::default(), vec![root.clone()]).await;
         assert!(cd_command(&c, inside.to_str().unwrap()).await.contains("now"));
         assert_eq!(c.work_dir().await.unwrap(), inside.canonicalize().unwrap());
-        // somewhere real, but not allowed
-        assert!(cd_command(&c, "/etc").await.contains("not in allowed_dirs"));
-        // and a directory that isn't one
-        assert!(cd_command(&c, "/telepager-nope").await.contains("Could not use"));
+        // somewhere real, but not allowed. temp_dir holds root, so it's
+        // outside it — and unlike /etc it exists on windows too.
+        let outside = std::env::temp_dir();
+        assert!(cd_command(&c, outside.to_str().unwrap()).await.contains("not in allowed_dirs"));
+        // and a path that isn't a directory at all
+        let missing = root.join("nope");
+        assert!(cd_command(&c, missing.to_str().unwrap()).await.contains("Could not use"));
 
         server.abort();
         for d in [root, dir, dir2] {

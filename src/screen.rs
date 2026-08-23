@@ -298,9 +298,7 @@ impl Grid {
     }
 
     fn touch_all(&mut self) {
-        for flag in &mut self.touched {
-            *flag = true;
-        }
+        self.touched.fill(true);
     }
 
     // ---------------------------------------------------------- the cursor
