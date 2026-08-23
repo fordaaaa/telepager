@@ -302,6 +302,10 @@ fn launch_on_pty(
     // the whole point: a terminal the agent will actually draw on
     cmd.env("TERM", "xterm-256color");
     cmd.env_remove("NO_COLOR");
+    // removals first, so a preset's own env can put one back deliberately
+    for key in &preset.unset {
+        cmd.env_remove(key);
+    }
     for (key, value) in &preset.env {
         cmd.env(key, value);
     }
@@ -342,6 +346,9 @@ fn launch_on_pipes(
     // holds the `Child`, so dropping the process table — or unwinding out of an
     // unrelated error — SIGKILLs every running agent with nothing to tell the
     // user why. agents end in one place, `kill_tree` from `kill_agent`.
+    for key in &preset.unset {
+        cmd.env_remove(key);
+    }
     for (key, value) in &preset.env {
         cmd.env(key, value);
     }
@@ -634,6 +641,43 @@ mod tests {
 
         assert!(text.contains("yes"), "the agent was not on a tty: {text:?}");
         assert!(text.contains("xterm-256color"), "TERM was not set: {text:?}");
+        launched.child.wait().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_preset_can_take_a_variable_away_from_its_agent() {
+        let Some(_) = which("sh") else { return };
+        // an inherited variable the test can be sure of, rather than one it sets
+        let Ok(_) = std::env::var("HOME") else { return };
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("TELEPAGER_KEPT".to_string(), "yes".to_string());
+        let p = AgentPreset {
+            command: "sh".into(),
+            args: vec!["-c".into(), "echo [${HOME:-gone}] [$TELEPAGER_KEPT]".into()],
+            unset: vec!["HOME".into()],
+            env,
+            interactive: true,
+            pty: true,
+            ..AgentPreset::default()
+        };
+        let mut launched = launch(&p, &std::env::temp_dir(), "").unwrap();
+
+        let Io::Pty { reader, .. } = &mut launched.io else {
+            panic!("a pty preset should get a pty");
+        };
+        let mut reader = std::mem::replace(reader, Box::new(std::io::empty()));
+        let text = tokio::task::spawn_blocking(move || {
+            let mut buf = Vec::new();
+            let _ = reader.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+        .await
+        .unwrap();
+
+        assert!(text.contains("[gone]"), "HOME survived: {text:?}");
+        assert!(text.contains("[yes]"), "the preset's own env did not: {text:?}");
         launched.child.wait().await.unwrap();
     }
 

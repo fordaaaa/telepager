@@ -265,6 +265,9 @@ pub struct AgentPreset {
     pub description: String,
     /// Extra env for the child, e.g. a per-agent API key.
     pub env: BTreeMap<String, String>,
+    /// Variables to take away from the child before `env` is applied, for a
+    /// CLI that would rather use an exported key than the login it already has.
+    pub unset: Vec<String>,
     /// Whether this agent keeps reading stdin after it starts, which decides
     /// if "send a follow-up" is offered for its sessions.
     pub interactive: bool,
@@ -288,6 +291,7 @@ pub fn builtin_agents() -> BTreeMap<String, AgentPreset> {
                 args: args.iter().map(|s| s.to_string()).collect(),
                 description: description.to_string(),
                 env: BTreeMap::new(),
+                unset: Vec::new(),
                 interactive: watch,
                 pty: watch,
             },
@@ -325,6 +329,16 @@ pub fn builtin_agents() -> BTreeMap<String, AgentPreset> {
         "Gemini, on screen — ends when telepager does");
     add("opencode-tui", "opencode", &["{task}"], true,
         "opencode, on screen — ends when telepager does");
+
+    // a claude worker is the claude code login, the same way the master's
+    // claude-code backend is. an exported key would quietly replace it, and
+    // headless there's no prompt to notice. put one back with `env` if that's
+    // what you actually want.
+    for preset in m.values_mut() {
+        if preset.command == "claude" {
+            preset.unset = vec!["ANTHROPIC_API_KEY".into(), "ANTHROPIC_AUTH_TOKEN".into()];
+        }
+    }
     m
 }
 
@@ -712,6 +726,20 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("api_key"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_claude_presets_run_on_the_login_not_an_exported_key() {
+        let m = builtin_agents();
+        for name in ["claude", "claude-tui"] {
+            assert!(
+                m[name].unset.contains(&"ANTHROPIC_API_KEY".to_string()),
+                "{name} would inherit a key"
+            );
+        }
+        // and nothing else is touched — those clis have their own arrangements
+        assert!(m["codex"].unset.is_empty());
+        assert!(m["opencode"].unset.is_empty());
     }
 
     #[test]
