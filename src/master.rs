@@ -249,6 +249,10 @@ pub(crate) fn tools() -> Vec<ToolDef> {
 
 /// Handle one message to the master agent and return what to say back.
 pub async fn reply(core: &Arc<Core>, text: &str, origin: Origin) -> Result<String> {
+    // one turn at a time: a second message arriving mid-turn would otherwise
+    // interleave its tool calls into the same history
+    let _turn = core.master_turn.lock().await;
+
     let cfg = core.config().await.context("telepager isn't set up yet")?;
 
     // a cli backend (claude code, opencode) runs its own agent loop and reaches
@@ -882,6 +886,94 @@ mod tests {
         )
         .await;
         assert!(out.contains("hasn't produced any output"), "{out}");
+    }
+
+    /// An anthropic-shaped endpoint that asks for one tool call per turn and
+    /// then stops. It answers slowly, so two turns racing really do overlap.
+    async fn fake_llm() -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let count = seen.clone();
+                tokio::spawn(async move {
+                    let mut chunk = [0u8; 4096];
+                    let _ = stream.read(&mut chunk).await;
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+                    // the first request of each turn asks for a tool, the
+                    // second finishes it
+                    let body = if n < 2 {
+                        r#"{"content":[{"type":"tool_use","id":"t1","name":"list_sessions","input":{}}]}"#
+                    } else {
+                        r#"{"content":[{"type":"text","text":"done"}]}"#
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.ok();
+                });
+            }
+        });
+
+        (base, server)
+    }
+
+    #[tokio::test]
+    async fn concurrent_turns_do_not_interleave_into_the_history() {
+        let (llm_base, llm_server) = fake_llm().await;
+        let (tg_base, _seen, tg_server) = crate::core::tests::fake_telegram(7).await;
+        let c = core();
+        let cfg = crate::config::Config {
+            master: crate::config::MasterConfig {
+                provider: crate::config::Provider::Anthropic,
+                model: "test-model".into(),
+                api_key: Some("k".into()),
+                base_url: Some(llm_base),
+                ..Default::default()
+            },
+            ..crate::core::tests::config_for(&[7])
+        };
+        c.attach(cfg, crate::telegram::Telegram::with_base(&tg_base)).await;
+
+        // two messages arriving at once, the way telegram delivers them
+        let (a, b) = tokio::join!(
+            reply(&c, "first", Origin::Ui),
+            reply(&c, "second", Origin::Ui),
+        );
+        a.unwrap();
+        b.unwrap();
+
+        // every tool_use has to be answered before anything else is said, or
+        // the next request is a 400 for the rest of the conversation
+        let history = c.master.lock().await.history.clone();
+        for (i, msg) in history.iter().enumerate() {
+            let Msg::Assistant { calls, .. } = msg else { continue };
+            for (offset, call) in calls.iter().enumerate() {
+                match history.get(i + 1 + offset) {
+                    Some(Msg::ToolResult { name, .. }) => assert_eq!(name, &call.name),
+                    other => panic!("call {} of {i} is unanswered: {other:?}", offset),
+                }
+            }
+        }
+        // and a second message can't land while the first turn is still going:
+        // two user messages in a row is a roles-must-alternate 400
+        assert_eq!(history.iter().filter(|m| matches!(m, Msg::User(_))).count(), 2);
+        for pair in history.windows(2) {
+            assert!(
+                !matches!((&pair[0], &pair[1]), (Msg::User(_), Msg::User(_))),
+                "two turns interleaved: {history:?}"
+            );
+        }
+
+        llm_server.abort();
+        tg_server.abort();
     }
 
     /// A core whose config grants what the test is about.
