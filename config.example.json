@@ -12,6 +12,7 @@
     "mine": {
       "command": "my-agent",
       "args": ["--prompt", "{task}"],
+      "model_args": ["--model", "{model}"],
       "description": "shows up in the console's agent picker"
     }
   }

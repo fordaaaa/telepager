@@ -16,6 +16,11 @@ Start an agent in a directory, watch it work, answer questions it gets stuck
 on, and kill it when it goes wrong — from Telegram or a local console. Runs
 entirely on your machine; no webhook or public URL needed.
 
+The agent you talk to runs on the Claude Code you're already signed into.
+There's no API key to create, paste, or pay for: telepager shells out to
+`claude` for each turn, so whatever that login is good for, this is good for.
+Point it at `opencode` instead, or at a model API, if you'd rather.
+
 ## Install
 
 telepager is a terminal command, like `claude` or `git`. You install it, type
@@ -90,29 +95,51 @@ what you address when you're not talking to a specific session:
 It starts workers, summarizes what they're doing, reads their output, sends
 follow-ups, kills stuck ones, and answers questions a worker is blocked on.
 
+Anything that isn't one of these goes to it, argument and all:
+
+| Command | What it does |
+| --- | --- |
+| `/status` | what every session is doing |
+| `/agents` | which agent CLIs are installed |
+| `/model <m>` | which model the master thinks on |
+| `/a <text>` | answer whatever is waiting on you |
+| `/sh <cmd>` | run a command in the working directory |
+| `/cd <dir>` | set that working directory |
+| `/kill <s>` | stop a running session |
+| `/settings` | what's granted, and change it if remote control is on |
+| `/new` | forget the conversation so far |
+| `/ui` | the console's address |
+
 Worker agents are ordinary coding CLIs — anything installed on your machine
 shows up in the picker with no config: `claude` · `codex` · `gemini` ·
-`opencode` · `cursor-agent` · `amp` · `aider` · `crush` · `qwen` · `goose`.
+`opencode` · `cursor` · `amp` · `aider` · `crush` · `qwen` · `goose`. Each has
+a `-tui` twin — `claude-tui`, `codex-tui`, `gemini-tui`, `opencode-tui` — that
+runs on a real terminal you can watch.
 
 ### Master agent provider
 
-No key needed — reuse a CLI you're already logged into:
+The default is the login you already did. telepager runs `claude` for each
+turn, so there's no key in the config at all:
 
 ```json
 { "master": { "provider": "claude-code" } }
 ```
-```json
-{ "master": { "provider": "opencode", "model": "opencode/nemotron-3.5-lightning-free" } }
-```
 
-Or a model API directly, set via env var or in the console's **Settings**:
+An exported `ANTHROPIC_API_KEY` quietly outranks that login, and headless
+there's no prompt to notice — so telepager takes it out of `claude`'s
+environment, for the master agent and for `claude` workers alike. Set
+`api_key` or `api_key_env` in the master block if you do want a key used.
 
-| Provider | Set | Notes |
+| Provider | Needs | Notes |
 | --- | --- | --- |
-| `anthropic` | `ANTHROPIC_API_KEY` | |
-| `openai` | `OPENAI_API_KEY` | also OpenRouter, Groq, Together, LM Studio, vLLM via `base_url` |
-| `gemini` | `GEMINI_API_KEY` | |
+| `claude-code` | `claude`, logged in | the default |
+| `opencode` | `opencode`, logged in | free models included |
+| `anthropic` | `ANTHROPIC_API_KEY` | or `CLAUDE_API_KEY` |
+| `openai` | `OPENAI_API_KEY` | `openrouter`, `groq`, `together` are aliases |
+| `gemini` | `GEMINI_API_KEY` | or `GOOGLE_API_KEY` |
 | `ollama` | — | runs locally, no key |
+
+Set it in the console's **Settings**, or in the config:
 
 ```json
 {
@@ -122,6 +149,29 @@ Or a model API directly, set via env var or in the console's **Settings**:
     "base_url": "https://openrouter.ai/api/v1"
   }
 }
+```
+
+### Which model
+
+Leave `model` out and each backend uses whatever it's already set to. Name one
+and it's used instead — `opus`, `sonnet` and `haiku` all work on a Claude Code
+login, as does a full model id.
+
+```json
+{ "master": { "provider": "claude-code", "model": "opus" } }
+```
+
+`/model opus` does the same from your phone, and the conversation carries on
+where it was. `/model` on its own says what's running now; `/model default`
+hands the choice back to the CLI. It changes the config, so it needs remote
+control on, the same as `/settings`.
+
+Worker agents take one per spawn — "start claude in ~/code/api on opus" — for
+the ones whose flag telepager knows: claude, codex, gemini, opencode and
+aider. For anything else, say how to ask:
+
+```json
+{ "agents": { "mine": { "model_args": ["-m", "{model}"] } } }
 ```
 
 ### Custom worker agents
@@ -139,7 +189,11 @@ Or a model API directly, set via env var or in the console's **Settings**:
 ```
 
 `{task}` is passed as a single argument — no shell, so quotes and semicolons
-in a task are inert.
+in a task are inert. `{dir}` and `{model}` are substituted the same way.
+
+`env` adds variables for that agent; `unset` takes them away first, which is
+how the built-in `claude` presets keep an exported key from replacing your
+login.
 
 Set `"pty": true` to run an agent on a real terminal, so the console draws its
 screen instead of a line log. The `-tui` presets do this. The trade: telepager
@@ -201,7 +255,7 @@ Also read from `./telepager.config.json`; `--config PATH` overrides the lookup.
 | `allowed_user_ids` | — | Required, non-empty. `TELEGRAM_ALLOWED_IDS` (comma-separated) overrides it. |
 | `chat_id` | lowest allowed id | Where messages go. Rarely set. |
 | `ask_timeout_seconds` | `300` | How long `ask_question` waits before giving up. |
-| `master` | claude-code | `claude-code`, `opencode`, `anthropic`, `openai`, `gemini`, or `ollama`. |
+| `master` | claude-code | Which backend answers you, and on what model. |
 | `agents` | built-in list | Worker agent CLIs. Yours override built-ins of the same name. |
 | `allowed_dirs` | `[]` | Directories Telegram may start agents in. Empty disables it. |
 | `ui_port` | any free port | Pin the console's port. |
@@ -226,8 +280,8 @@ Also read from `./telepager.config.json`; `--config PATH` overrides the lookup.
   your machine.
 - Keys are scrubbed from every error before it's logged or sent anywhere.
 
-To keep the old, inert pager-only behavior: leave `allowed_dirs` empty and
-skip configuring a master agent.
+To keep the old, inert pager-only behavior: leave `allowed_dirs` empty, so
+Telegram can't start anything, and leave `shell` off.
 
 ## Known limits
 
