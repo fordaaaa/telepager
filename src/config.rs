@@ -551,6 +551,22 @@ pub fn save_permissions(explicit: Option<&Path>, permissions: &Permissions) -> R
     Ok(path)
 }
 
+/// `provider: "openrouter"` names a service, not just an api shape. serde maps
+/// the alias onto the provider and the name is gone, so the address it implies
+/// has to be read back out of the file — otherwise an openrouter key is sent
+/// to openai.
+fn apply_named_service(text: &str, raw: &mut RawConfig) {
+    let Some(master) = raw.master.as_mut() else { return };
+    if master.base_url.as_deref().map(str::trim).is_some_and(|b| !b.is_empty()) {
+        return;
+    }
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(text) else { return };
+    let Some(name) = doc["master"]["provider"].as_str() else { return };
+    if let Some((_, Some(base))) = Provider::named(name) {
+        master.base_url = Some(base.to_string());
+    }
+}
+
 pub fn load(explicit: Option<&Path>) -> Result<Config> {
     let file = resolve_config_path(explicit);
 
@@ -561,8 +577,10 @@ pub fn load(explicit: Option<&Path>) -> Result<Config> {
             if text.trim().is_empty() {
                 RawConfig::default()
             } else {
-                serde_json::from_str(&text)
-                    .with_context(|| format!("{} is not valid JSON", path.display()))?
+                let mut raw: RawConfig = serde_json::from_str(&text)
+                    .with_context(|| format!("{} is not valid JSON", path.display()))?;
+                apply_named_service(&text, &mut raw);
+                raw
             }
         }
         _ => RawConfig::default(),
@@ -758,6 +776,34 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("api_key"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_service_named_in_the_file_gets_its_address_too() {
+        let dir = scratch("named-service");
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"bot_token":"1:x","allowed_user_ids":[7],
+                "master":{"provider":"openrouter","api_key":"sk-or-x"}}"#,
+        )
+        .unwrap();
+
+        let cfg = load(Some(&path)).unwrap();
+        assert_eq!(cfg.master.provider, Provider::Openai);
+        // without this an openrouter key would be sent to openai
+        assert_eq!(cfg.master.base_url_or_default(), "https://openrouter.ai/api/v1");
+
+        // and a base_url written by hand still wins
+        std::fs::write(
+            &path,
+            r#"{"bot_token":"1:x","allowed_user_ids":[7],
+                "master":{"provider":"openrouter","base_url":"http://localhost:8080"}}"#,
+        )
+        .unwrap();
+        assert_eq!(load(Some(&path)).unwrap().master.base_url_or_default(), "http://localhost:8080");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

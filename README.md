@@ -136,7 +136,7 @@ environment, for the master agent and for `claude` workers alike. Set
 | `claude-code` | `claude`, logged in | the default |
 | `opencode` | `opencode`, logged in | free models included |
 | `anthropic` | `ANTHROPIC_API_KEY` | or `CLAUDE_API_KEY` |
-| `openai` | `OPENAI_API_KEY` | `openrouter`, `groq`, `together` are aliases |
+| `openai` | `OPENAI_API_KEY` | so are `openrouter`, `groq`, `together` |
 | `gemini` | `GEMINI_API_KEY` | or `GOOGLE_API_KEY` |
 | `ollama` | — | runs locally, no key |
 
@@ -150,12 +150,16 @@ typed it in; if you'd rather nothing secret went through Telegram at all,
 ```json
 {
   "master": {
-    "provider": "openai",
+    "provider": "openrouter",
     "model": "anthropic/claude-sonnet-4.5",
-    "base_url": "https://openrouter.ai/api/v1"
+    "api_key_env": "OPENROUTER_API_KEY"
   }
 }
 ```
+
+Naming a service that way sets its address as well, so there's no `base_url`
+to get right. Write one anyway and yours wins — which is how LM Studio, vLLM
+and anything else OpenAI-shaped fits in.
 
 ### Which model
 
