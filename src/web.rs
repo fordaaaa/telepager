@@ -516,7 +516,9 @@ async fn spawn(core: &Arc<Core>, body: &Value) -> Result<Value> {
     let agent = str_field(body, "agent")?;
     let dir = str_field(body, "dir")?;
     let task = str_field(body, "task")?;
-    let id = core.spawn_agent(agent, dir, task, false).await?;
+    // optional: most agents take whatever model they're already set to
+    let model = body.get("model").and_then(|v| v.as_str()).map(str::trim).filter(|m| !m.is_empty());
+    let id = core.spawn_agent(agent, dir, task, model, false).await?;
     Ok(json!({ "session": id }))
 }
 

@@ -552,6 +552,7 @@ impl Core {
         agent: &str,
         dir: &str,
         task: &str,
+        model: Option<&str>,
         from_telegram: bool,
     ) -> Result<SessionId> {
         let cfg = self.config().await.context("not set up yet")?;
@@ -595,7 +596,7 @@ impl Core {
             )
             .await;
 
-        let launched = match agents::launch(&preset, &path, task) {
+        let launched = match agents::launch(&preset, &path, task, model) {
             Ok(l) => l,
             Err(e) => {
                 let reason = format!("{e:#}");
@@ -1212,7 +1213,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn spawning_without_a_config_is_an_error() {
         let c = core();
-        let err = c.spawn_agent("claude", "/tmp", "do it", false).await.unwrap_err();
+        let err = c.spawn_agent("claude", "/tmp", "do it", None, false).await.unwrap_err();
         assert!(format!("{err:#}").contains("not set up"), "{err:#}");
     }
 
@@ -1276,7 +1277,7 @@ pub(crate) mod tests {
         }
         let (core, dir) = configured_core("stdin");
         let id = core
-            .spawn_agent("sleeper", dir.to_str().unwrap(), "sleep", false)
+            .spawn_agent("sleeper", dir.to_str().unwrap(), "sleep", None, false)
             .await
             .unwrap();
 
@@ -1350,7 +1351,7 @@ pub(crate) mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            core.spawn_agent("ticker", dir.to_str().unwrap(), "tick", false)
+            core.spawn_agent("ticker", dir.to_str().unwrap(), "tick", None, false)
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -1415,7 +1416,7 @@ pub(crate) mod tests {
             return;
         }
         let (core, dir) = tui_core("screen");
-        let id = core.spawn_agent("tui", dir.to_str().unwrap(), "draw", false).await.unwrap();
+        let id = core.spawn_agent("tui", dir.to_str().unwrap(), "draw", None, false).await.unwrap();
 
         assert!(screen_says(&core, &id, "hello").await, "the screen never drew");
 

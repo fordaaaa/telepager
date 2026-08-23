@@ -268,6 +268,9 @@ pub struct AgentPreset {
     /// Variables to take away from the child before `env` is applied, for a
     /// CLI that would rather use an exported key than the login it already has.
     pub unset: Vec<String>,
+    /// How this CLI is told which model to use, e.g. `["--model", "{model}"]`.
+    /// Appended only when a spawn asks for one; empty means it can't be asked.
+    pub model_args: Vec<String>,
     /// Whether this agent keeps reading stdin after it starts, which decides
     /// if "send a follow-up" is offered for its sessions.
     pub interactive: bool,
@@ -292,6 +295,7 @@ pub fn builtin_agents() -> BTreeMap<String, AgentPreset> {
                 description: description.to_string(),
                 env: BTreeMap::new(),
                 unset: Vec::new(),
+                model_args: Vec::new(),
                 interactive: watch,
                 pty: watch,
             },
@@ -329,6 +333,17 @@ pub fn builtin_agents() -> BTreeMap<String, AgentPreset> {
         "Gemini, on screen — ends when telepager does");
     add("opencode-tui", "opencode", &["{task}"], true,
         "opencode, on screen — ends when telepager does");
+
+    // the clis whose model flag we're sure of. anything else can say so in the
+    // config rather than have us guess a flag at it
+    for name in [
+        "claude", "claude-tui", "codex", "codex-tui", "gemini", "gemini-tui",
+        "opencode", "opencode-tui", "aider",
+    ] {
+        if let Some(preset) = m.get_mut(name) {
+            preset.model_args = vec!["--model".into(), "{model}".into()];
+        }
+    }
 
     // a claude worker is the claude code login, the same way the master's
     // claude-code backend is. an exported key would quietly replace it, and
@@ -740,6 +755,16 @@ mod tests {
         // and nothing else is touched — those clis have their own arrangements
         assert!(m["codex"].unset.is_empty());
         assert!(m["opencode"].unset.is_empty());
+    }
+
+    #[test]
+    fn the_agents_we_know_the_model_flag_for_can_be_asked_for_one() {
+        let m = builtin_agents();
+        assert_eq!(m["claude"].model_args, vec!["--model", "{model}"]);
+        assert_eq!(m["codex-tui"].model_args, vec!["--model", "{model}"]);
+        // and the ones we'd only be guessing at are left alone
+        assert!(m["amp"].model_args.is_empty());
+        assert!(m["goose"].model_args.is_empty());
     }
 
     #[test]

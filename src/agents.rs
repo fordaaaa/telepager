@@ -106,13 +106,17 @@ impl Handle {
 /// Substitute a preset's placeholders. An argument that is exactly `{task}` is
 /// swapped whole, so spaces and quotes in the task stay one argument and never
 /// meet a shell; embedded ones like `--message={task}` are substituted in place.
-pub fn render_args(args: &[String], task: &str, dir: &Path) -> Vec<String> {
+pub fn render_args(args: &[String], task: &str, dir: &Path, model: &str) -> Vec<String> {
     let dir_text = dir.display().to_string();
     args.iter()
         .map(|arg| match arg.as_str() {
             "{task}" => task.to_string(),
             "{dir}" => dir_text.clone(),
-            other => other.replace("{task}", task).replace("{dir}", &dir_text),
+            "{model}" => model.to_string(),
+            other => other
+                .replace("{task}", task)
+                .replace("{dir}", &dir_text)
+                .replace("{model}", model),
         })
         .collect()
 }
@@ -252,9 +256,17 @@ pub fn dir_is_allowed(dir: &Path, allowed: &[PathBuf]) -> bool {
     })
 }
 
-pub fn launch(preset: &AgentPreset, dir: &Path, task: &str) -> Result<Launched> {
+pub fn launch(preset: &AgentPreset, dir: &Path, task: &str, model: Option<&str>) -> Result<Launched> {
     if preset.command.trim().is_empty() {
         bail!("this agent has no command configured");
+    }
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
+    if model.is_some() && preset.model_args.is_empty() {
+        bail!(
+            "'{}' has no model_args, so telepager doesn't know how to ask it for \
+             one — set model_args on the preset, or leave the model out",
+            preset.command
+        );
     }
     let program = which(&preset.command).ok_or_else(|| {
         anyhow::anyhow!(
@@ -263,7 +275,10 @@ pub fn launch(preset: &AgentPreset, dir: &Path, task: &str) -> Result<Launched> 
         )
     })?;
 
-    let args = render_args(&preset.args, task, dir);
+    let mut args = render_args(&preset.args, task, dir, model.unwrap_or_default());
+    if let Some(model) = model {
+        args.extend(render_args(&preset.model_args, task, dir, model));
+    }
     let mut rendered = vec![preset.command.clone()];
     rendered.extend(args.clone());
 
@@ -448,25 +463,51 @@ mod tests {
             &["-p".into(), "{task}".into()],
             "fix the build and don't ask",
             Path::new("/tmp"),
+            "",
         );
         assert_eq!(args, vec!["-p", "fix the build and don't ask"]);
     }
 
     #[test]
     fn an_embedded_placeholder_is_substituted_in_place() {
-        let args = render_args(&["--message={task}".into()], "hi there", Path::new("/tmp"));
+        let args = render_args(&["--message={task}".into()], "hi there", Path::new("/tmp"), "");
         assert_eq!(args, vec!["--message=hi there"]);
     }
 
     #[test]
     fn the_dir_placeholder_works_too() {
-        let args = render_args(&["{dir}".into(), "--cwd={dir}".into()], "t", Path::new("/srv/x"));
+        let args = render_args(&["{dir}".into(), "--cwd={dir}".into()], "t", Path::new("/srv/x"), "");
         assert_eq!(args, vec!["/srv/x", "--cwd=/srv/x"]);
     }
 
     #[test]
+    fn the_model_placeholder_is_filled_in_like_the_others() {
+        let args = render_args(&["--model".into(), "{model}".into()], "t", Path::new("/tmp"), "opus");
+        assert_eq!(args, vec!["--model", "opus"]);
+    }
+
+    #[tokio::test]
+    async fn a_model_only_reaches_an_agent_that_knows_how_to_be_asked() {
+        let plain = preset(&["{task}"]);
+        let err = launch(&plain, &std::env::temp_dir(), "t", Some("opus")).map(|_| ()).unwrap_err();
+        assert!(format!("{err:#}").contains("model_args"), "{err:#}");
+
+        // and the same preset is happy when no model is asked for
+        let launched = launch(&plain, &std::env::temp_dir(), "t", None).unwrap();
+        assert!(!launched.rendered.contains(&"--model".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_asked_for_model_is_appended_to_the_command() {
+        let mut p = preset(&["{task}"]);
+        p.model_args = vec!["--model".into(), "{model}".into()];
+        let launched = launch(&p, &std::env::temp_dir(), "t", Some("opus")).unwrap();
+        assert_eq!(launched.rendered, vec!["echo", "t", "--model", "opus"]);
+    }
+
+    #[test]
     fn quotes_in_a_task_are_not_special() {
-        let args = render_args(&["{task}".into()], r#"say "hi"; rm -rf /"#, Path::new("/tmp"));
+        let args = render_args(&["{task}".into()], r#"say "hi"; rm -rf /"#, Path::new("/tmp"), "");
         // no shell is involved, so this is one inert argument
         assert_eq!(args, vec![r#"say "hi"; rm -rf /"#]);
     }
@@ -587,7 +628,7 @@ mod tests {
     #[test]
     fn launching_a_missing_command_says_so_clearly() {
         let p = AgentPreset { command: "telepager-not-real".into(), ..AgentPreset::default() };
-        let Err(err) = launch(&p, &std::env::temp_dir(), "t") else {
+        let Err(err) = launch(&p, &std::env::temp_dir(), "t", None) else {
             panic!("a missing command should not launch");
         };
         assert!(format!("{err:#}").contains("not installed"), "{err:#}");
@@ -600,7 +641,7 @@ mod tests {
         if which("echo").is_none() {
             return;
         }
-        let mut launched = launch(&preset(&["{task}"]), &std::env::temp_dir(), "hello agent").unwrap();
+        let mut launched = launch(&preset(&["{task}"]), &std::env::temp_dir(), "hello agent", None).unwrap();
         assert_eq!(launched.rendered, vec!["echo", "hello agent"]);
 
         let Io::Pipes { stdout, .. } = &mut launched.io else {
@@ -625,7 +666,7 @@ mod tests {
             pty: true,
             ..AgentPreset::default()
         };
-        let mut launched = launch(&p, &std::env::temp_dir(), "").unwrap();
+        let mut launched = launch(&p, &std::env::temp_dir(), "", None).unwrap();
 
         let Io::Pty { reader, .. } = &mut launched.io else {
             panic!("an interactive preset should get a pty");
@@ -662,7 +703,7 @@ mod tests {
             pty: true,
             ..AgentPreset::default()
         };
-        let mut launched = launch(&p, &std::env::temp_dir(), "").unwrap();
+        let mut launched = launch(&p, &std::env::temp_dir(), "", None).unwrap();
 
         let Io::Pty { reader, .. } = &mut launched.io else {
             panic!("a pty preset should get a pty");
@@ -694,7 +735,7 @@ mod tests {
             pty: true,
             ..AgentPreset::default()
         };
-        let mut launched = launch(&p, &std::env::temp_dir(), "").unwrap();
+        let mut launched = launch(&p, &std::env::temp_dir(), "", None).unwrap();
         let pid = launched.child.id().unwrap() as i32;
 
         unsafe extern "C" {
@@ -738,7 +779,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("ticks");
 
-        let launched = launch(&ticker(&marker), &dir, "").unwrap();
+        let launched = launch(&ticker(&marker), &dir, "", None).unwrap();
         let pid = launched.child.id().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
@@ -766,7 +807,7 @@ mod tests {
             args: vec!["-c".into(), "sleep 300 & sleep 300".into()],
             ..AgentPreset::default()
         };
-        let mut launched = launch(&p, &std::env::temp_dir(), "").unwrap();
+        let mut launched = launch(&p, &std::env::temp_dir(), "", None).unwrap();
 
         kill_tree(&mut launched.child).await.unwrap();
 

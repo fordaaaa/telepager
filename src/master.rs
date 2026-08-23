@@ -176,6 +176,7 @@ pub(crate) fn tools() -> Vec<ToolDef> {
                     "agent": { "type": "string", "description": "which agent, e.g. claude or codex" },
                     "dir": { "type": "string", "description": "absolute path to work in" },
                     "task": { "type": "string", "description": "what the agent should do" },
+                    "model": { "type": "string", "description": "which model to run it on, if it takes one, e.g. opus" },
                 },
                 "required": ["agent", "dir", "task"],
             }),
@@ -392,7 +393,9 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
             let agent = str_arg(args, "agent");
             let dir = str_arg(args, "dir");
             let task = str_arg(args, "task");
-            match core.spawn_agent(&agent, &dir, &task, origin.is_telegram()).await {
+            let model = str_arg(args, "model");
+            let model = (!model.is_empty()).then_some(model);
+            match core.spawn_agent(&agent, &dir, &task, model.as_deref(), origin.is_telegram()).await {
                 Ok(id) => format!("Started {agent} in {dir} as session {id}."),
                 Err(e) => format!("Could not start it: {e:#}"),
             }
