@@ -30,7 +30,10 @@ fi
 case "$(uname -s)" in
   Linux) os="unknown-linux-gnu" ;;
   Darwin) os="apple-darwin" ;;
-  *) die "unsupported os $(uname -s). windows: use npm, or grab the exe from releases" ;;
+  *) die "unsupported os $(uname -s). this script only covers linux and macos.
+  on windows, install the command with npm or cargo instead:
+    npm install -g telepager
+    cargo install telepager" ;;
 esac
 
 case "$(uname -m)" in
@@ -73,5 +76,5 @@ case ":$PATH:" in
 esac
 
 say ""
-say "  next: telepager       (shows what's set up)"
+say "  next: telepager       (runs it here, ctrl-c ends it)"
 say "        claude mcp add --scope user telepager -- telepager mcp"

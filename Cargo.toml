@@ -6,7 +6,17 @@ license = "AGPL-3.0-only"
 authors = ["fordaaaa"]
 description = "An MCP server that pages you on Telegram — your agent can message you, show progress, and ask you questions with buttons."
 repository = "https://github.com/fordaaaa/telepager"
+homepage = "https://github.com/fordaaaa/telepager"
 readme = "README.md"
+keywords = ["mcp", "telegram", "agent", "cli", "notifications"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    "target/",
+    "npm/",
+    "docs/",
+    ".github/",
+    "install.sh",
+]
 
 [[bin]]
 name = "telepager"
@@ -22,6 +32,8 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 dirs = "5"
+portable-pty = "0.9"
+vte = "0.15"
 
 [profile.release]
 strip = true

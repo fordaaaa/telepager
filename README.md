@@ -16,36 +16,59 @@ Start an agent in a directory, watch it work, answer questions it gets stuck
 on, and kill it when it goes wrong — from Telegram or a local console. Runs
 entirely on your machine; no webhook or public URL needed.
 
-## Install & start
+## Install
+
+telepager is a terminal command, like `claude` or `git`. You install it, type
+`telepager`, and it runs in that terminal. It doesn't install a background
+service, doesn't add a login item, and doesn't start with your machine —
+running the command is what starts it.
 
 ```bash
-npm install -g telepager
+npm install -g telepager     # or: npx -y telepager, no install
+```
+
+```bash
+cargo install telepager      # if you have rust
+```
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fordaaaa/telepager/main/install.sh | sh
+```
+
+The script drops a prebuilt binary in `~/.local/bin`. On Windows use npm or
+cargo. From a checkout, `cargo build --release` puts one in `target/release`.
+
+## Run it
+
+```bash
 telepager
 ```
 
-First run opens the console and walks you through connecting Telegram: paste
-a bot token from [@BotFather](https://t.me/BotFather), press **Detect**,
-message your bot, done.
+That runs in the foreground and opens the console in your browser. Ctrl-C ends
+it; closing the terminal ends it. First run walks you through connecting
+Telegram: paste a bot token from [@BotFather](https://t.me/BotFather), press
+**Detect**, message your bot, done.
+
+To let your coding agent page you, register the MCP server once:
+
+```bash
+claude mcp add --scope user telepager -- telepager mcp
+```
 
 | Command | What it does |
 | --- | --- |
-| `telepager` / `telepager webui` | start the app, open the console |
+| `telepager` | run it here, open the console. Ctrl-C ends it |
+| `telepager start` | run it in the background instead |
+| `telepager stop` | stop the background one |
 | `telepager status` | check setup, running state, active model |
-| `telepager stop` | stop the background app |
-| `telepager daemon` | run in the foreground, no browser |
+| `telepager webui` | open the console against whatever's already running |
 | `telepager mcp` | stdio MCP server (spawned by MCP clients) |
 
 <details>
-<summary>Other install methods</summary>
+<summary>If <code>npm install -g</code> fails with <code>EACCES</code></summary>
 
-```bash
-npx -y telepager                    # no install
-curl -fsSL https://raw.githubusercontent.com/fordaaaa/telepager/main/install.sh | sh   # plain binary
-cargo build --release               # from source -> target/release/telepager
-```
-
-If `npm install -g` fails with `EACCES`, point npm at your home directory
-instead of using `sudo`:
+npm is trying to write somewhere you don't own. Point it at your home directory
+rather than reaching for `sudo`:
 
 ```bash
 npm config set prefix ~/.local
@@ -184,7 +207,8 @@ skip configuring a master agent.
   `ask_timeout_seconds` to match if it does.
 - Spawned agents are killed by process group on Unix; on Windows a killed
   agent may leave grandchildren behind.
-- The app keeps running once started; `telepager stop` ends it.
+- `telepager start` leaves a process running after your terminal is gone;
+  `telepager stop` ends it.
 
 ## License
 
