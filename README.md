@@ -268,7 +268,7 @@ Also read from `./telepager.config.json`; `--config PATH` overrides the lookup.
 | `master` | claude-code | Which backend answers you, and on what model. |
 | `agents` | built-in list | Worker agent CLIs. Yours override built-ins of the same name. |
 | `allowed_dirs` | `[]` | Directories Telegram may start agents in. Empty disables it. |
-| `ui_port` | any free port | Pin the console's port. |
+| `ui_port` | `47823` | The console's port. Falls back to a free one if this is taken. |
 
 ## Security
 
@@ -279,8 +279,8 @@ Also read from `./telepager.config.json`; `--config PATH` overrides the lookup.
 - `allowed_dirs` is empty by default, so Telegram can't spawn agents anywhere
   until you set it. The local console is unrestricted — using it means you're
   already at the machine.
-- The console is loopback-only, on a random port, behind a one-off key in the
-  URL, and checks the `Host` header.
+- The console is loopback-only, on a fixed port (`47823` unless you set
+  `ui_port`), behind a one-off key in the URL, and checks the `Host` header.
 - Prefer `TELEGRAM_BOT_TOKEN` over the plaintext config; the file is `0600`.
   Anyone with the bot token can act as your bot.
 - Telegram isn't end-to-end encrypted — don't page real secrets through it.

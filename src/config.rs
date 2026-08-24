@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// The console's port when nothing in config pins one. Fixed rather than
+/// random so the console sits at a stable address you can bookmark; if it's
+/// taken, `web::start` falls back to a free one instead of failing.
+pub const DEFAULT_UI_PORT: u16 = 47823;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawConfig {
@@ -629,7 +634,7 @@ pub fn load(explicit: Option<&Path>) -> Result<Config> {
         master: raw.master.unwrap_or_default(),
         agents,
         allowed_dirs: raw.allowed_dirs.unwrap_or_default(),
-        ui_port: raw.ui_port.unwrap_or(0),
+        ui_port: raw.ui_port.unwrap_or(DEFAULT_UI_PORT),
         permissions: raw.permissions.unwrap_or_default(),
     })
 }

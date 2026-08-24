@@ -38,7 +38,11 @@ const SNAPSHOT_EVENTS: usize = 400;
 /// `port_override` is `--port`; 0 means the configured port, or any free one.
 pub async fn start(core: Arc<Core>, open_browser: bool, port_override: u16) -> Result<UiInfo> {
     let port = match port_override {
-        0 => core.config().await.map(|c| c.ui_port).unwrap_or(0),
+        0 => core
+            .config()
+            .await
+            .map(|c| c.ui_port)
+            .unwrap_or(crate::config::DEFAULT_UI_PORT),
         explicit => explicit,
     };
 

@@ -704,7 +704,7 @@ async fn apply_setting(
 }
 
 const HELP: &str = "\
-telepager — talk to me and I'll run agents on your machine.
+master agent — talk to me and I'll run agents on your machine.
 
 Just say what you want, e.g. \"start claude in ~/code/api and make the tests pass\"
 or \"what's running?\".
