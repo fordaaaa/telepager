@@ -33,15 +33,12 @@ npm install -g telepager     # or: npx -y telepager, no install
 ```
 
 ```bash
-cargo install telepager      # if you have rust
-```
-
-```bash
 curl -fsSL https://raw.githubusercontent.com/fordaaaa/telepager/main/install.sh | sh
 ```
 
-The script drops a prebuilt binary in `~/.local/bin`. On Windows use npm or
-cargo. From a checkout, `cargo build --release` puts one in `target/release`.
+The script drops a prebuilt binary in `~/.local/bin`. On Windows use npm.
+telepager isn't on crates.io; from a checkout, `cargo build --release` puts a
+binary in `target/release` if you'd rather build it yourself.
 
 ## Run it
 

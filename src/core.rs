@@ -1137,6 +1137,10 @@ pub(crate) mod tests {
                     body.len()
                 );
                 tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.ok();
+                // see fake_llm's comment in master.rs: drop the connection
+                // gracefully or windows can turn it into a forcible close.
+                tokio::io::AsyncWriteExt::flush(&mut stream).await.ok();
+                tokio::io::AsyncWriteExt::shutdown(&mut stream).await.ok();
             }
         });
 

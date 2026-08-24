@@ -924,6 +924,12 @@ mod tests {
                         body.len()
                     );
                     tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.ok();
+                    // dropping the stream right after the write can race the
+                    // client's read on windows and land as a forcible-close
+                    // (os error 10054) instead of a graceful eof, so flush
+                    // and shut the write side down properly first.
+                    tokio::io::AsyncWriteExt::flush(&mut stream).await.ok();
+                    tokio::io::AsyncWriteExt::shutdown(&mut stream).await.ok();
                 });
             }
         });

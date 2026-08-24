@@ -31,9 +31,8 @@ case "$(uname -s)" in
   Linux) os="unknown-linux-gnu" ;;
   Darwin) os="apple-darwin" ;;
   *) die "unsupported os $(uname -s). this script only covers linux and macos.
-  on windows, install the command with npm or cargo instead:
-    npm install -g telepager
-    cargo install telepager" ;;
+  on windows, install the command with npm instead:
+    npm install -g telepager" ;;
 esac
 
 case "$(uname -m)" in
