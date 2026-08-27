@@ -191,7 +191,7 @@ impl Screen {
 
     /// Scrollback then screen, as plain lines. `tail_text` is what the callers
     /// so far want; this is the whole thing.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn to_plain_text(&self) -> String {
         self.grid.plain_lines().join("\n")
     }
@@ -570,6 +570,7 @@ impl Grid {
         out
     }
 
+    #[cfg(test)]
     fn plain_lines(&self) -> Vec<String> {
         let mut out: Vec<String> =
             self.scrollback.iter().chain(self.cells.iter()).map(|r| row_text(r)).collect();
