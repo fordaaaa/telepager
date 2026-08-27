@@ -57,7 +57,7 @@ impl ServerHandler for Bridge {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info.name = "telepager".into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
-        info.instructions = Some(master::system_prompt(None));
+        info.instructions = Some(master::system_prompt(None, false));
         info
     }
 

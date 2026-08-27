@@ -200,6 +200,16 @@ pub struct MasterConfig {
     pub command: Option<String>,
     /// Extra arguments appended to a CLI backend's command line.
     pub args: Vec<String>,
+    /// Give a CLI-backed master the bundled web and browser tooling: the
+    /// github, context7 and playwright MCP servers, plus the CLI's own
+    /// WebSearch/WebFetch. Off means telepager's own bridge and nothing else.
+    #[serde(alias = "bundledMcp")]
+    pub bundled_mcp: bool,
+    /// Additional MCP servers for a CLI-backed master, in Claude Code's
+    /// `mcpServers` shape. Merged in on top of the bundled set, and honoured
+    /// whether or not `bundled_mcp` is on.
+    #[serde(alias = "mcpServers")]
+    pub mcp_servers: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl Default for MasterConfig {
@@ -216,6 +226,8 @@ impl Default for MasterConfig {
             max_tokens: 4096,
             command: None,
             args: Vec::new(),
+            bundled_mcp: true,
+            mcp_servers: None,
         }
     }
 }

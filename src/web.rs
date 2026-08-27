@@ -295,6 +295,8 @@ async fn state(core: &Arc<Core>) -> Result<Value> {
             "model": master.model_or_default(),
             "base_url": master.base_url.clone(),
             "system": master.system.clone(),
+            "bundled_mcp": master.bundled_mcp,
+            "mcp_servers": master.mcp_servers.clone(),
             "ready": master.is_usable(),
             "key_source": master_key_source(&master),
             "providers": Provider::all().iter().map(|p| json!({
@@ -464,6 +466,15 @@ async fn save_master(core: &Arc<Core>, body: &Value) -> Result<Value> {
             .unwrap_or(existing.max_tokens),
         command: optional("command").or(existing.command),
         args: existing.args,
+        bundled_mcp: body
+            .get("bundled_mcp")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(existing.bundled_mcp),
+        mcp_servers: body
+            .get("mcp_servers")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .or(existing.mcp_servers),
     };
 
     let switched = master.provider != existing.provider;

@@ -114,7 +114,7 @@ impl Conversation {
     }
 }
 
-pub(crate) fn system_prompt(extra: Option<&str>) -> String {
+pub(crate) fn system_prompt(extra: Option<&str>, web_tools: bool) -> String {
     let mut prompt = String::from(
         "You are the master agent. The person you're talking to is reaching you from \
          their phone over Telegram, or from a small web console on their own \
@@ -145,6 +145,14 @@ pub(crate) fn system_prompt(extra: Option<&str>) -> String {
          - If a tool fails, say so plainly and what you'd try instead. Don't retry the \
            same call twice.",
     );
+    if web_tools {
+        prompt.push_str(
+            "\n\nYou also have web search and fetch, library docs (context7), github \
+             issues and pull requests, and a browser you can drive and screenshot \
+             (playwright). Use them to check something yourself rather than sending \
+             the person to look it up.",
+        );
+    }
     if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
         prompt.push_str("\n\nFrom the person who set this up:\n");
         prompt.push_str(extra);
@@ -274,7 +282,7 @@ pub async fn reply(core: &Arc<Core>, text: &str, origin: Origin) -> Result<Strin
     }
     let llm = Llm::new(&cfg.master)?;
     log::debug!("master agent replying via {}", llm.describe());
-    let system = system_prompt(cfg.master.system.as_deref());
+    let system = system_prompt(cfg.master.system.as_deref(), false);
     let toolbox = tools();
 
     core.record(None, EventKind::Chat { role: "user".into(), text: text.to_string() })
@@ -750,12 +758,13 @@ mod tests {
 
     #[test]
     fn the_system_prompt_appends_rather_than_replaces() {
-        let base = system_prompt(None);
-        let with_extra = system_prompt(Some("always speak like a pirate"));
+        let base = system_prompt(None, false);
+        let with_extra = system_prompt(Some("always speak like a pirate"), false);
         assert!(with_extra.starts_with(&base));
         assert!(with_extra.contains("pirate"));
         // an empty personal note doesn't add a dangling header
-        assert_eq!(system_prompt(Some("   ")), base);
+        assert_eq!(system_prompt(Some("   "), false), base);
+        assert!(system_prompt(None, true).contains("playwright"));
     }
 
     #[test]

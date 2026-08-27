@@ -92,6 +92,12 @@ what you address when you're not talking to a specific session:
 It starts workers, summarizes what they're doing, reads their output, sends
 follow-ups, kills stuck ones, and answers questions a worker is blocked on.
 
+On a Claude Code or opencode backend it also gets web search and fetch,
+library docs, GitHub issues and pull requests, and a browser it can drive and
+screenshot. Untick **Web search, docs and browser tools** in the console's
+Settings to take those away, or set `"bundled_mcp": false` in the `master`
+block; `"mcp_servers"` there adds MCP servers of your own either way.
+
 Anything that isn't one of these goes to it, argument and all:
 
 | Command | What it does |

@@ -3,7 +3,17 @@
   "allowed_user_ids": [123456789],
 
   "master": {
-    "provider": "claude-code"
+    "provider": "claude-code",
+
+    "bundled_mcp": true,
+
+    "mcp_servers": {
+      "my-server": {
+        "type": "stdio",
+        "command": "my-mcp",
+        "args": []
+      }
+    }
   },
 
   "allowed_dirs": [],

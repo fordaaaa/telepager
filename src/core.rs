@@ -388,8 +388,8 @@ impl Core {
     /// Send a message to Telegram on a session's behalf.
     pub async fn send(&self, session: Option<&str>, text: &str) -> String {
         let label = match session {
-            Some(id) => self.session_label(id).await.unwrap_or_else(|| "master agent".into()),
-            None => "master agent".into(),
+            Some(id) => self.session_label(id).await.unwrap_or_else(|| "master-agent".into()),
+            None => "master-agent".into(),
         };
 
         if let Some(id) = session {
@@ -405,8 +405,8 @@ impl Core {
     /// The in-place status line. `previous` is the broadcast being edited.
     pub async fn thinking(&self, session: Option<&str>, text: &str, previous: &Fanout) -> (String, Fanout) {
         let label = match session {
-            Some(id) => self.session_label(id).await.unwrap_or_else(|| "master agent".into()),
-            None => "master agent".into(),
+            Some(id) => self.session_label(id).await.unwrap_or_else(|| "master-agent".into()),
+            None => "master-agent".into(),
         };
         if let Some(id) = session {
             self.registry.lock().await.set_thinking(id, text);
@@ -435,7 +435,7 @@ impl Core {
             format!("q{n}")
         };
 
-        let label = self.session_label(session).await.unwrap_or_else(|| "master agent".into());
+        let label = self.session_label(session).await.unwrap_or_else(|| "master-agent".into());
         let text = decorate(&label, question);
 
         // the question is live in the ui whether or not telegram works

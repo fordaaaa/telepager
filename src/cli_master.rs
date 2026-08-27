@@ -56,7 +56,7 @@ pub async fn reply(core: &Arc<Core>, cfg: &Config, text: &str, origin: Origin) -
         conversation.push(crate::llm::Msg::User(text.to_string()));
         conversation.cli_session.clone()
     };
-    let system = crate::master::system_prompt(master.system.as_deref());
+    let system = crate::master::system_prompt(master.system.as_deref(), master.bundled_mcp);
     let exe = std::env::current_exe().context("finding our own binary")?;
 
     let plan = match master.provider {
@@ -296,18 +296,117 @@ fn stream_status(line: &str) -> Option<String> {
     latest
 }
 
-/// The MCP server definition handed to Claude Code.
-fn claude_mcp_config(exe: &Path, origin: Origin) -> String {
-    json!({
-        "mcpServers": {
-            SERVER_NAME: {
-                "command": exe.display().to_string(),
-                "args": ["master-mcp"],
-                "env": { "TELEPAGER_ORIGIN": origin.as_str() },
-            }
+/// Web and browser tooling the master gets unless the config turns it off.
+/// Same set the panoply plugin bundle ships.
+fn bundled_servers() -> serde_json::Map<String, Value> {
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        "github".into(),
+        json!({
+            "type": "http",
+            "url": "https://api.githubcopilot.com/mcp/",
+            "headers": {
+                "Authorization": "Bearer ${GITHUB_MCP_TOKEN}",
+                "X-MCP-Toolsets": "issues,pull_requests,repos",
+            },
+        }),
+    );
+    servers.insert("context7".into(), json!({ "type": "http", "url": "https://mcp.context7.com/mcp" }));
+    servers.insert(
+        "playwright".into(),
+        json!({ "type": "stdio", "command": "npx", "args": ["-y", "@playwright/mcp@latest"] }),
+    );
+    servers
+}
+
+/// Everything beyond telepager's own bridge that this config asks for, in
+/// Claude Code's `mcpServers` shape.
+fn extra_servers(master: &crate::config::MasterConfig) -> serde_json::Map<String, Value> {
+    let mut servers = if master.bundled_mcp { bundled_servers() } else { serde_json::Map::new() };
+    for (name, value) in master.mcp_servers.iter().flatten() {
+        if name != SERVER_NAME {
+            servers.insert(name.clone(), value.clone());
         }
-    })
-    .to_string()
+    }
+    servers
+}
+
+/// One server definition translated from Claude Code's shape into opencode's.
+/// `None` for anything neither cli would recognise.
+fn opencode_server(server: &Value) -> Option<Value> {
+    match server["type"].as_str() {
+        Some("http") | Some("sse") | Some("remote") => {
+            let mut out = json!({
+                "type": "remote",
+                "url": server["url"].as_str()?,
+                "enabled": true,
+            });
+            if let Some(headers) = server["headers"].as_object() {
+                let expanded: serde_json::Map<String, Value> = headers
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.clone(), json!(expand_env(v.as_str()?)?))))
+                    .collect();
+                if !expanded.is_empty() {
+                    out["headers"] = Value::Object(expanded);
+                }
+            }
+            Some(out)
+        }
+        Some("stdio") | Some("local") | None => {
+            let mut command = vec![json!(server["command"].as_str()?)];
+            command.extend(server["args"].as_array().into_iter().flatten().cloned());
+            let mut out = json!({ "type": "local", "command": command, "enabled": true });
+            if let Some(env) = server["env"].as_object() {
+                out["environment"] = Value::Object(env.clone());
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Claude Code expands `${VAR}` in a server definition itself; opencode spells
+/// it differently, so we do the substitution before handing the config over.
+/// `None` when a referenced variable isn't set, so a half-formed credential
+/// header is dropped rather than sent literally.
+fn expand_env(value: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let end = rest[start..].find('}')? + start;
+        out.push_str(&rest[..start]);
+        out.push_str(std::env::var(&rest[start + 2..end]).ok()?.trim());
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// The MCP server definitions handed to Claude Code.
+fn claude_mcp_config(exe: &Path, origin: Origin, master: &crate::config::MasterConfig) -> String {
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        SERVER_NAME.into(),
+        json!({
+            "command": exe.display().to_string(),
+            "args": ["master-mcp"],
+            "env": { "TELEPAGER_ORIGIN": origin.as_str() },
+        }),
+    );
+    servers.append(&mut extra_servers(master));
+    json!({ "mcpServers": servers }).to_string()
+}
+
+/// The `--allowedTools` value: our bridge, whatever else is configured, and the
+/// cli's own web tools when the bundle is on.
+fn claude_allowed_tools(master: &crate::config::MasterConfig) -> String {
+    let mut allowed = vec![format!("mcp__{SERVER_NAME}")];
+    allowed.extend(extra_servers(master).keys().map(|name| format!("mcp__{name}")));
+    if master.bundled_mcp {
+        allowed.push("WebSearch".into());
+        allowed.push("WebFetch".into());
+    }
+    allowed.join(",")
 }
 
 fn claude_plan(
@@ -326,12 +425,13 @@ fn claude_plan(
         "--output-format".into(),
         "stream-json".into(),
         "--verbose".into(),
-        // only our tools: the master orchestrates, it doesn't edit code itself
+        // a curated set, not whatever the user's own claude config carries:
+        // the master orchestrates, it doesn't edit code itself
         "--mcp-config".into(),
-        claude_mcp_config(exe, origin),
+        claude_mcp_config(exe, origin, master),
         "--strict-mcp-config".into(),
         "--allowedTools".into(),
-        format!("mcp__{SERVER_NAME}"),
+        claude_allowed_tools(master),
         "--append-system-prompt".into(),
         system.into(),
     ];
@@ -385,17 +485,24 @@ fn opencode_plan(
 ) -> Plan {
     // opencode takes its whole config as inline json, so telepager never has
     // to write to the user's opencode.json
-    let config = json!({
-        "mcp": {
-            SERVER_NAME: {
-                "type": "local",
-                "command": [exe.display().to_string(), "master-mcp"],
-                "enabled": true,
-                "environment": { "TELEPAGER_ORIGIN": origin.as_str() },
-            }
+    let mut mcp = serde_json::Map::new();
+    mcp.insert(
+        SERVER_NAME.into(),
+        json!({
+            "type": "local",
+            "command": [exe.display().to_string(), "master-mcp"],
+            "enabled": true,
+            "environment": { "TELEPAGER_ORIGIN": origin.as_str() },
+        }),
+    );
+    for (name, value) in extra_servers(master) {
+        if let Some(server) = opencode_server(&value) {
+            mcp.insert(name, server);
         }
-    })
-    .to_string();
+    }
+    // opencode has no allowlist flag and no built-in websearch/webfetch, so
+    // `--auto` plus the mcp set above is the whole story there.
+    let config = json!({ "mcp": mcp }).to_string();
 
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -578,12 +685,18 @@ mod tests {
         args.get(i + 1).cloned()
     }
 
+    fn bare(provider: Provider) -> MasterConfig {
+        MasterConfig { provider, bundled_mcp: false, ..MasterConfig::default() }
+    }
+
     #[test]
     fn claude_gets_our_mcp_server_and_nothing_else() {
-        let plan = claude_plan(&exe(), &master(Provider::ClaudeCode), "SYS", "do it", None, Origin::Ui);
+        let plan = claude_plan(&exe(), &bare(Provider::ClaudeCode), "SYS", "do it", None, Origin::Ui);
 
         assert!(plan.args.contains(&"--strict-mcp-config".to_string()));
         assert_eq!(arg_after(&plan.args, "--allowedTools").unwrap(), "mcp__telepager");
+        let config: Value = serde_json::from_str(&arg_after(&plan.args, "--mcp-config").unwrap()).unwrap();
+        assert_eq!(config["mcpServers"].as_object().unwrap().len(), 1);
         assert_eq!(arg_after(&plan.args, "--append-system-prompt").unwrap(), "SYS");
         assert_eq!(arg_after(&plan.args, "--output-format").unwrap(), "stream-json");
         assert!(plan.args.contains(&"--verbose".to_string()));
@@ -596,6 +709,59 @@ mod tests {
         assert!(plan.args.contains(&"do it".to_string()));
         // no session to resume on the first turn
         assert!(!plan.args.contains(&"--resume".to_string()));
+    }
+
+    #[test]
+    fn the_bundled_web_and_browser_servers_are_on_by_default() {
+        let plan = claude_plan(&exe(), &master(Provider::ClaudeCode), "SYS", "do it", None, Origin::Ui);
+
+        let config: Value = serde_json::from_str(&arg_after(&plan.args, "--mcp-config").unwrap()).unwrap();
+        assert_eq!(config["mcpServers"]["playwright"]["command"], "npx");
+        assert_eq!(config["mcpServers"]["context7"]["type"], "http");
+        assert_eq!(config["mcpServers"]["github"]["headers"]["X-MCP-Toolsets"], "issues,pull_requests,repos");
+        assert_eq!(config["mcpServers"]["telepager"]["args"][0], "master-mcp");
+
+        // strict stays on: a curated set, not the user's own claude config
+        assert!(plan.args.contains(&"--strict-mcp-config".to_string()));
+
+        let allowed = arg_after(&plan.args, "--allowedTools").unwrap();
+        for tool in ["mcp__telepager", "mcp__github", "mcp__context7", "mcp__playwright", "WebSearch", "WebFetch"] {
+            assert!(allowed.split(',').any(|t| t == tool), "{tool} missing from {allowed}");
+        }
+    }
+
+    #[test]
+    fn extra_servers_from_config_survive_the_bundle_being_off() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("mine".into(), json!({ "type": "stdio", "command": "my-mcp" }));
+        let cfg = MasterConfig { mcp_servers: Some(extra), ..bare(Provider::ClaudeCode) };
+
+        let plan = claude_plan(&exe(), &cfg, "s", "t", None, Origin::Ui);
+        let config: Value = serde_json::from_str(&arg_after(&plan.args, "--mcp-config").unwrap()).unwrap();
+        assert_eq!(config["mcpServers"]["mine"]["command"], "my-mcp");
+        assert!(config["mcpServers"]["playwright"].is_null());
+
+        let allowed = arg_after(&plan.args, "--allowedTools").unwrap();
+        assert_eq!(allowed, "mcp__telepager,mcp__mine");
+    }
+
+    #[test]
+    fn opencode_gets_the_bundle_in_its_own_shape() {
+        let plan = opencode_plan(&exe(), &master(Provider::Opencode), "SYS", "do it", None, Origin::Ui);
+        let config: Value = serde_json::from_str(&plan.env[0].1).unwrap();
+
+        assert_eq!(config["mcp"]["context7"]["type"], "remote");
+        assert_eq!(config["mcp"]["context7"]["url"], "https://mcp.context7.com/mcp");
+        assert_eq!(config["mcp"]["playwright"]["type"], "local");
+        assert_eq!(config["mcp"]["playwright"]["command"][0], "npx");
+        assert_eq!(config["mcp"]["playwright"]["command"][2], "@playwright/mcp@latest");
+        assert_eq!(config["mcp"]["telepager"]["type"], "local");
+    }
+
+    #[test]
+    fn an_unset_variable_drops_the_header_rather_than_sending_it_raw() {
+        assert_eq!(expand_env("Bearer ${TELEPAGER_NO_SUCH_VAR}"), None);
+        assert_eq!(expand_env("issues,repos").as_deref(), Some("issues,repos"));
     }
 
     #[test]
