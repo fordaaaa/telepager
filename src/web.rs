@@ -297,6 +297,7 @@ async fn state(core: &Arc<Core>) -> Result<Value> {
             "system": master.system.clone(),
             "bundled_mcp": master.bundled_mcp,
             "mcp_servers": master.mcp_servers.clone(),
+            "tmux_attach": master.tmux_attach,
             "ready": master.is_usable(),
             "key_source": master_key_source(&master),
             "providers": Provider::all().iter().map(|p| json!({
@@ -318,6 +319,7 @@ async fn state(core: &Arc<Core>) -> Result<Value> {
 /// The session list, each marked with whether we still hold a live process for
 /// it — that's what decides if "kill" and stdin are offered.
 async fn sessions_with_liveness(core: &Arc<Core>) -> Vec<Value> {
+    crate::tmux::sync(core).await;
     let mut out = Vec::new();
     for mut summary in core.sessions().await {
         let running = match summary["id"].as_str() {
@@ -475,6 +477,10 @@ async fn save_master(core: &Arc<Core>, body: &Value) -> Result<Value> {
             .and_then(|v| v.as_object())
             .cloned()
             .or(existing.mcp_servers),
+        tmux_attach: body
+            .get("tmux_attach")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(existing.tmux_attach),
     };
 
     let switched = master.provider != existing.provider;

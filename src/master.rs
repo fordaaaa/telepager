@@ -114,7 +114,7 @@ impl Conversation {
     }
 }
 
-pub(crate) fn system_prompt(extra: Option<&str>, web_tools: bool) -> String {
+pub(crate) fn system_prompt(extra: Option<&str>, web_tools: bool, tmux_attach: bool) -> String {
     let mut prompt = String::from(
         "You are the master agent. The person you're talking to is reaching you from \
          their phone over Telegram, or from a small web console on their own \
@@ -151,6 +151,14 @@ pub(crate) fn system_prompt(extra: Option<&str>, web_tools: bool) -> String {
              issues and pull requests, and a browser you can drive and screenshot \
              (playwright). Use them to check something yourself rather than sending \
              the person to look it up.",
+        );
+    }
+    if tmux_attach {
+        prompt.push_str(
+            "\n\nYou can also see coding agents the person started themselves in tmux \
+             panes, listed as tmux sessions. Read and type at those the same way, but \
+             they are the person's own terminals: killing one only sends Ctrl-C, and \
+             it never closes their pane.",
         );
     }
     if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
@@ -282,7 +290,7 @@ pub async fn reply(core: &Arc<Core>, text: &str, origin: Origin) -> Result<Strin
     }
     let llm = Llm::new(&cfg.master)?;
     log::debug!("master agent replying via {}", llm.describe());
-    let system = system_prompt(cfg.master.system.as_deref(), false);
+    let system = system_prompt(cfg.master.system.as_deref(), false, cfg.master.tmux_attach);
     let toolbox = tools();
 
     core.record(None, EventKind::Chat { role: "user".into(), text: text.to_string() })
@@ -352,6 +360,7 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
     let args = &call.args;
     match call.name.as_str() {
         "list_sessions" => {
+            crate::tmux::sync(core).await;
             let lines = core.session_lines().await;
             let pending = core.pending_questions().await;
 
@@ -380,6 +389,7 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
 
         "list_agents" => match core.config().await {
             Some(cfg) => {
+                crate::tmux::sync(core).await;
                 let installed: Vec<String> = crate::agents::catalog(&cfg.agents)
                     .into_iter()
                     .filter(|a| a["installed"].as_bool().unwrap_or(false))
@@ -391,11 +401,30 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
                         )
                     })
                     .collect();
-                if installed.is_empty() {
-                    "No agent CLIs are installed on this machine.".into()
+                let mut out = if installed.is_empty() {
+                    "No agent CLIs are installed on this machine.".to_string()
                 } else {
                     installed.join("\n")
+                };
+                let in_tmux: Vec<String> = core
+                    .sessions()
+                    .await
+                    .into_iter()
+                    .filter(|s| s["kind"] == "tmux")
+                    .map(|s| {
+                        format!(
+                            "{} — {} in tmux {}",
+                            s["id"].as_str().unwrap_or("?"),
+                            s["agent"].as_str().unwrap_or("?"),
+                            s["location"].as_str().unwrap_or("?")
+                        )
+                    })
+                    .collect();
+                if !in_tmux.is_empty() {
+                    out.push_str("\n\nAlready running in the person's own tmux panes:\n");
+                    out.push_str(&in_tmux.join("\n"));
                 }
+                out
             }
             None => "telepager isn't set up yet.".into(),
         },
@@ -422,6 +451,19 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
         "read_output" => {
             let session = str_arg(args, "session");
             let lines = args["lines"].as_u64().unwrap_or(60).clamp(1, 400) as usize;
+            if let Some(pane) = crate::tmux::pane_of(core, &session).await {
+                return match crate::tmux::capture(&pane, crate::tmux::CAPTURE_LINES).await {
+                    Some(text) if text.trim().is_empty() => {
+                        format!("{session}'s tmux pane is empty.")
+                    }
+                    Some(text) => {
+                        let kept: Vec<&str> = text.lines().collect();
+                        let start = kept.len().saturating_sub(lines);
+                        kept[start..].join("\n")
+                    }
+                    None => format!("Could not read {session}'s tmux pane."),
+                };
+            }
             match core.output_tail(&session, lines).await {
                 Some(text) if text.trim().is_empty() => {
                     format!("{session} hasn't produced any output yet.")
@@ -434,6 +476,12 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
         "send_to_agent" => {
             let session = str_arg(args, "session");
             let text = str_arg(args, "text");
+            if let Some(pane) = crate::tmux::pane_of(core, &session).await {
+                return match crate::tmux::send_text(&pane, &text).await {
+                    Ok(()) => format!("Typed it into {session}'s tmux pane."),
+                    Err(e) => format!("Could not: {e}"),
+                };
+            }
             match core.write_to_agent(&session, &text).await {
                 Ok(()) => format!("Sent it to {session}."),
                 Err(e) => format!("Could not: {e:#}"),
@@ -442,6 +490,17 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
 
         "kill_agent" => {
             let session = str_arg(args, "session");
+            // a tmux pane is the person's own terminal, not something we
+            // spawned, so the most we do to it is interrupt what's running
+            if let Some(pane) = crate::tmux::pane_of(core, &session).await {
+                return match crate::tmux::interrupt(&pane).await {
+                    Ok(()) => format!(
+                        "Sent Ctrl-C to {session}'s tmux pane. It's their own terminal, \
+                         so the pane is still open."
+                    ),
+                    Err(e) => format!("Could not: {e}"),
+                };
+            }
             match core.kill_agent(&session).await {
                 Ok(()) => format!("Killed {session}."),
                 Err(e) => format!("Could not: {e:#}"),
@@ -758,13 +817,14 @@ mod tests {
 
     #[test]
     fn the_system_prompt_appends_rather_than_replaces() {
-        let base = system_prompt(None, false);
-        let with_extra = system_prompt(Some("always speak like a pirate"), false);
+        let base = system_prompt(None, false, false);
+        let with_extra = system_prompt(Some("always speak like a pirate"), false, false);
         assert!(with_extra.starts_with(&base));
         assert!(with_extra.contains("pirate"));
         // an empty personal note doesn't add a dangling header
-        assert_eq!(system_prompt(Some("   "), false), base);
-        assert!(system_prompt(None, true).contains("playwright"));
+        assert_eq!(system_prompt(Some("   "), false, false), base);
+        assert!(system_prompt(None, true, false).contains("playwright"));
+        assert!(system_prompt(None, false, true).contains("tmux"));
     }
 
     #[test]

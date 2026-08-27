@@ -232,6 +232,39 @@ Off until you turn it on, in the console's settings or in the config:
 `confirm_destructive` asks first when a command looks like it deletes
 something. Every run is announced to everyone on the allowlist.
 
+### Attaching to your own tmux sessions
+
+**Off by default, and more invasive than the rest of telepager.** Normally
+telepager only touches sessions it started itself. Turn this on and it will also
+find Claude Code (and codex, gemini, opencode, and the other agent CLIs it knows)
+running in *your* tmux panes — ones you started by hand, that telepager had no
+part in — and let the master agent read their screens and type into them.
+
+Turn it on with the "Attach to tmux sessions running coding agents" checkbox in
+the console's settings, or in the config:
+
+```json
+{
+  "master": {
+    "tmux_attach": true
+  }
+}
+```
+
+Either way it takes effect immediately — no restart. What you get:
+
+- Those panes show up in `list_sessions` and in the console, marked `tmux`, so
+  you can tell them apart from sessions telepager started.
+- Reading one returns the last ~200 lines of that pane's screen.
+- Sending to one types the text into the pane and presses enter. It is a real
+  keystroke into a terminal you're probably also using.
+- **Killing one only sends Ctrl-C.** telepager never closes the pane or kills
+  the process: it's your terminal, and it didn't start it. If Ctrl-C doesn't
+  stop whatever is running, that's for you to deal with at the keyboard.
+
+Linux and macOS only. Without tmux installed, or with no tmux server running,
+nothing happens and nothing errors.
+
 ## As an MCP server
 
 Let an agent page *you*:
@@ -269,6 +302,7 @@ Also read from `./telepager.config.json`; `--config PATH` overrides the lookup.
 | `chat_id` | lowest allowed id | Where messages go. Rarely set. |
 | `ask_timeout_seconds` | `300` | How long `ask_question` waits before giving up. |
 | `master` | claude-code | Which backend answers you, and on what model. |
+| `master.tmux_attach` | `false` | Let the master see and type into agents running in your own tmux panes. |
 | `agents` | built-in list | Worker agent CLIs. Yours override built-ins of the same name. |
 | `allowed_dirs` | `[]` | Directories Telegram may start agents in. Empty disables it. |
 | `ui_port` | `47823` | The console's port. Falls back to a free one if this is taken. |
@@ -294,6 +328,11 @@ Also read from `./telepager.config.json`; `--config PATH` overrides the lookup.
   `allowed_dirs` is the boundary; the destructive-command prompt is a seatbelt,
   not a fence — a shell inside an allowed directory can still reach the rest of
   your machine.
+- `master.tmux_attach` is off by default. On, it reaches past the sessions
+  telepager started into terminals you own — reading their screens and typing
+  into them — and `allowed_dirs` does not gate it, because it isn't spawning
+  anything. Only turn it on if you're happy with whoever reaches the master
+  agent typing into your own tmux panes.
 - Keys are scrubbed from every error before it's logged or sent anywhere.
 
 To keep the old, inert pager-only behavior: leave `allowed_dirs` empty, so

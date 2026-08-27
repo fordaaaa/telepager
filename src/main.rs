@@ -13,6 +13,7 @@ mod screen;
 mod session;
 mod status;
 mod telegram;
+mod tmux;
 mod web;
 
 use std::path::PathBuf;

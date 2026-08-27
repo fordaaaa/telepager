@@ -20,13 +20,28 @@ const MAX_EVENTS_PER_SESSION: usize = 2000;
 
 pub type SessionId = String;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     /// An MCP client connected to us.
     Attached,
     /// An agent process we started.
     Spawned,
+    /// A coding agent running in a tmux pane we didn't start. `location` is the
+    /// `session:window.pane` string, for display.
+    TmuxAttached { pane_id: String, location: String },
+}
+
+impl Kind {
+    /// The word the UI and the master see. `tmux` marks a session telepager
+    /// found rather than started.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Kind::Attached => "attached",
+            Kind::Spawned => "spawned",
+            Kind::TmuxAttached { .. } => "tmux",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,11 +130,25 @@ pub struct Session {
 impl Session {
     /// The session list the UI and master both read, minus the event log —
     /// that's fetched per session.
+    /// The tmux pane behind this session, if it is one. The only place a pane
+    /// id ever comes from — never from tool input.
+    pub fn pane_id(&self) -> Option<&str> {
+        match &self.kind {
+            Kind::TmuxAttached { pane_id, .. } => Some(pane_id.as_str()),
+            _ => None,
+        }
+    }
+
     pub fn summary(&self) -> Value {
         json!({
             "id": self.id,
             "label": self.label,
-            "kind": self.kind,
+            "kind": self.kind.word(),
+            "pane": self.pane_id(),
+            "location": match &self.kind {
+                Kind::TmuxAttached { location, .. } => Some(location.clone()),
+                _ => None,
+            },
             "cwd": self.cwd.as_ref().map(|p| p.display().to_string()),
             "agent": self.agent,
             "task": self.task,
@@ -139,9 +168,12 @@ impl Session {
 
     /// A one-line description for the master agent's tool results.
     pub fn line(&self) -> String {
-        let kind = match self.kind {
+        let kind = match &self.kind {
             Kind::Attached => "attached".to_string(),
             Kind::Spawned => format!("spawned:{}", self.agent.as_deref().unwrap_or("?")),
+            Kind::TmuxAttached { location, .. } => {
+                format!("tmux:{}@{location}", self.agent.as_deref().unwrap_or("?"))
+            }
         };
         let mut out = format!("{} [{}] {} — {}", self.id, kind, self.label, self.state.word());
         if let Some(task) = &self.task {
@@ -468,6 +500,30 @@ mod tests {
         assert_eq!(s.agent.as_deref(), Some("claude"));
         assert!(matches!(s.events[0].kind, EventKind::Started { .. }));
         assert!(s.line().contains("fix the build"));
+    }
+
+    #[test]
+    fn a_tmux_session_carries_its_pane_and_says_so() {
+        let mut r = registry();
+        let id = r.open(
+            Kind::TmuxAttached { pane_id: "%12".into(), location: "work:0.1".into() },
+            "proj".into(),
+            Some(PathBuf::from("/home/me/proj")),
+            Some("claude".into()),
+            None,
+        );
+        let s = r.get(&id).unwrap();
+        assert_eq!(s.pane_id(), Some("%12"));
+        assert_eq!(s.summary()["kind"], "tmux");
+        assert_eq!(s.summary()["pane"], "%12");
+        assert_eq!(s.summary()["location"], "work:0.1");
+        assert!(s.line().contains("tmux:claude@work:0.1"));
+
+        // sessions we started have no pane, and the old kind words are unchanged
+        let other = r.open(Kind::Spawned, "x".into(), None, None, None);
+        assert!(r.get(&other).unwrap().pane_id().is_none());
+        assert_eq!(r.get(&other).unwrap().summary()["kind"], "spawned");
+        assert!(r.get(&other).unwrap().summary()["pane"].is_null());
     }
 
     #[test]

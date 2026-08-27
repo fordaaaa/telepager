@@ -610,6 +610,14 @@
       </p>
     </div>
     <div class="field">
+      <label class="check"><input type="checkbox" id="tmuxAttach"> Attach to tmux sessions running coding agents</label>
+      <p class="hint">
+        Lets the master read and send keystrokes into coding agents you started
+        yourself in tmux panes. Killing one only sends Ctrl-C — it never closes
+        your pane.
+      </p>
+    </div>
+    <div class="field">
       <label for="system">Extra instructions <span class="muted">(optional)</span></label>
       <textarea id="system" rows="3" placeholder="Anything it should always keep in mind."></textarea>
     </div>
@@ -1433,6 +1441,7 @@ $("openSettings").onclick = () => {
   $("baseUrl").value = m.base_url || "";
   $("system").value = m.system || "";
   $("bundledMcp").checked = m.bundled_mcp !== false;
+  $("tmuxAttach").checked = m.tmux_attach === true;
   $("apiKey").value = "";
   $("keyHint").textContent = m.key_source
     ? "Currently using a key from " + m.key_source + "."
@@ -1462,6 +1471,7 @@ $("settingsSave").onclick = async () => {
       base_url: $("baseUrl").value,
       system: $("system").value,
       bundled_mcp: $("bundledMcp").checked,
+      tmux_attach: $("tmuxAttach").checked,
     });
     note($("masterNote"), r.ready ? "Using " + r.model + "." : (r.problem || "Saved."), r.ready ? "ok" : "bad");
 

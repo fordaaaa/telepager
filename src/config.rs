@@ -210,6 +210,11 @@ pub struct MasterConfig {
     /// whether or not `bundled_mcp` is on.
     #[serde(alias = "mcpServers")]
     pub mcp_servers: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Let the master see, read and type at coding agents running in tmux panes
+    /// telepager didn't start. Off by default: those are the user's own
+    /// terminals, so this reaches further than the spawned-session model does.
+    #[serde(alias = "tmuxAttach")]
+    pub tmux_attach: bool,
 }
 
 impl Default for MasterConfig {
@@ -228,6 +233,7 @@ impl Default for MasterConfig {
             args: Vec::new(),
             bundled_mcp: true,
             mcp_servers: None,
+            tmux_attach: false,
         }
     }
 }

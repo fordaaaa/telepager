@@ -56,7 +56,7 @@ pub async fn reply(core: &Arc<Core>, cfg: &Config, text: &str, origin: Origin) -
         conversation.push(crate::llm::Msg::User(text.to_string()));
         conversation.cli_session.clone()
     };
-    let system = crate::master::system_prompt(master.system.as_deref(), master.bundled_mcp);
+    let system = crate::master::system_prompt(master.system.as_deref(), master.bundled_mcp, master.tmux_attach);
     let exe = std::env::current_exe().context("finding our own binary")?;
 
     let plan = match master.provider {
