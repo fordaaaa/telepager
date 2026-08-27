@@ -55,7 +55,7 @@ pub struct Exit {
 }
 
 impl Exit {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn success(&self) -> bool {
         self.code == Some(0)
     }
