@@ -65,6 +65,15 @@ claude mcp add --scope user telepager -- telepager mcp
 | `telepager status` | check setup, running state, active model |
 | `telepager webui` | open the console against whatever's already running |
 | `telepager mcp` | stdio MCP server (spawned by MCP clients) |
+| `telepager service install [--config PATH]` | start it in the background at login (launchd on macOS, systemd user service on Linux) |
+| `telepager service uninstall` | stop starting it at login |
+
+`telepager service install` registers a login service that runs
+`telepager start --no-open` for you; `telepager service uninstall` removes it.
+On macOS it writes a LaunchAgent (`~/Library/LaunchAgents/com.telepager.daemon.plist`,
+logs to `~/Library/Logs/telepager.log`); on Linux a systemd user unit
+(`~/.config/systemd/user/telepager.service`). Re-running install replaces the
+existing unit. Not supported on Windows yet.
 
 <details>
 <summary>If <code>npm install -g</code> fails with <code>EACCES</code></summary>
@@ -91,6 +100,13 @@ what you address when you're not talking to a specific session:
 
 It starts workers, summarizes what they're doing, reads their output, sends
 follow-ups, kills stuck ones, and answers questions a worker is blocked on.
+
+Photos, voice notes, video notes and documents send to Telegram are
+downloaded to the inbox under your cache dir (`telepager/inbox/<date>/`) and
+forwarded to the master agent with the saved path, so it can act on the file
+— e.g. read it with `run_shell`. Voice notes arrive with their length and
+format; telepager doesn't transcribe them, so type out anything that needs
+exact wording.
 
 On a Claude Code or opencode backend it also gets web search and fetch,
 library docs, GitHub issues and pull requests, and a browser it can drive and
@@ -279,7 +295,9 @@ claude mcp add --scope user telepager -- telepager mcp
 | `send_thinking(text)` | a `💭 …` status line, edited in place |
 | `ask_question(question, options[])` | blocks until you answer; returns your pick |
 
-Add to your `CLAUDE.md` so agents actually use it:
+Add to your `CLAUDE.md` so agents actually use it — or just run
+`telepager install-hooks` (auto-detects your agent, `--agent claude|opencode|cursor|all`
+to pick, `--dir DIR` for another directory; safe to re-run):
 
 > When you hit a decision you'd otherwise guess at during a long task, use
 > telepager's `ask_question` to ask me instead. Page me with `send_message`
@@ -293,7 +311,9 @@ Add to your `CLAUDE.md` so agents actually use it:
 | macOS | `~/Library/Application Support/telepager/config.json` |
 | Windows | `%APPDATA%\telepager\config.json` |
 
-Also read from `./telepager.config.json`; `--config PATH` overrides the lookup.
+Lookup order: `--config PATH` > `./.telepager/config.json` > `./telepager.config.json` > the global path above. Run `telepager status` inside a project and it picks up the project config with no `--config` needed.
+
+To scope terminal access per repo, run `telepager init [--dir DIR] [--preset pager-only|full]` (default preset `pager-only`). It writes `./.telepager/config.json` with `allowed_dirs` set to that directory and `permissions` from the preset (`pager-only`: `shell`/`remote_control` off; `full`: both on, `confirm_destructive` on either way), preserves any existing `bot_token`/`allowed_user_ids` in the file, and adds `.telepager/` to `.gitignore` once.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -348,6 +368,9 @@ Telegram can't start anything, and leave `shell` off.
   `telepager stop` ends it.
 - An agent on a `pty` ends when telepager does. Use the headless presets for
   anything that should outlive it.
+- Files you send to Telegram are saved to the inbox and the master agent is
+  told the path — it doesn't see photos as images yet, and voice notes aren't
+  transcribed. Files over 20MB are rejected.
 
 ## License
 
