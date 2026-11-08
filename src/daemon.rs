@@ -14,7 +14,7 @@ use crate::config::{MasterConfig, Provider};
 use crate::core::{Answer, Core, Fanout};
 use crate::ipc::{self, Endpoint, Request, Response};
 use crate::master::{self, Origin};
-use crate::session::{Kind, State};
+use crate::session::{EventKind, Kind, State};
 use crate::telegram::{IncomingMessage, Telegram};
 
 /// How long a freshly connected client has to introduce itself.
@@ -249,6 +249,13 @@ async fn handle_message(core: Arc<Core>, msg: IncomingMessage) {
         log::warn!("ignoring a message from {}", from.id);
         return;
     }
+    // Media first: a photo/voice/document with no text (and no caption) must
+    // still reach the master — it used to be silently dropped here. The
+    // allowlist check above runs before anything is downloaded.
+    if let Some(plan) = crate::telegram::media_plan(&msg) {
+        handle_media(core, &msg, plan).await;
+        return;
+    }
     let Some(text) = msg.text.clone() else { return };
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -271,6 +278,65 @@ async fn handle_message(core: Arc<Core>, msg: IncomingMessage) {
             reply_to_telegram(core, &answer).await;
         }
     }
+}
+
+/// A media message: download it to the inbox, then hand the master a prompt
+/// naming the saved path. The sender was already allowlisted in
+/// `handle_message`, so nothing is fetched for anyone else. The master sees
+/// text only (`Msg::User(String)`): vision wiring — passing photo bytes as
+/// multimodal blocks to the model encoders in llm.rs — is a future slice, so
+/// the master acts on the file at that path instead of seeing the pixels.
+/// Voice notes carry no transcript; the prompt says so (an STT backend could
+/// supply one later without changing this code).
+async fn handle_media(core: &Arc<Core>, msg: &IncomingMessage, plan: crate::telegram::MediaPlan) {
+    let Some(tg) = core.telegram().await else {
+        reply_to_telegram(core, "couldn't download that: telegram isn't set up yet").await;
+        return;
+    };
+
+    let message_id = msg.message_id;
+    let saved = download_media(&tg, message_id, &plan).await;
+    let path = match saved {
+        Ok(path) => path,
+        Err(e) => {
+            reply_to_telegram(core, &format!("couldn't download that: {e:#}")).await;
+            return;
+        }
+    };
+
+    core.record(
+        None,
+        EventKind::Notice {
+            text: format!("telegram {} saved at {}", plan.kind, path.display()),
+        },
+    )
+    .await;
+
+    let prompt = crate::telegram::media_prompt(&plan, &path);
+    let answer = match master::reply(core, &prompt, Origin::Telegram).await {
+        Ok(text) => text,
+        Err(e) => format!("⚠️ {e:#}"),
+    };
+    reply_to_telegram(core, &answer).await;
+}
+
+/// Fetch one file into the dated inbox and return where it landed. Size is
+/// checked before saving, the write is tmp-then-rename, and the path is
+/// always under the cache-dir inbox — no telegram-supplied name reaches it.
+async fn download_media(
+    tg: &Telegram,
+    message_id: i64,
+    plan: &crate::telegram::MediaPlan,
+) -> Result<std::path::PathBuf> {
+    let file_path = tg.get_file(&plan.file_id).await?;
+    let bytes = tg.download_file(&file_path).await?;
+    crate::telegram::check_file_size(bytes.len())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dir = crate::telegram::inbox_dir().join(crate::telegram::yyyymmdd_from_unix(now));
+    crate::telegram::write_inbox_file(&dir, message_id, &plan.ext, &bytes)
 }
 
 /// `where_said` is the message the command arrived in, so one carrying a
@@ -828,6 +894,12 @@ mod tests {
             from: None,
             text: Some(text.to_string()),
             reply_to_message: reply_to.map(|message_id| SentMessage { message_id }),
+            photo: None,
+            voice: None,
+            audio: None,
+            video_note: None,
+            document: None,
+            caption: None,
         }
     }
 
@@ -1257,5 +1329,48 @@ mod tests {
         let c = core();
         // no config means no allowlist, so nobody is allowed
         assert!(!allowed(&c, 12345).await);
+    }
+
+    // ---- Feature 3: media messages route to a download, not to the void ----
+
+    #[test]
+    fn a_photo_message_routes_to_a_download_plan() {
+        let msg: IncomingMessage = serde_json::from_str(
+            r#"{"message_id":55,"chat":{"id":7},"from":{"id":7},"photo":[{"file_id":"s","width":1,"height":1},{"file_id":"L","width":9,"height":9}],"caption":"hi"}"#,
+        )
+        .unwrap();
+        let plan = crate::telegram::media_plan(&msg).expect("a photo must plan a download");
+        assert_eq!(plan.file_id, "L");
+        assert_eq!(plan.caption.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn a_voice_note_with_no_caption_still_routes_to_a_download() {
+        let msg: IncomingMessage = serde_json::from_str(
+            r#"{"message_id":56,"chat":{"id":7},"from":{"id":7},"voice":{"file_id":"v","mime_type":"audio/ogg","duration":9}}"#,
+        )
+        .unwrap();
+        // the old handle_message dropped this entirely: no text, no caption
+        assert!(msg.text.is_none());
+        let plan = crate::telegram::media_plan(&msg).expect("voice must not be dropped");
+        assert_eq!(plan.kind, "voice");
+        assert_eq!(plan.duration, Some(9));
+    }
+
+    #[test]
+    fn a_document_message_routes_to_a_download_plan() {
+        let msg: IncomingMessage = serde_json::from_str(
+            r#"{"message_id":57,"chat":{"id":7},"from":{"id":7},"document":{"file_id":"d","file_name":"a.txt","mime_type":"text/plain"}}"#,
+        )
+        .unwrap();
+        let plan = crate::telegram::media_plan(&msg).expect("a document must plan a download");
+        assert_eq!(plan.kind, "document");
+        assert_eq!(plan.ext, "txt");
+    }
+
+    #[test]
+    fn a_plain_text_message_has_no_download_plan() {
+        let msg = message("hello", None);
+        assert!(crate::telegram::media_plan(&msg).is_none());
     }
 }

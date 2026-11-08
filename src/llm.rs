@@ -32,6 +32,10 @@ pub struct ToolCall {
 }
 
 /// One entry of conversation history.
+// TODO(vision): Msg::User is text-only. Telegram photos/voice currently reach
+// the master as a saved-file path prompt (see telegram::media_prompt); wiring
+// base64 multimodal blocks into the encoders below is a future slice, so the
+// unit tests here stay stable.
 #[derive(Debug, Clone)]
 pub enum Msg {
     User(String),
