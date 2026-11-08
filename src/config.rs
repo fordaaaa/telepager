@@ -42,6 +42,40 @@ impl Default for Permissions {
     }
 }
 
+/// The two shapes `telepager init` can write: a pager that can't run anything,
+/// or the full local console with shell and remote control.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InitPreset {
+    #[default]
+    PagerOnly,
+    Full,
+}
+
+impl InitPreset {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pager-only" => Some(Self::PagerOnly),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    pub fn permissions(self) -> Permissions {
+        match self {
+            Self::PagerOnly => Permissions {
+                shell: false,
+                remote_control: false,
+                confirm_destructive: true,
+            },
+            Self::Full => Permissions {
+                shell: true,
+                remote_control: true,
+                confirm_destructive: true,
+            },
+        }
+    }
+}
+
 /// Which backend the master agent runs on. Most are HTTP APIs whose wire
 /// formats differ enough to name, though everything openai-shaped (openrouter,
 /// groq, together, lm studio, vllm, ollama's /v1) is one variant with a
@@ -456,16 +490,32 @@ pub fn first_candidate() -> String {
 }
 
 fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
+    resolve_config_path_in(explicit, Path::new("."), config_candidates())
+}
+
+/// The lookup order, with the working directory and global candidates passed
+/// in so it can be tested without changing process-wide state:
+/// `--config` > `./.telepager/config.json` > `./telepager.config.json` > global.
+fn resolve_config_path_in(
+    explicit: Option<&Path>,
+    cwd: &Path,
+    globals: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(p.to_path_buf());
     }
 
-    let cwd = PathBuf::from("telepager.config.json");
-    if cwd.exists() {
-        return Some(cwd);
+    let project = cwd.join(".telepager").join("config.json");
+    if project.exists() {
+        return Some(project);
     }
 
-    config_candidates().into_iter().find(|p| p.exists())
+    let legacy = cwd.join("telepager.config.json");
+    if legacy.exists() {
+        return Some(legacy);
+    }
+
+    globals.into_iter().find(|p| p.exists())
 }
 
 // the config file we'd read right now, if there is one. an explicit --config
@@ -572,6 +622,49 @@ pub fn save_permissions(explicit: Option<&Path>, permissions: &Permissions) -> R
     obj.insert("permissions".into(), serde_json::to_value(permissions)?);
     write_doc(&path, &doc)?;
     Ok(path)
+}
+
+/// Write a project-local `.telepager/config.json` that scopes terminal access
+/// to `dir`, and keep the directory out of git. Anything already in the file —
+/// the bot token and allowlist in particular — is left alone.
+pub fn init(dir: Option<&Path>, preset: InitPreset) -> Result<PathBuf> {
+    let base = match dir {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().context("finding the current directory")?,
+    };
+    let base = std::fs::canonicalize(&base)
+        .with_context(|| format!("{} is not a directory", base.display()))?;
+    if !base.is_dir() {
+        bail!("{} is not a directory", base.display());
+    }
+
+    let path = base.join(".telepager").join("config.json");
+    let mut doc = read_doc(&path)?;
+    let obj = doc
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
+    obj.insert("allowed_dirs".into(), serde_json::json!([base]));
+    obj.insert("permissions".into(), serde_json::to_value(preset.permissions())?);
+    write_doc(&path, &doc)?;
+
+    ignore_in_git(&base)?;
+    Ok(path)
+}
+
+fn ignore_in_git(dir: &Path) -> Result<()> {
+    let path = dir.join(".gitignore");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    if text.lines().any(|line| line.trim() == ".telepager/") {
+        return Ok(());
+    }
+
+    let mut out = text;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(".telepager/\n");
+    std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 /// `provider: "openrouter"` names a service, not just an api shape. serde maps
@@ -1012,5 +1105,95 @@ mod tests {
     fn ollama_is_usable_without_a_key() {
         let m = MasterConfig { provider: Provider::Ollama, ..MasterConfig::default() };
         assert!(m.is_usable());
+    }
+
+    #[test]
+    fn init_lookup_prefers_the_project_config() {
+        let dir = scratch("init-lookup");
+        let global = dir.join("global").join("config.json");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "{}").unwrap();
+
+        assert_eq!(
+            resolve_config_path_in(None, &dir, vec![global.clone()]),
+            Some(global.clone())
+        );
+
+        let legacy = dir.join("telepager.config.json");
+        std::fs::write(&legacy, "{}").unwrap();
+        assert_eq!(
+            resolve_config_path_in(None, &dir, vec![global.clone()]),
+            Some(legacy.clone())
+        );
+
+        let project = dir.join(".telepager").join("config.json");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&project, "{}").unwrap();
+        assert_eq!(
+            resolve_config_path_in(None, &dir, vec![global.clone()]),
+            Some(project.clone())
+        );
+
+        let explicit = dir.join("explicit.json");
+        assert_eq!(
+            resolve_config_path_in(Some(&explicit), &dir, vec![global]),
+            Some(explicit)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn init_writes_the_preset_permissions_and_the_allowed_dir() {
+        let dir = scratch("init-preset");
+        let path = init(Some(&dir), InitPreset::Full).unwrap();
+
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["allowed_dirs"], serde_json::json!([dir.canonicalize().unwrap()]));
+        assert_eq!(back["permissions"]["shell"], true);
+        assert_eq!(back["permissions"]["remote_control"], true);
+        assert_eq!(back["permissions"]["confirm_destructive"], true);
+
+        let pager = scratch("init-pager");
+        let path = init(Some(&pager), InitPreset::PagerOnly).unwrap();
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["permissions"]["shell"], false);
+        assert_eq!(back["permissions"]["remote_control"], false);
+        assert_eq!(back["permissions"]["confirm_destructive"], true);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&pager).unwrap();
+    }
+
+    #[test]
+    fn init_keeps_a_token_already_in_the_project_config() {
+        let dir = scratch("init-merge");
+        let path = dir.join(".telepager").join("config.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"bot_token":"keep","allowed_user_ids":[7]}"#).unwrap();
+
+        init(Some(&dir), InitPreset::Full).unwrap();
+
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["bot_token"], "keep");
+        assert_eq!(back["allowed_user_ids"], serde_json::json!([7]));
+        assert_eq!(back["permissions"]["shell"], true);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn init_ignores_the_project_config_in_git_once() {
+        let dir = scratch("init-gitignore");
+        std::fs::write(dir.join(".gitignore"), "target\n").unwrap();
+
+        init(Some(&dir), InitPreset::PagerOnly).unwrap();
+        init(Some(&dir), InitPreset::PagerOnly).unwrap();
+
+        let text = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(text.starts_with("target\n"), "{text}");
+        assert_eq!(text.matches(".telepager/").count(), 1, "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

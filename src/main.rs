@@ -4,12 +4,14 @@ mod client;
 mod config;
 mod core;
 mod daemon;
+mod hooks;
 mod ipc;
 mod llm;
 mod master;
 mod master_mcp;
 mod mcp;
 mod screen;
+mod service;
 mod session;
 mod status;
 mod telegram;
@@ -26,11 +28,15 @@ usage: telepager [--no-open] [--config PATH]
        telepager webui [--no-open] [--config PATH]
        telepager start [--no-open] [--config PATH]
        telepager setup [--port N] [--no-open] [--config PATH]
+       telepager init [--dir DIR] [--preset pager-only|full]
+       telepager install-hooks [--dir DIR] [--agent claude|opencode|cursor|all]
        telepager status [--config PATH]
        telepager mcp [--config PATH]
        telepager master-mcp
        telepager daemon [--no-open] [--config PATH]
        telepager stop
+       telepager service install [--config PATH]
+       telepager service uninstall
 
   (no command)    run the app here and open the console in your browser. it
                   lives in this terminal — ctrl-c ends it. runs setup first if
@@ -40,6 +46,10 @@ usage: telepager [--no-open] [--config PATH]
   start           run the app in the background instead, so it outlives this
                   terminal. `telepager stop` ends it.
   setup           connect a telegram bot: paste a token, pick up your user id.
+  init            write a per-project .telepager/config.json that scopes
+                  terminal access to this repo, and ignore it in git.
+  install-hooks   add telepager paging guidance to CLAUDE.md / AGENTS.md so
+                  agents auto-send when done. prints the mcp registration.
   status          show whether it's set up and running.
   mcp             the stdio server an mcp client starts. this is what you
                   register with claude code, cursor and friends.
@@ -47,10 +57,15 @@ usage: telepager [--no-open] [--config PATH]
                   through. started by telepager itself, not by you.
   daemon          run the app in the foreground without opening a browser.
   stop            stop the background app.
+  service install start it in the background at login, so it's always there.
+  service uninstall stop doing that.
 
   --config PATH   config file to use, instead of the default lookup
-                  (./telepager.config.json, then telepager/config.json
-                  in your user config dir)
+                  (./.telepager/config.json, ./telepager.config.json, then
+                  telepager/config.json in your user config dir)
+  --dir DIR       directory for `telepager init` / `install-hooks` (default: current)
+  --preset P      init preset: pager-only (default) or full
+  --agent A       install-hooks agent: claude, opencode, cursor, or all
   --port N        port for the console (default: any free one)
   --no-open       don't try to launch a browser
   -h, --help      show this
@@ -75,6 +90,8 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Action::Stop => return finish(status::stop()),
+        Action::ServiceInstall { config } => return finish(service::install(config)),
+        Action::ServiceUninstall => return finish(service::uninstall()),
         Action::App { config, open } => {
             init_logging();
             return finish(status::open_console(config, open));
@@ -86,6 +103,34 @@ fn main() -> ExitCode {
         Action::Setup { config, port, open } => {
             init_logging();
             return finish(web::run_standalone(config, port, open));
+        }
+        Action::Init { dir, preset } => {
+            return match config::init(dir.as_deref(), preset) {
+                Ok(path) => {
+                    println!("wrote {}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Action::InstallHooks { dir, agent } => {
+            let dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            return match hooks::install(&dir, agent) {
+                Ok(written) => {
+                    for path in &written {
+                        println!("wrote {}", path.display());
+                    }
+                    println!("register the mcp server: {}", hooks::REGISTRATION_COMMAND);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    ExitCode::FAILURE
+                }
+            };
         }
         Action::MasterMcp => {
             init_logging();
@@ -158,12 +203,18 @@ enum Action {
     /// Put the app in the background and open the console.
     Start { config: Option<PathBuf>, open: bool },
     Setup { config: Option<PathBuf>, port: u16, open: bool },
+    Init { dir: Option<PathBuf>, preset: config::InitPreset },
+    InstallHooks { dir: Option<PathBuf>, agent: Option<hooks::Agent> },
     Status(Option<PathBuf>),
     Mcp(Option<PathBuf>),
     /// The MCP bridge a CLI-backed master agent calls telepager through.
     MasterMcp,
     Daemon { config: Option<PathBuf>, open: bool },
     Stop,
+    /// Install a login/boot service that runs `telepager start --no-open`.
+    ServiceInstall { config: Option<PathBuf> },
+    /// Remove that service.
+    ServiceUninstall,
     Exit,
 }
 
@@ -175,8 +226,12 @@ fn parse_args() -> Result<Action, String> {
 fn parse(args: impl Iterator<Item = String>, by_a_person: bool) -> Result<Action, String> {
     let mut config = None;
     let mut mode = None;
+    let mut service = None;
     let mut port = 0u16;
     let mut open = true;
+    let mut dir = None;
+    let mut preset = None;
+    let mut agent = None;
     let mut args = args;
 
     while let Some(arg) = args.next() {
@@ -190,7 +245,21 @@ fn parse(args: impl Iterator<Item = String>, by_a_person: bool) -> Result<Action
                 return Ok(Action::Exit);
             }
             "mcp" | "master-mcp" | "daemon" | "status" | "setup" | "webui" | "ui" | "start"
-            | "stop" => mode = Some(arg),
+            | "init" | "install-hooks" | "stop" => mode = Some(arg),
+            "service" => {
+                let action = args
+                    .next()
+                    .ok_or("service needs `install` or `uninstall`")?;
+                service = Some(match action.as_str() {
+                    "install" => true,
+                    "uninstall" => false,
+                    other => {
+                        return Err(format!(
+                            "service: '{other}' isn't `install` or `uninstall`"
+                        ))
+                    }
+                });
+            }
             "--port" => {
                 let value = args.next().ok_or("--port needs a number")?;
                 port = value
@@ -202,12 +271,38 @@ fn parse(args: impl Iterator<Item = String>, by_a_person: bool) -> Result<Action
                 let path = args.next().ok_or("--config needs a path")?;
                 config = Some(PathBuf::from(path));
             }
+            "--dir" => {
+                let path = args.next().ok_or("--dir needs a path")?;
+                dir = Some(PathBuf::from(path));
+            }
+            "--preset" => {
+                let value = args.next().ok_or("--preset needs a value")?;
+                preset = Some(
+                    config::InitPreset::parse(&value)
+                        .ok_or_else(|| format!("--preset: '{value}' is not pager-only or full"))?,
+                );
+            }
+            "--agent" => {
+                let value = args.next().ok_or("--agent needs a value")?;
+                agent = Some(
+                    hooks::Agent::parse(&value)
+                        .ok_or_else(|| format!("--agent: '{value}' is not claude, opencode, cursor, or all"))?,
+                );
+            }
             other => return Err(format!("unexpected argument '{other}'")),
         }
     }
 
+    match service {
+        Some(true) => return Ok(Action::ServiceInstall { config }),
+        Some(false) => return Ok(Action::ServiceUninstall),
+        None => {}
+    }
+
     match mode.as_deref() {
         Some("setup") => Ok(Action::Setup { config, port, open }),
+        Some("init") => Ok(Action::Init { dir, preset: preset.unwrap_or_default() }),
+        Some("install-hooks") => Ok(Action::InstallHooks { dir, agent }),
         Some("webui") | Some("ui") => Ok(Action::App { config, open }),
         Some("start") => Ok(Action::Start { config, open }),
         Some("daemon") => Ok(Action::Daemon { config, open: false }),
@@ -232,7 +327,20 @@ mod tests {
 
     #[test]
     fn the_usage_documents_every_command() {
-        for command in ["webui", "setup", "status", "mcp", "master-mcp", "daemon", "start", "stop"] {
+        for command in [
+            "webui",
+            "setup",
+            "init",
+            "install-hooks",
+            "status",
+            "mcp",
+            "master-mcp",
+            "daemon",
+            "start",
+            "stop",
+            "service install",
+            "service uninstall",
+        ] {
             assert!(
                 super::USAGE.contains(command),
                 "usage doesn't mention {command}"
@@ -267,6 +375,33 @@ mod tests {
     }
 
     #[test]
+    fn service_installs_and_uninstalls_at_login() {
+        assert!(matches!(
+            parse(args(&["service", "install"]), true).unwrap(),
+            Action::ServiceInstall { config: None }
+        ));
+        match parse(args(&["service", "install", "--config", "/tmp/c.json"]), true).unwrap() {
+            Action::ServiceInstall { config } => {
+                assert_eq!(config.as_deref(), Some(std::path::Path::new("/tmp/c.json")));
+            }
+            _ => panic!("service install isn't an install"),
+        }
+        assert!(matches!(
+            parse(args(&["service", "uninstall"]), true).unwrap(),
+            Action::ServiceUninstall
+        ));
+    }
+
+    #[test]
+    fn service_without_an_action_says_what_the_actions_are() {
+        let err = match parse(args(&["service"]), true) {
+            Ok(_) => panic!("bare `service` was accepted"),
+            Err(e) => e,
+        };
+        assert!(err.contains("install"), "{err}");
+    }
+
+    #[test]
     fn webui_takes_the_foreground_path_too() {
         for name in ["webui", "ui"] {
             assert!(
@@ -274,5 +409,42 @@ mod tests {
                 "{name} isn't the app"
             );
         }
+    }
+
+    #[test]
+    fn init_takes_a_directory_and_a_preset() {
+        match parse(args(&["init"]), true).unwrap() {
+            Action::Init { dir: None, preset: crate::config::InitPreset::PagerOnly } => {}
+            _ => panic!("bare init isn't pager-only in the current directory"),
+        }
+
+        match parse(args(&["init", "--dir", "/tmp/project", "--preset", "full"]), true).unwrap() {
+            Action::Init { dir: Some(dir), preset: crate::config::InitPreset::Full } => {
+                assert_eq!(dir, std::path::PathBuf::from("/tmp/project"));
+            }
+            _ => panic!("init didn't take --dir and --preset"),
+        }
+    }
+
+    #[test]
+    fn init_rejects_an_unknown_preset() {
+        assert!(parse(args(&["init", "--preset", "everything"]), true).is_err());
+    }
+
+    #[test]
+    fn install_hooks_accepts_dir_and_agent() {
+        match parse(args(&["install-hooks", "--dir", "/tmp/project", "--agent", "opencode"]), true).unwrap() {
+            Action::InstallHooks { dir: Some(dir), agent: Some(crate::hooks::Agent::Opencode) } => {
+                assert_eq!(dir, std::path::PathBuf::from("/tmp/project"));
+            }
+            _ => panic!("install-hooks didn't take --dir and --agent"),
+        }
+        let bare = parse(args(&["install-hooks"]), true).unwrap();
+        assert!(matches!(bare, Action::InstallHooks { dir: None, agent: None }));
+    }
+
+    #[test]
+    fn install_hooks_rejects_a_bad_agent() {
+        assert!(parse(args(&["install-hooks", "--agent", "emacs"]), true).is_err());
     }
 }
