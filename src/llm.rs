@@ -98,8 +98,10 @@ impl Llm {
     }
 
     /// Keys ride in the url for gemini, and reqwest prints urls in its errors.
+    /// Any non-empty key is scrubbed, however short — a short key still
+    /// identifies a provider and still ends up quoted in an error.
     fn scrub(&self, e: anyhow::Error) -> anyhow::Error {
-        let Some(key) = self.key.as_deref().filter(|k| k.len() > 6) else {
+        let Some(key) = self.key.as_deref().filter(|k| !k.is_empty()) else {
             return e;
         };
         let text = format!("{e:#}");
@@ -743,6 +745,21 @@ mod tests {
         let llm = Llm::new(&cfg).unwrap();
         let leaky = anyhow::anyhow!("calling https://x/models?key=SUPER-SECRET-KEY");
         assert!(!format!("{:#}", llm.scrub(leaky)).contains("SUPER-SECRET-KEY"));
+    }
+
+    #[test]
+    fn short_keys_are_scrubbed_from_errors_too() {
+        // keys shorter than the old length gate still end up quoted in URLs
+        let cfg = MasterConfig {
+            provider: Provider::Gemini,
+            api_key: Some("ab12".into()),
+            ..MasterConfig::default()
+        };
+        let llm = Llm::new(&cfg).unwrap();
+        let leaky = anyhow::anyhow!("calling https://x/models?key=ab12 failed");
+        let scrubbed = format!("{:#}", llm.scrub(leaky));
+        assert!(!scrubbed.contains("ab12"), "{scrubbed}");
+        assert!(scrubbed.contains("<redacted>"), "{scrubbed}");
     }
 
     #[test]

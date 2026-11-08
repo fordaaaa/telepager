@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -114,6 +116,10 @@ struct FileInfo {
 #[derive(Debug, Deserialize)]
 pub struct Chat {
     pub id: i64,
+    /// Telegram's `type`: "private" | "group" | "supergroup" | "channel".
+    /// /key refuses groups, so keys never land in shared chats.
+    #[serde(default, rename = "type")]
+    pub typ: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -600,7 +606,31 @@ pub fn write_inbox_file(dir: &Path, message_id: i64, ext: &str, bytes: &[u8]) ->
     let final_path = dir.join(format!("{message_id}.{ext}"));
     debug_assert!(is_under(&final_path, dir));
     let tmp_path = dir.join(format!("{message_id}.{ext}.tmp"));
-    std::fs::write(&tmp_path, bytes).with_context(|| format!("writing {}", tmp_path.display()))?;
+    // a symlink at either end would turn the tmp write or the rename into a
+    // write / replace of something outside the inbox
+    for path in [&tmp_path, &final_path] {
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                bail!("refusing to follow symlink {}", path.display());
+            }
+        }
+    }
+    // saved files can carry anything, so they are owner-only from creation
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp_path).with_context(|| format!("writing {}", tmp_path.display()))?;
+    file.write_all(bytes).with_context(|| format!("writing {}", tmp_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("writing {}", tmp_path.display()))?;
+    }
     std::fs::rename(&tmp_path, &final_path)
         .with_context(|| format!("renaming {} to {}", tmp_path.display(), final_path.display()))?;
     Ok(final_path)
@@ -884,6 +914,59 @@ mod tests {
         let cache = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
         assert!(dir.starts_with(&cache), "{} not under cache dir", dir.display());
         assert!(dir.ends_with("telepager/inbox") || dir.to_string_lossy().ends_with("telepager/inbox"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_inbox_refuses_to_follow_a_planted_symlink() {
+        let dir = std::env::temp_dir().join(format!("telepager-inbox-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        let tmp = dir.join("123.png.tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        let err = write_inbox_file(&dir, 123, "png", b"hi").map(|_| ()).unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+        // following the link would have overwritten the victim
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert!(!dir.join("123.png").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_inbox_file_is_owner_only() {
+        let dir = std::env::temp_dir().join(format!("telepager-inbox-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let saved = write_inbox_file(&dir, 55, "png", b"hello").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&saved).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_type_distinguishes_private_from_group() {
+        let upd: Update = serde_json::from_str(
+            r#"{"update_id":1,"message":{"message_id":1,"chat":{"id":-100,"type":"supergroup"},"from":{"id":7},"text":"hi"}}"#,
+        )
+        .unwrap();
+        assert_eq!(upd.message.unwrap().chat.unwrap().typ.as_deref(), Some("supergroup"));
+
+        let upd: Update = serde_json::from_str(
+            r#"{"update_id":1,"message":{"message_id":1,"chat":{"id":7,"type":"private"},"from":{"id":7},"text":"hi"}}"#,
+        )
+        .unwrap();
+        assert_eq!(upd.message.unwrap().chat.unwrap().typ.as_deref(), Some("private"));
+
+        // chats telegram doesn't annotate (old payloads) read as unknown
+        let upd: Update = serde_json::from_str(
+            r#"{"update_id":1,"message":{"message_id":1,"chat":{"id":7},"from":{"id":7},"text":"hi"}}"#,
+        )
+        .unwrap();
+        assert!(upd.message.unwrap().chat.unwrap().typ.is_none());
     }
 
     #[test]

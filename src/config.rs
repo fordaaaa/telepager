@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -550,7 +551,18 @@ fn write_doc(path: &Path, doc: &serde_json::Value) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(path, serde_json::to_vec_pretty(doc)?)
+    // owner-only from creation, so the token never sits in a world-readable
+    // file between the open and the chmod; the chmod after covers a file
+    // that already existed and therefore kept its old mode.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path).with_context(|| format!("writing {}", path.display()))?;
+    file.write_all(&serde_json::to_vec_pretty(doc)?)
         .with_context(|| format!("writing {}", path.display()))?;
 
     // the token is a credential, so don't leave it world readable
@@ -846,6 +858,17 @@ mod tests {
         assert_eq!(back["bot_token"], "new");
         assert_eq!(back["allowed_user_ids"], serde_json::json!([7, 8]));
         assert_eq!(back["ask_timeout_seconds"], 900);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_config_file_is_owner_only() {
+        let dir = scratch("cfg-mode");
+        let path = dir.join("config.json");
+        save(Some(&path), "tok", &[1]).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

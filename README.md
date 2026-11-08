@@ -336,6 +336,12 @@ To scope terminal access per repo, run `telepager init [--dir DIR] [--preset pag
 - `allowed_dirs` is empty by default, so Telegram can't spawn agents anywhere
   until you set it. The local console is unrestricted — using it means you're
   already at the machine.
+- Spawning or messaging an agent from Telegram requires `permissions.shell`
+  (plus an allowed directory). The console stays exempt. Tasks and models
+  that start with `-` are refused, so they can't be parsed as agent
+  command-line flags.
+- `/key` only works in a private chat — in a group or supergroup chat it is
+  refused, so a key never lands where everyone in the chat can see it.
 - The console is loopback-only, on a fixed port (`47823` unless you set
   `ui_port`), behind a one-off key in the URL, and checks the `Host` header.
 - Prefer `TELEGRAM_BOT_TOKEN` over the plaintext config; the file is `0600`.

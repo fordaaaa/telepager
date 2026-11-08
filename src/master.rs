@@ -435,6 +435,27 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
             let task = str_arg(args, "task");
             let model = str_arg(args, "model");
             let model = (!model.is_empty()).then_some(model);
+            // spawning is shell-equivalent (the agent runs commands), so from
+            // telegram it needs shell access on top of an allowed directory —
+            // without this the allowlist alone was the whole boundary. The
+            // console stays exempt: reaching it means being at the machine.
+            if origin.is_telegram() && !matches!(core.config().await, Some(ref cfg) if cfg.permissions.shell) {
+                return format!(
+                    "shell access is off. spawning from telegram needs it. turn it on in the \
+                     console's Settings, or set permissions.shell to true in {}.",
+                    crate::config::first_candidate()
+                );
+            }
+            // a task or model starting with '-' would be parsed as a flag.
+            // agents::launch refuses it too; this is just the earlier, clearer no.
+            if let Err(e) = crate::agents::reject_flag_like(&task, "task") {
+                return format!("Could not start it: {e:#}");
+            }
+            if let Some(m) = &model {
+                if let Err(e) = crate::agents::reject_flag_like(m, "model") {
+                    return format!("Could not start it: {e:#}");
+                }
+            }
             match core.spawn_agent(&agent, &dir, &task, model.as_deref(), origin.is_telegram()).await {
                 Ok(id) => format!("Started {agent} in {dir} as session {id}."),
                 Err(e) => format!("Could not start it: {e:#}"),
@@ -476,6 +497,16 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
         "send_to_agent" => {
             let session = str_arg(args, "session");
             let text = str_arg(args, "text");
+            // typing at an agent is shell-equivalent for the same reason
+            // spawning is, so telegram needs shell access here too. This is
+            // checked before the tmux-pane path, not just the core path.
+            if origin.is_telegram() && !matches!(core.config().await, Some(ref cfg) if cfg.permissions.shell) {
+                return format!(
+                    "shell access is off. sending to an agent from telegram needs it. turn it on \
+                     in the console's Settings, or set permissions.shell to true in {}.",
+                    crate::config::first_candidate()
+                );
+            }
             if let Some(pane) = crate::tmux::pane_of(core, &session).await {
                 return match crate::tmux::send_text(&pane, &text).await {
                     Ok(()) => format!("Typed it into {session}'s tmux pane."),
@@ -1273,5 +1304,139 @@ mod tests {
         let c = core();
         let err = reply(&c, "hello", Origin::Ui).await.unwrap_err();
         assert!(format!("{err:#}").contains("isn't set up"), "{err:#}");
+    }
+
+    /// A core with one real, spawnable agent, so a spawn that gets past the
+    /// gates really starts.
+    async fn spawn_ready(shell: bool, allowed: Vec<PathBuf>) -> (Arc<Core>, tokio::task::JoinHandle<()>) {
+        let (base, _seen, server) = crate::core::tests::fake_telegram(7).await;
+        let c = core();
+        let mut agents = std::collections::BTreeMap::new();
+        agents.insert(
+            "echo".to_string(),
+            crate::config::AgentPreset {
+                command: "echo".into(),
+                args: vec!["{task}".into()],
+                ..Default::default()
+            },
+        );
+        let cfg = crate::config::Config {
+            permissions: crate::config::Permissions {
+                shell,
+                remote_control: false,
+                confirm_destructive: true,
+            },
+            agents,
+            allowed_dirs: allowed,
+            ..crate::core::tests::config_for(&[7])
+        };
+        c.attach(cfg, crate::telegram::Telegram::with_base(&base)).await;
+        (c, server)
+    }
+
+    fn spawn_call(dir: &std::path::Path, task: &str) -> ToolCall {
+        call(
+            "spawn_agent",
+            json!({ "agent": "echo", "dir": dir.to_str().unwrap(), "task": task }),
+        )
+    }
+
+    #[tokio::test]
+    async fn telegram_cannot_spawn_without_shell_access() {
+        let dir = std::env::temp_dir();
+        let (c, server) = spawn_ready(false, vec![dir.clone()]).await;
+
+        let out = run_tool(&c, &spawn_call(&dir, "fix tests"), Origin::Telegram).await;
+        assert!(out.contains("shell access is off"), "{out}");
+        assert!(c.sessions().await.is_empty(), "nothing should have spawned");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn telegram_can_spawn_with_shell_access() {
+        if crate::agents::which("echo").is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir();
+        let (c, server) = spawn_ready(true, vec![dir.clone()]).await;
+
+        let out = run_tool(&c, &spawn_call(&dir, "fix tests"), Origin::Telegram).await;
+        assert!(out.contains("Started echo"), "{out}");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn the_console_can_spawn_without_shell_access() {
+        if crate::agents::which("echo").is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir();
+        // no allowed dirs at all: reaching the console means being at the machine
+        let (c, server) = spawn_ready(false, vec![]).await;
+
+        let out = run_tool(&c, &spawn_call(&dir, "fix tests"), Origin::Ui).await;
+        assert!(out.contains("Started echo"), "{out}");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn telegram_cannot_send_to_an_agent_without_shell_access() {
+        let (c, server) = spawn_ready(false, vec![]).await;
+
+        let refused = run_tool(
+            &c,
+            &call("send_to_agent", json!({ "session": "s1", "text": "hi" })),
+            Origin::Telegram,
+        )
+        .await;
+        assert!(refused.contains("shell access is off"), "{refused}");
+
+        // from the console the same call gets past the gate and reports the
+        // real (missing) session instead
+        let allowed = run_tool(
+            &c,
+            &call("send_to_agent", json!({ "session": "s1", "text": "hi" })),
+            Origin::Ui,
+        )
+        .await;
+        assert!(allowed.contains("running agent"), "{allowed}");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn spawn_tool_refuses_flag_like_tasks_and_models() {
+        if crate::agents::which("echo").is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir();
+        let (c, server) = spawn_ready(true, vec![dir.clone()]).await;
+
+        let flagged = run_tool(&c, &spawn_call(&dir, "--help"), Origin::Telegram).await;
+        assert!(flagged.contains("flag"), "{flagged}");
+
+        let flagged_model = run_tool(
+            &c,
+            &call(
+                "spawn_agent",
+                json!({
+                    "agent": "echo",
+                    "dir": dir.to_str().unwrap(),
+                    "task": "fix tests",
+                    "model": "--dangerously-skip-permissions",
+                }),
+            ),
+            Origin::Telegram,
+        )
+        .await;
+        assert!(flagged_model.contains("flag"), "{flagged_model}");
+
+        let ok = run_tool(&c, &spawn_call(&dir, "fix tests"), Origin::Telegram).await;
+        assert!(ok.contains("Started echo"), "{ok}");
+
+        server.abort();
     }
 }

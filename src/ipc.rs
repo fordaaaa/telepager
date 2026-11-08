@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -45,19 +46,33 @@ pub fn state_path() -> PathBuf {
 }
 
 pub fn write_endpoint(e: &Endpoint) -> Result<()> {
-    let path = state_path();
+    write_endpoint_to(&state_path(), e)
+}
+
+fn write_endpoint_to(path: &Path, e: &Endpoint) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(&path, serde_json::to_vec_pretty(e)?)
+    // owner-only from creation, so the token never sits in a world-readable
+    // file between the open and the chmod; the chmod after covers a file that
+    // already existed and therefore kept its old mode.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path).with_context(|| format!("writing {}", path.display()))?;
+    file.write_all(&serde_json::to_vec_pretty(e)?)
         .with_context(|| format!("writing {}", path.display()))?;
 
     // the token is what stops other local users talking to the daemon
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
 }
@@ -97,7 +112,7 @@ pub fn new_token() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     // two rounds of the os-seeded hasher, plenty for a value that lives in a
-    // 0600 file on this machine
+    // 0600 file on this machine. TODO: a CSPRNG 32-byte token would be stronger.
     let a = RandomState::new().build_hasher().finish();
     let b = RandomState::new().build_hasher().finish();
     format!("{a:016x}{b:016x}")
@@ -130,5 +145,30 @@ mod tests {
     #[test]
     fn state_path_is_namespaced() {
         assert!(state_path().ends_with("telepager/daemon.json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_endpoint_file_is_owner_only_from_creation() {
+        let dir =
+            std::env::temp_dir().join(format!("telepager-ipc-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("daemon.json");
+
+        let e = Endpoint {
+            port: 44013,
+            token: "tok".into(),
+            pid: std::process::id(),
+            ui_port: Some(46375),
+            ui_key: Some("k".into()),
+        };
+        write_endpoint_to(&path, &e).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        // and it round-trips
+        let back: Endpoint = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.port, 44013);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

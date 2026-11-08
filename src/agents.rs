@@ -103,6 +103,19 @@ impl Handle {
     }
 }
 
+/// A task or model that starts with '-' would be read as a command-line flag
+/// by the agent binary (`--help` prints help, `--dangerously-skip-permissions`
+/// grants that permission), so refuse it before it ever becomes an argv entry.
+pub fn reject_flag_like(value: &str, what: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('-') {
+        bail!(
+            "{what} starts with '-': {trimmed} would be parsed as a command-line flag, so it's refused"
+        );
+    }
+    Ok(())
+}
+
 /// Substitute a preset's placeholders. An argument that is exactly `{task}` is
 /// swapped whole, so spaces and quotes in the task stay one argument and never
 /// meet a shell; embedded ones like `--message={task}` are substituted in place.
@@ -260,7 +273,13 @@ pub fn launch(preset: &AgentPreset, dir: &Path, task: &str, model: Option<&str>)
     if preset.command.trim().is_empty() {
         bail!("this agent has no command configured");
     }
+    // before the model_args check, so a flag-like model is named as a flag
+    // even when this agent couldn't be asked for a model anyway
+    reject_flag_like(task, "task")?;
     let model = model.map(str::trim).filter(|m| !m.is_empty());
+    if let Some(model) = model {
+        reject_flag_like(model, "model")?;
+    }
     if model.is_some() && preset.model_args.is_empty() {
         bail!(
             "'{}' has no model_args, so telepager doesn't know how to ask it for \
@@ -623,6 +642,32 @@ mod tests {
         assert!(!dir_is_allowed(&escaped, &allowed));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_flag_like_task_is_refused_before_launch() {
+        let err = launch(&preset(&["{task}"]), &std::env::temp_dir(), "--help", None)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("flag"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_flag_like_model_is_refused_before_launch() {
+        let mut p = preset(&["{task}"]);
+        p.model_args = vec!["--model".into(), "{model}".into()];
+        let err = launch(&p, &std::env::temp_dir(), "fix tests", Some("--dangerously-skip-permissions"))
+            .map(|_| ())
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("flag"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_task_and_model_launch_fine() {
+        let mut p = preset(&["{task}"]);
+        p.model_args = vec!["--model".into(), "{model}".into()];
+        let launched = launch(&p, &std::env::temp_dir(), "fix tests", Some("opus")).unwrap();
+        assert_eq!(launched.rendered, vec!["echo", "fix tests", "--model", "opus"]);
     }
 
     #[test]

@@ -51,6 +51,12 @@ fn refuse_if_already_running(existing: Option<Endpoint>) -> Result<()> {
     )
 }
 
+/// What the startup log says about the console: port only, never the url —
+/// the url carries the one-off key in `?k=`.
+fn startup_log_line(port: u16, ui_port: u16) -> String {
+    format!("daemon listening on 127.0.0.1:{port}, console on 127.0.0.1:{ui_port} (key in endpoint file)")
+}
+
 pub async fn serve_all(core: Arc<Core>, open_browser: bool) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -69,7 +75,7 @@ pub async fn serve_all(core: Arc<Core>, open_browser: bool) -> Result<()> {
         ui_port: Some(ui.port),
         ui_key: Some(ui.key.clone()),
     })?;
-    log::info!("daemon listening on 127.0.0.1:{port}, console on {}", ui.url());
+    log::info!("{}", startup_log_line(port, ui.port));
 
     tokio::spawn(telegram_loop(core.clone()));
 
@@ -269,7 +275,9 @@ async fn handle_message(core: Arc<Core>, msg: IncomingMessage) {
                 reply_to_telegram(core, "That question isn't waiting any more.").await;
             }
         }
-        Routing::Command(command) => handle_command(core, &command, msg.location()).await,
+        Routing::Command(command) => {
+            handle_command(core, &command, msg.location(), msg.chat.as_ref().and_then(|c| c.typ.as_deref())).await;
+        }
         Routing::Master => {
             let answer = match master::reply(core, &text, Origin::Telegram).await {
                 Ok(text) => text,
@@ -340,8 +348,15 @@ async fn download_media(
 }
 
 /// `where_said` is the message the command arrived in, so one carrying a
-/// secret can be taken back down.
-async fn handle_command(core: &Arc<Core>, command: &str, where_said: Option<(i64, i64)>) {
+/// secret can be taken back down. `chat_type` is telegram's `"type"` for the
+/// chat it arrived in (see `telegram::Chat::typ`), so `/key` can refuse groups.
+/// Returns the reply it sent, out of pure caller convenience.
+async fn handle_command(
+    core: &Arc<Core>,
+    command: &str,
+    where_said: Option<(i64, i64)>,
+    chat_type: Option<&str>,
+) -> String {
     let (name, rest) = command.split_once(char::is_whitespace).unwrap_or((command, ""));
     let rest = rest.trim();
 
@@ -379,7 +394,15 @@ async fn handle_command(core: &Arc<Core>, command: &str, where_said: Option<(i64
             None => "Not set up yet.".into(),
         },
         "model" => model_command(core, rest).await,
-        "key" | "apikey" => key_command(core, rest, where_said).await,
+        "key" | "apikey" => {
+            // a key in a group/supergroup chat is visible to everyone in it,
+            // and it only needs one allowed member to reach us
+            if matches!(chat_type, Some("group") | Some("supergroup")) {
+                "/key is only in private chat — a key in a group chat would be visible to everyone in it.".to_string()
+            } else {
+                key_command(core, rest, where_said).await
+            }
+        }
         "a" | "answer" => answer_command(core, rest).await,
         "sh" | "run" => master::shell(core, rest, None, None, Origin::Telegram).await,
         "cd" => cd_command(core, rest).await,
@@ -402,6 +425,7 @@ async fn handle_command(core: &Arc<Core>, command: &str, where_said: Option<(i64
     };
 
     reply_to_telegram(core, &reply).await;
+    reply
 }
 
 /// What an unknown `/command` says to the master. The argument used to be
@@ -447,6 +471,16 @@ async fn cd_command(core: &Arc<Core>, rest: &str) -> String {
     let Some(cfg) = core.config().await else {
         return "Not set up yet.".into();
     };
+    // setting the work dir steers where later /sh runs, so it's as much a
+    // shell gesture as running one — gated the same way. Reading it back
+    // (no argument, above) is free.
+    if !cfg.permissions.shell {
+        return format!(
+            "shell access is off. setting the working directory from telegram needs it. \
+             turn it on in the console's Settings, or set permissions.shell to true in {}.",
+            crate::config::first_candidate()
+        );
+    }
     let path = match crate::agents::resolve_dir(rest) {
         Ok(p) => p,
         Err(e) => return format!("Could not use that directory: {e:#}"),
@@ -970,10 +1004,10 @@ mod tests {
         let c = core();
         // reaching telegram is a no-op unconfigured; this is checking it
         // doesn't panic on the way
-        handle_command(&c, "help", None).await;
-        handle_command(&c, "status", None).await;
-        handle_command(&c, "agents", None).await;
-        handle_command(&c, "ui", None).await;
+        handle_command(&c, "help", None, None).await;
+        handle_command(&c, "status", None, None).await;
+        handle_command(&c, "agents", None, None).await;
+        handle_command(&c, "ui", None, None).await;
     }
 
     #[tokio::test]
@@ -981,7 +1015,7 @@ mod tests {
         let c = core();
         c.master.lock().await.push(crate::llm::Msg::User("hello".into()));
         assert!(!c.master.lock().await.transcript().is_empty());
-        handle_command(&c, "new", None).await;
+        handle_command(&c, "new", None, None).await;
         assert!(c.master.lock().await.transcript().is_empty());
     }
 
@@ -1088,12 +1122,12 @@ mod tests {
     #[tokio::test]
     async fn the_new_commands_do_not_panic_with_no_config() {
         let c = core();
-        handle_command(&c, "sh echo hi", None).await;
-        handle_command(&c, "cd /tmp", None).await;
-        handle_command(&c, "settings", None).await;
-        handle_command(&c, "model opus", None).await;
-        handle_command(&c, "key openrouter sk-nope", None).await;
-        handle_command(&c, "kill s9", None).await;
+        handle_command(&c, "sh echo hi", None, None).await;
+        handle_command(&c, "cd /tmp", None, None).await;
+        handle_command(&c, "settings", None, None).await;
+        handle_command(&c, "model opus", None, None).await;
+        handle_command(&c, "key openrouter sk-nope", None, None).await;
+        handle_command(&c, "kill s9", None, None).await;
     }
 
     #[tokio::test]
@@ -1102,12 +1136,14 @@ mod tests {
         let inside = root.join("project");
         std::fs::create_dir_all(&inside).unwrap();
 
-        let (c, dir, server) = configured("cd", Default::default(), vec![]).await;
+        // shell on, so the allowlist below is what actually gates it
+        let shell = crate::config::Permissions { shell: true, ..Default::default() };
+        let (c, dir, server) = configured("cd", shell.clone(), vec![]).await;
         assert!(cd_command(&c, inside.to_str().unwrap()).await.contains("no directories are allowed"));
         assert!(c.work_dir().await.is_none());
         server.abort();
 
-        let (c, dir2, server) = configured("cd2", Default::default(), vec![root.clone()]).await;
+        let (c, dir2, server) = configured("cd2", shell, vec![root.clone()]).await;
         assert!(cd_command(&c, inside.to_str().unwrap()).await.contains("now"));
         assert_eq!(c.work_dir().await.unwrap(), inside.canonicalize().unwrap());
         // somewhere real, but not allowed. temp_dir holds root, so it's
@@ -1372,5 +1408,56 @@ mod tests {
     fn a_plain_text_message_has_no_download_plan() {
         let msg = message("hello", None);
         assert!(crate::telegram::media_plan(&msg).is_none());
+    }
+
+    #[test]
+    fn the_startup_log_never_carries_the_console_key() {
+        let line = startup_log_line(44013, 46375);
+        assert!(!line.contains("k="), "{line}");
+        assert!(line.contains("44013"), "{line}");
+        assert!(line.contains("46375"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn key_is_refused_in_a_group_chat() {
+        // remote control on, so only the group rule can refuse it
+        let permissions = crate::config::Permissions {
+            remote_control: true,
+            ..Default::default()
+        };
+        let (c, dir, server) = configured("key-group", permissions, vec![]).await;
+
+        for chat_type in ["group", "supergroup"] {
+            let out = handle_command(&c, "key openrouter sk-secret", None, Some(chat_type)).await;
+            assert!(out.contains("only in private chat"), "{chat_type}: {out}");
+        }
+        // a private chat (and unknown chats) still work as before
+        let out = handle_command(&c, "key openrouter sk-secret", None, Some("private")).await;
+        assert!(!out.contains("only in private chat"), "{out}");
+        let out = handle_command(&c, "key clear", None, None).await;
+        assert!(!out.contains("only in private chat"), "{out}");
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cd_refuses_to_set_a_directory_without_shell_access() {
+        let root = std::env::temp_dir().join(format!("telepager-cd-shell-{}", std::process::id()));
+        let inside = root.join("project");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        // default permissions: shell off, directory allowed
+        let (c, dir, server) = configured("cd-noshell", Default::default(), vec![root.clone()]).await;
+        let refused = cd_command(&c, inside.to_str().unwrap()).await;
+        assert!(refused.contains("shell access is off"), "{refused}");
+        assert!(c.work_dir().await.is_none());
+        // reads are still allowed
+        let read = cd_command(&c, "").await;
+        assert!(read.contains("Say which directory"), "{read}");
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
