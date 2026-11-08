@@ -143,13 +143,30 @@ fn joined(done: Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
     }
 }
 
-/// The few lines a person sees when the console is up.
+/// The few lines a person sees when the console is up. On a tty the full url
+/// (key included) is fine — it's the local terminal. Captured to a service
+/// log file it would outlive the run, so non-tty output names the port only.
+fn console_display(url: &str, is_tty: bool) -> String {
+    if is_tty {
+        return url.to_string();
+    }
+    // a captured (non-tty) stream is a service log: name the port, never the
+    // key, so the url never outlives the run on disk
+    if let Some((_, rest)) = url.split_once("127.0.0.1:") {
+        if let Some((port, _)) = rest.split_once('/') {
+            return format!("127.0.0.1:{port}");
+        }
+    }
+    // unexpected shape — still strip any query rather than leak a key
+    url.split('?').next().unwrap_or(url).to_string()
+}
+
 fn announce(url: &str, config: Option<&Path>, started: bool, ending: &str) {
     if started {
         println!("telepager started.");
     }
     println!();
-    println!("  console   {url}");
+    println!("  console   {}", console_display(url, std::io::stdout().is_terminal()));
 
     match crate::config::load(config) {
         Ok(cfg) => println!("  telegram  connected, {} allowed user(s)", cfg.allowed_user_ids.len()),
@@ -302,5 +319,21 @@ mod tests {
             panic!("a console-less daemon looked fine");
         };
         assert!(format!("{err:#}").contains("telepager stop"));
+    }
+
+    #[test]
+    fn a_non_tty_announcement_names_the_port_not_the_key() {
+        // service logs capture stdout; the key in a log file outlives the run
+        let line = console_display("http://127.0.0.1:46375/?k=sekret", false);
+        assert!(line.contains("46375"), "{line}");
+        assert!(!line.contains("k="), "{line}");
+        assert!(!line.contains("sekret"), "{line}");
+    }
+
+    #[test]
+    fn a_tty_announcement_keeps_the_full_url() {
+        // a local terminal is a fine place for the key — it's already local
+        let url = "http://127.0.0.1:46375/?k=sekret";
+        assert_eq!(console_display(url, true), url);
     }
 }

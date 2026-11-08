@@ -34,7 +34,19 @@ const STATUS_TICK: Duration = Duration::from_millis(1200);
 /// `--allowedTools mcp__telepager` works.
 const SERVER_NAME: &str = "telepager";
 
+/// A master message is an argv entry after `claude -p` (and opencode's
+/// trailing message), so one starting with '-' would be parsed as a cli flag
+/// — `--dangerously-skip-permissions` most of all. Refuse it before it ever
+/// becomes an argument, on first turns and resumed ones alike.
+fn reject_flag_message(text: &str) -> Result<()> {
+    agents::reject_flag_like(text, "message")
+}
+
 pub async fn reply(core: &Arc<Core>, cfg: &Config, text: &str, origin: Origin) -> Result<String> {
+    // before anything builds the argv: the message becomes an argument of
+    // `claude -p` (or opencode's trailing message), so a leading '-' is a
+    // flag, not a prompt — and the turn never starts
+    reject_flag_message(text)?;
     let master = &cfg.master;
     let command = master.cli_command().context("no cli command for this provider")?;
     let program = agents::which(&command).ok_or_else(|| {
@@ -314,7 +326,7 @@ fn bundled_servers() -> serde_json::Map<String, Value> {
     servers.insert("context7".into(), json!({ "type": "http", "url": "https://mcp.context7.com/mcp" }));
     servers.insert(
         "playwright".into(),
-        json!({ "type": "stdio", "command": "npx", "args": ["-y", "@playwright/mcp@latest"] }),
+        json!({ "type": "stdio", "command": "npx", "args": ["-y", "@playwright/mcp@0.0.84"] }),
     );
     servers
 }
@@ -754,7 +766,7 @@ mod tests {
         assert_eq!(config["mcp"]["context7"]["url"], "https://mcp.context7.com/mcp");
         assert_eq!(config["mcp"]["playwright"]["type"], "local");
         assert_eq!(config["mcp"]["playwright"]["command"][0], "npx");
-        assert_eq!(config["mcp"]["playwright"]["command"][2], "@playwright/mcp@latest");
+        assert_eq!(config["mcp"]["playwright"]["command"][2], "@playwright/mcp@0.0.84");
         assert_eq!(config["mcp"]["telepager"]["type"], "local");
     }
 
@@ -1007,5 +1019,21 @@ mod tests {
         let dir = master_workdir().unwrap();
         assert!(dir.ends_with("telepager/master"));
         assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn a_flag_like_master_message_is_refused_before_it_becomes_an_argv_entry() {
+        // `claude -p --dangerously-skip-permissions` parses as flags, not a
+        // prompt; the same holds for an opencode resumed turn's message.
+        assert!(reject_flag_message("--dangerously-skip-permissions").is_err());
+        // trimmed, so leading whitespace doesn't smuggle one past
+        assert!(reject_flag_message("  --dangerously-skip-permissions").is_err());
+        assert!(reject_flag_message("-n").is_err());
+    }
+
+    #[test]
+    fn an_ordinary_master_message_is_allowed() {
+        assert!(reject_flag_message("fix tests").is_ok());
+        assert!(reject_flag_message("what's the diff - 3 lines?").is_ok());
     }
 }

@@ -453,13 +453,24 @@ async fn save_master(core: &Arc<Core>, body: &Value) -> Result<Value> {
             .filter(|s| !s.is_empty())
     };
 
+    // switching providers means the address the console re-sends belongs to
+    // the old one — clear it unless the new value is actually different, the
+    // same rule /key applies on telegram: a stale base_url would point the
+    // new provider at the wrong service
+    let requested_base_url = optional("base_url");
+    let base_url = if provider != existing.provider && requested_base_url == existing.base_url {
+        None
+    } else {
+        requested_base_url
+    };
+
     let master = MasterConfig {
         provider,
         model,
         // an empty key field means "leave what's there", not "erase it"
         api_key: optional("api_key").or(existing.api_key),
         api_key_env: optional("api_key_env").or(existing.api_key_env),
-        base_url: optional("base_url"),
+        base_url,
         system: optional("system"),
         max_tokens: body
             .get("max_tokens")
@@ -1084,5 +1095,59 @@ mod tests {
     #[tokio::test]
     async fn a_blank_master_message_is_refused() {
         assert!(master_send(&core(), &json!({ "text": "   " })).await.is_err());
+    }
+
+    /// A config with a master block whose base_url belongs to the old provider.
+    fn core_with_openai_base_url(name: &str) -> (Arc<Core>, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("telepager-web-base-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        config::save(Some(&path), "1:fake", &[7]).unwrap();
+        config::save_master(
+            Some(&path),
+            &MasterConfig {
+                provider: Provider::Openai,
+                base_url: Some("https://old.example/v1".into()),
+                ..MasterConfig::default()
+            },
+        )
+        .unwrap();
+        (Core::new(Some(path.clone())), path, dir)
+    }
+
+    #[tokio::test]
+    async fn switching_the_master_provider_clears_a_stale_base_url() {
+        // the console re-sends the address it was showing, which belongs to
+        // the old provider; keeping it would point the new one at the wrong
+        // service
+        let (c, path, dir) = core_with_openai_base_url("stale");
+        let out = save_master(
+            &c,
+            &json!({ "provider": "anthropic", "base_url": "https://old.example/v1", "model": "" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["switched"], true);
+
+        let loaded = config::load(Some(&path)).unwrap();
+        assert_eq!(loaded.master.provider, Provider::Anthropic);
+        assert!(loaded.master.base_url.is_none(), "{:?}", loaded.master.base_url);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_new_base_url_survives_a_provider_switch() {
+        let (c, path, dir) = core_with_openai_base_url("fresh");
+        save_master(
+            &c,
+            &json!({ "provider": "anthropic", "base_url": "https://new.example", "model": "" }),
+        )
+        .await
+        .unwrap();
+
+        let loaded = config::load(Some(&path)).unwrap();
+        assert_eq!(loaded.master.base_url.as_deref(), Some("https://new.example"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

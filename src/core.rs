@@ -579,6 +579,18 @@ impl Core {
             bail!("the task is empty");
         }
 
+        // spawning is shell-equivalent (the agent runs commands), so telegram
+        // needs shell access on top of an allowed directory. Checked here as
+        // defense in depth — the master already gates it, but a caller that
+        // passed through gets refused anyway, before the allowlist.
+        if from_telegram && !cfg.permissions.shell {
+            bail!(
+                "shell access is off. spawning from telegram needs it. turn it on in the \
+                 console's Settings, or set permissions.shell to true in {}",
+                config::first_candidate()
+            );
+        }
+
         let path = agents::resolve_dir(dir)?;
 
         // telegram is the remote surface, so it only reaches allowlisted dirs.
@@ -1682,5 +1694,47 @@ pub(crate) mod tests {
         c.notice("something happened").await;
         let event = rx.recv().await.unwrap();
         assert!(matches!(event.kind, EventKind::Notice { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_telegram_spawn_is_refused_when_shell_access_is_off() {
+        // defense in depth: even a caller that passed the master-level gate
+        // gets refused here, before the directory allowlist is even checked
+        if crate::agents::which("sh").is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("telepager-shell-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "bot_token": "1:fake",
+                "allowed_user_ids": [1],
+                "allowed_dirs": [dir],
+                "permissions": { "shell": false },
+                "agents": { "sleeper": { "command": "sh", "args": ["-c", "sleep 30"] } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let core = Core::new(Some(path));
+
+        let err = core
+            .spawn_agent("sleeper", dir.to_str().unwrap(), "sleep", None, true)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("shell access is off"), "{err:#}");
+        assert!(core.sessions().await.is_empty(), "a refused spawn left a session");
+
+        // the console stays exempt — reaching it means being at the machine
+        let id = core
+            .spawn_agent("sleeper", dir.to_str().unwrap(), "sleep", None, false)
+            .await
+            .unwrap();
+        core.kill_agent(&id).await.ok();
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

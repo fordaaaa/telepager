@@ -315,6 +315,15 @@ Lookup order: `--config PATH` > `./.telepager/config.json` > `./telepager.config
 
 To scope terminal access per repo, run `telepager init [--dir DIR] [--preset pager-only|full]` (default preset `pager-only`). It writes `./.telepager/config.json` with `allowed_dirs` set to that directory and `permissions` from the preset (`pager-only`: `shell`/`remote_control` off; `full`: both on, `confirm_destructive` on either way), preserves any existing `bot_token`/`allowed_user_ids` in the file, and adds `.telepager/` to `.gitignore` once.
 
+> **Warning — a project config must not be trusted with the bot token.** When a
+> global config exists, `bot_token` and `allowed_user_ids` in the project file
+> are ignored — they come from the global config or the environment — and
+> `permissions` are intersected with the global ones, so a project file can only
+> narrow shell access, never widen it. That is on purpose: a file anyone can
+> commit to a repository must not be able to hand over the bot token or the
+> allowlist. With no global config at all, the project token and ids are taken
+> as-is (the fresh-`init` flow). Keep `.telepager/` out of git either way.
+
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `bot_token` | — | Required. `TELEGRAM_BOT_TOKEN` overrides it. |

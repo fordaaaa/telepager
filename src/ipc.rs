@@ -1,7 +1,6 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 // where the daemon writes its port and token so clients can find it
@@ -50,31 +49,9 @@ pub fn write_endpoint(e: &Endpoint) -> Result<()> {
 }
 
 fn write_endpoint_to(path: &Path, e: &Endpoint) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    // owner-only from creation, so the token never sits in a world-readable
-    // file between the open and the chmod; the chmod after covers a file that
-    // already existed and therefore kept its old mode.
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(path).with_context(|| format!("writing {}", path.display()))?;
-    file.write_all(&serde_json::to_vec_pretty(e)?)
-        .with_context(|| format!("writing {}", path.display()))?;
-
-    // the token is what stops other local users talking to the daemon
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    // tmp-then-rename (config::write_atomic): a symlink at the endpoint path
+    // is replaced, never followed to its victim
+    crate::config::write_atomic(path, &serde_json::to_vec_pretty(e)?)
 }
 
 // the path to tell someone to write their config to
@@ -167,6 +144,34 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         // and it round-trips
+        let back: Endpoint = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.port, 44013);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writing_an_endpoint_through_a_symlink_does_not_write_the_victim() {
+        let dir =
+            std::env::temp_dir().join(format!("telepager-ipc-sym-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        let path = dir.join("daemon.json");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        let e = Endpoint {
+            port: 44013,
+            token: "tok".into(),
+            pid: std::process::id(),
+            ui_port: Some(46375),
+            ui_key: Some("k".into()),
+        };
+        write_endpoint_to(&path, &e).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
         let back: Endpoint = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(back.port, 44013);
         let _ = std::fs::remove_dir_all(&dir);

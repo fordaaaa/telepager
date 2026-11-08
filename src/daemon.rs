@@ -47,7 +47,9 @@ fn refuse_if_already_running(existing: Option<Endpoint>) -> Result<()> {
          before starting another — two daemons share one bot token and telegram \
          gives each message to only one of them.",
         ep.pid,
-        ep.ui_url().map(|u| format!(", console at {u}")).unwrap_or_default()
+        // port only: the url carries the one-off console key in `?k=`, and an
+        // error string is the wrong place for it
+        ep.ui_port.map(|p| format!(", console on 127.0.0.1:{p}")).unwrap_or_default()
     )
 }
 
@@ -336,8 +338,8 @@ async fn download_media(
     message_id: i64,
     plan: &crate::telegram::MediaPlan,
 ) -> Result<std::path::PathBuf> {
-    let file_path = tg.get_file(&plan.file_id).await?;
-    let bytes = tg.download_file(&file_path).await?;
+    let file = tg.get_file(&plan.file_id).await?;
+    let bytes = tg.download_file(&file).await?;
     crate::telegram::check_file_size(bytes.len())?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -375,7 +377,9 @@ async fn handle_command(
             "Started a fresh conversation.".to_string()
         }
         "ui" | "webui" => match core.ui().await {
-            Some(ui) => format!("The console is at {} (only reachable from that machine).", ui.url()),
+            // port only: the url carries the one-off console key, and telegram
+            // chat logs (and telegram's servers) are the wrong place for it
+            Some(ui) => format!("console on 127.0.0.1:{} (only reachable from that machine).", ui.port),
             None => "The console isn't running.".to_string(),
         },
         "agents" => match core.config().await {
@@ -956,10 +960,23 @@ mod tests {
         assert!(text.contains("already running"), "{text}");
         assert!(text.contains("4756"), "{text}");
         assert!(text.contains("telepager stop"), "{text}");
+        // the console is named by port only — the url carries the one-off k=
+        assert!(text.contains("127.0.0.1:46375"), "{text}");
+        assert!(!text.contains("k="), "{text}");
 
         // nothing running, or our own endpoint read back, is not a second daemon
         refuse_if_already_running(None).unwrap();
         refuse_if_already_running(Some(endpoint(std::process::id()))).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_ui_command_names_the_port_not_the_key() {
+        let c = core();
+        c.set_ui(crate::core::UiInfo { port: 46375, key: "s3cr3t".into() }).await;
+        let out = handle_command(&c, "ui", None, None).await;
+        assert!(out.contains("46375"), "{out}");
+        assert!(!out.contains("k="), "{out}");
+        assert!(!out.contains("s3cr3t"), "{out}");
     }
 
     #[test]

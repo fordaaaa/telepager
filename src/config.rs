@@ -546,32 +546,57 @@ fn read_doc(path: &Path) -> Result<serde_json::Value> {
     }
 }
 
-fn write_doc(path: &Path, doc: &serde_json::Value) -> Result<()> {
+/// Write `bytes` to `path` atomically and owner-only: tmp file in the same
+/// directory, then rename over the target.
+///
+/// The rename is the point. Opening `path` with truncate would follow a
+/// symlink planted there and truncate its victim; rename replaces the link
+/// itself, so the victim is never touched. Used for every file that carries a
+/// secret (config, endpoint).
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    // owner-only from creation, so the token never sits in a world-readable
-    // file between the open and the chmod; the chmod after covers a file
-    // that already existed and therefore kept its old mode.
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(path).with_context(|| format!("writing {}", path.display()))?;
-    file.write_all(&serde_json::to_vec_pretty(doc)?)
-        .with_context(|| format!("writing {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "telepager".to_string());
+    let tmp = path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
 
-    // the token is a credential, so don't leave it world readable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let written = (|| -> Result<()> {
+        // owner-only from creation, so the secret never sits in a
+        // world-readable file between the open and the chmod
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+        file.write_all(bytes).with_context(|| format!("writing {}", tmp.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("writing {}", tmp.display()))?;
+        }
+
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+        Ok(())
+    })();
+
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    Ok(())
+    written
+}
+
+fn write_doc(path: &Path, doc: &serde_json::Value) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(doc)?)
 }
 
 // write bot_token and allowed_user_ids without stomping on anything else
@@ -696,27 +721,76 @@ fn apply_named_service(text: &str, raw: &mut RawConfig) {
 }
 
 pub fn load(explicit: Option<&Path>) -> Result<Config> {
-    let file = resolve_config_path(explicit);
+    load_inner(explicit, Path::new("."), config_candidates())
+}
+
+/// Read one config file into its raw shape, resolving named services.
+fn read_raw_config(path: &Path) -> Result<RawConfig> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config file {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(RawConfig::default());
+    }
+    let mut raw: RawConfig = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    apply_named_service(&text, &mut raw);
+    Ok(raw)
+}
+
+/// Whether `path` is a project-local config (`./.telepager/config.json` or
+/// `./telepager.config.json` in `cwd`).
+fn is_project_path(path: &Path, cwd: &Path) -> bool {
+    *path == *cwd.join(".telepager").join("config.json")
+        || *path == *cwd.join("telepager.config.json")
+}
+
+/// The permissions a project file may effectively grant when a global config
+/// also exists: the intersection of grants. Asking before destructive commands
+/// is a restriction rather than a grant, so either side can reinstate it.
+fn intersect_permissions(project: Permissions, global: Permissions) -> Permissions {
+    Permissions {
+        shell: project.shell && global.shell,
+        remote_control: project.remote_control && global.remote_control,
+        confirm_destructive: project.confirm_destructive || global.confirm_destructive,
+    }
+}
+
+/// `load` with the working directory and global candidates supplied, so the
+/// project-vs-global trust split can be tested without touching cwd.
+///
+/// Trust split: when the winning file is project-local, its `bot_token` and
+/// `allowed_user_ids` are ignored in favour of the global file (or the
+/// environment) whenever a global config exists — a file anyone can commit to
+/// a repo must not supply the bot token or the whole allowlist. If no global
+/// config exists, the project token and ids are accepted: that is the fresh
+/// `telepager init` flow, where the project file is the only config there is.
+/// Permissions are intersected the same way, so a project file can narrow but
+/// never widen what the global config granted.
+fn load_inner(explicit: Option<&Path>, cwd: &Path, globals: Vec<PathBuf>) -> Result<Config> {
+    let file = resolve_config_path_in(explicit, cwd, globals.clone());
 
     let raw: RawConfig = match &file {
-        Some(path) if path.exists() => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading config file {}", path.display()))?;
-            if text.trim().is_empty() {
-                RawConfig::default()
-            } else {
-                let mut raw: RawConfig = serde_json::from_str(&text)
-                    .with_context(|| format!("{} is not valid JSON", path.display()))?;
-                apply_named_service(&text, &mut raw);
-                raw
-            }
-        }
+        Some(path) if path.exists() => read_raw_config(path)?,
         _ => RawConfig::default(),
+    };
+
+    let is_project = explicit.is_none()
+        && file.as_deref().is_some_and(|p| is_project_path(p, cwd));
+    let global_raw: Option<RawConfig> = if is_project {
+        match globals.iter().find(|p| p.exists()) {
+            Some(path) => Some(read_raw_config(path)?),
+            None => None,
+        }
+    } else {
+        None
     };
 
     let token = match std::env::var("TELEGRAM_BOT_TOKEN") {
         Ok(v) if !v.trim().is_empty() => v,
-        _ => raw.bot_token.clone().unwrap_or_default(),
+        _ => match &global_raw {
+            Some(global) => global.bot_token.clone().unwrap_or_default(),
+            None => raw.bot_token.clone().unwrap_or_default(),
+        },
     };
     if token.trim().is_empty() {
         let where_to_put_it = first_candidate();
@@ -728,7 +802,10 @@ pub fn load(explicit: Option<&Path>) -> Result<Config> {
 
     let allowed_user_ids = match std::env::var("TELEGRAM_ALLOWED_IDS") {
         Ok(v) if !v.trim().is_empty() => parse_allowed_ids(&v)?,
-        _ => raw.allowed_user_ids.clone().unwrap_or_default(),
+        _ => match &global_raw {
+            Some(global) => global.allowed_user_ids.clone().unwrap_or_default(),
+            None => raw.allowed_user_ids.clone().unwrap_or_default(),
+        },
     };
     if allowed_user_ids.is_empty() {
         bail!(
@@ -745,9 +822,22 @@ pub fn load(explicit: Option<&Path>) -> Result<Config> {
 
     // configured agents override a builtin of the same name, and add new ones
     let mut agents = builtin_agents();
-    for (name, preset) in raw.agents.unwrap_or_default() {
+    for (name, preset) in raw.agents.clone().unwrap_or_default() {
         agents.insert(name, preset);
     }
+
+    let permissions = match (raw.permissions.clone(), global_raw.as_ref()) {
+        (Some(project), Some(global)) => intersect_permissions(
+            project,
+            global.permissions.clone().unwrap_or_default(),
+        ),
+        (Some(project), None) => project,
+        (None, Some(global)) => intersect_permissions(
+            Permissions::default(),
+            global.permissions.clone().unwrap_or_default(),
+        ),
+        (None, None) => Permissions::default(),
+    };
 
     Ok(Config {
         token,
@@ -758,7 +848,7 @@ pub fn load(explicit: Option<&Path>) -> Result<Config> {
         agents,
         allowed_dirs: raw.allowed_dirs.unwrap_or_default(),
         ui_port: raw.ui_port.unwrap_or(DEFAULT_UI_PORT),
-        permissions: raw.permissions.unwrap_or_default(),
+        permissions,
     })
 }
 
@@ -1217,6 +1307,114 @@ mod tests {
         let text = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
         assert!(text.starts_with("target\n"), "{text}");
         assert_eq!(text.matches(".telepager/").count(), 1, "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_symlink_does_not_write_the_victim() {
+        // a symlink planted at the config path (or swapped in mid-write) must
+        // not turn the write into a truncate of its target. The victim is
+        // valid (empty) JSON so the read side is not what stops it.
+        let dir = scratch("symlink");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "{}").unwrap();
+        let path = dir.join("config.json");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        save(Some(&path), "tok", &[1]).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "{}");
+        // the link itself was replaced by a real file
+        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["bot_token"], "tok");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn trust_case(name: &str, project: &str, global: &str) -> (PathBuf, Vec<PathBuf>) {
+        let dir = scratch(name);
+        let project_path = dir.join(".telepager").join("config.json");
+        std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+        std::fs::write(&project_path, project).unwrap();
+        let global_path = dir.join("global").join("config.json");
+        std::fs::create_dir_all(global_path.parent().unwrap()).unwrap();
+        std::fs::write(&global_path, global).unwrap();
+        (dir, vec![global_path])
+    }
+
+    #[test]
+    fn a_project_token_is_ignored_when_a_global_config_exists() {
+        // a project file anyone can commit must not hand over the bot token
+        // or the allowlist when a global config is in play
+        let (dir, globals) = trust_case(
+            "trust-token",
+            r#"{"bot_token":"project","allowed_user_ids":[1]}"#,
+            r#"{"bot_token":"global","allowed_user_ids":[2]}"#,
+        );
+        let loaded = load_inner(None, &dir, globals).unwrap();
+        assert_eq!(loaded.token, "global");
+        assert_eq!(loaded.allowed_user_ids, vec![2]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_project_shell_grant_cannot_escalate_a_global_denial() {
+        let (dir, globals) = trust_case(
+            "trust-shell",
+            r#"{"bot_token":"project","allowed_user_ids":[1],"permissions":{"shell":true,"remote_control":true}}"#,
+            r#"{"bot_token":"global","allowed_user_ids":[2],"permissions":{"shell":false,"remote_control":false}}"#,
+        );
+        let loaded = load_inner(None, &dir, globals).unwrap();
+        assert!(!loaded.permissions.shell);
+        assert!(!loaded.permissions.remote_control);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_intersection_never_grants_what_the_project_denied() {
+        let (dir, globals) = trust_case(
+            "trust-shell2",
+            r#"{"bot_token":"project","allowed_user_ids":[1],"permissions":{"shell":false}}"#,
+            r#"{"bot_token":"global","allowed_user_ids":[2],"permissions":{"shell":true}}"#,
+        );
+        let loaded = load_inner(None, &dir, globals).unwrap();
+        assert!(!loaded.permissions.shell);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_project_only_config_still_loads() {
+        // the init flow: no global file exists, so the project token and
+        // permissions are the only ones there are
+        let dir = scratch("trust-fresh");
+        let project_path = dir.join(".telepager").join("config.json");
+        std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project_path,
+            r#"{"bot_token":"project","allowed_user_ids":[1],"permissions":{"shell":true}}"#,
+        )
+        .unwrap();
+        let missing_global = dir.join("global").join("config.json");
+
+        let loaded = load_inner(None, &dir, vec![missing_global]).unwrap();
+        assert_eq!(loaded.token, "project");
+        assert_eq!(loaded.allowed_user_ids, vec![1]);
+        assert!(loaded.permissions.shell);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_project_token_is_accepted_when_there_is_no_global_config() {
+        let dir = scratch("trust-noglobal");
+        let project_path = dir.join(".telepager").join("config.json");
+        std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+        std::fs::write(&project_path, r#"{"bot_token":"project","allowed_user_ids":[1]}"#).unwrap();
+        let missing_global = dir.join("global").join("config.json");
+
+        let loaded = load_inner(None, &dir, vec![missing_global]).unwrap();
+        assert_eq!(loaded.token, "project");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

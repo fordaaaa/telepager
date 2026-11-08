@@ -105,12 +105,11 @@ impl IncomingMessage {
 }
 
 /// What a telegram `getFile` answer carries.
-#[allow(dead_code)] // file_size is parsed for shape; only the path is needed
 #[derive(Debug, Deserialize)]
-struct FileInfo {
-    file_path: String,
+pub struct FileInfo {
+    pub file_path: String,
     #[serde(default)]
-    file_size: Option<u64>,
+    pub file_size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,20 +315,22 @@ impl Telegram {
     }
 
     /// `getFile`: a file_id from an incoming photo/voice/document becomes the
-    /// path downloads are served from.
-    pub async fn get_file(&self, file_id: &str) -> Result<String> {
-        let info: FileInfo = self.call("getFile", json!({ "file_id": file_id })).await?;
-        Ok(info.file_path)
+    /// path downloads are served from, along with the size telegram declared.
+    pub async fn get_file(&self, file_id: &str) -> Result<FileInfo> {
+        self.call("getFile", json!({ "file_id": file_id })).await
     }
 
     /// Download a file `get_file` named. The bot token is in the url, so
-    /// errors go through `scrub` like every other call.
-    pub async fn download_file(&self, file_path: &str) -> Result<Vec<u8>> {
-        let url = file_url_for_base(&self.base, file_path);
-        self.download_inner(&url).await.map_err(|e| self.scrub(e))
+    /// errors go through `scrub` like every other call. The declared size is
+    /// refused before anything is fetched, and the Content-Length before a
+    /// byte is buffered.
+    pub async fn download_file(&self, file: &FileInfo) -> Result<Vec<u8>> {
+        let url = file_url_for_base(&self.base, &file.file_path);
+        self.download_inner(&url, file.file_size).await.map_err(|e| self.scrub(e))
     }
 
-    async fn download_inner(&self, url: &str) -> Result<Vec<u8>> {
+    async fn download_inner(&self, url: &str, declared_size: Option<u64>) -> Result<Vec<u8>> {
+        check_declared_size(declared_size)?;
         let resp = self
             .http
             .get(url)
@@ -340,6 +341,7 @@ impl Telegram {
         if !status.is_success() {
             bail!("downloading the file returned {}", status.as_u16());
         }
+        check_content_length(resp.content_length())?;
         let bytes = resp.bytes().await.context("reading the downloaded file")?;
         check_file_size(bytes.len())?;
         Ok(bytes.to_vec())
@@ -546,6 +548,23 @@ pub fn check_file_size(len: usize) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a `getFile` answer that declares more than the cap: no reason to
+/// open the download at all when telegram already said it's too big. `None`
+/// means telegram didn't say, so the later checks have to catch it.
+pub fn check_declared_size(file_size: Option<u64>) -> Result<()> {
+    let Some(size) = file_size else { return Ok(()) };
+    if size > MAX_FILE_SIZE as u64 {
+        bail!("file is too large ({size} bytes, max {MAX_FILE_SIZE})");
+    }
+    Ok(())
+}
+
+/// Refuse a download whose Content-Length already exceeds the cap, before a
+/// byte of it is buffered in memory. `None` means no header was sent.
+pub fn check_content_length(content_length: Option<u64>) -> Result<()> {
+    check_declared_size(content_length)
+}
+
 /// Is `path` inside `base`? Component-wise, so "/inbox-evil" is not inside
 /// "/inbox" — the inbox must stay under the cache dir it was derived from.
 fn is_under(path: &Path, base: &Path) -> bool {
@@ -691,6 +710,20 @@ mod tests {
     #[test]
     fn short_text_is_one_chunk() {
         assert_eq!(chunk_text("hello", 100), vec!["hello"]);
+    }
+
+    #[test]
+    fn an_oversize_declared_file_size_is_refused_before_downloading() {
+        assert!(check_declared_size(Some(MAX_FILE_SIZE as u64 + 1)).is_err());
+        assert!(check_declared_size(Some(1024)).is_ok());
+        assert!(check_declared_size(None).is_ok());
+    }
+
+    #[test]
+    fn an_oversize_content_length_is_refused_before_buffering() {
+        assert!(check_content_length(Some(MAX_FILE_SIZE as u64 + 1)).is_err());
+        assert!(check_content_length(Some(1024)).is_ok());
+        assert!(check_content_length(None).is_ok());
     }
 
     #[test]

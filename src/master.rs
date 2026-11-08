@@ -473,6 +473,16 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
             let session = str_arg(args, "session");
             let lines = args["lines"].as_u64().unwrap_or(60).clamp(1, 400) as usize;
             if let Some(pane) = crate::tmux::pane_of(core, &session).await {
+                // reading a tmux screen is shell-equivalent — it's the
+                // person's own terminal — so telegram needs shell access here,
+                // like send_to_agent does. Checked before the pane is read.
+                if origin.is_telegram() && !matches!(core.config().await, Some(ref cfg) if cfg.permissions.shell) {
+                    return format!(
+                        "shell access is off. reading a tmux pane from telegram needs it. turn it on \
+                         in the console's Settings, or set permissions.shell to true in {}.",
+                        crate::config::first_candidate()
+                    );
+                }
                 return match crate::tmux::capture(&pane, crate::tmux::CAPTURE_LINES).await {
                     Some(text) if text.trim().is_empty() => {
                         format!("{session}'s tmux pane is empty.")
@@ -524,6 +534,15 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
             // a tmux pane is the person's own terminal, not something we
             // spawned, so the most we do to it is interrupt what's running
             if let Some(pane) = crate::tmux::pane_of(core, &session).await {
+                // interrupting what's in a pane is typing at their terminal,
+                // so telegram needs shell access here too
+                if origin.is_telegram() && !matches!(core.config().await, Some(ref cfg) if cfg.permissions.shell) {
+                    return format!(
+                        "shell access is off. interrupting a tmux pane from telegram needs it. turn it on \
+                         in the console's Settings, or set permissions.shell to true in {}.",
+                        crate::config::first_candidate()
+                    );
+                }
                 return match crate::tmux::interrupt(&pane).await {
                     Ok(()) => format!(
                         "Sent Ctrl-C to {session}'s tmux pane. It's their own terminal, \
@@ -992,6 +1011,47 @@ mod tests {
         )
         .await;
         assert!(out.contains("hasn't produced any output"), "{out}");
+    }
+
+    /// A core with tmux attach on but shell access off, and one tmux session
+    /// registered — no tmux binary needed, the pane lookup is registry-only.
+    async fn tmux_core_shell_off() -> (Arc<Core>, String, tokio::task::JoinHandle<()>) {
+        let (base, _seen, server) = crate::core::tests::fake_telegram(7).await;
+        let c = core();
+        let cfg = crate::config::Config {
+            master: crate::config::MasterConfig { tmux_attach: true, ..Default::default() },
+            permissions: crate::config::Permissions { shell: false, ..Default::default() },
+            ..crate::core::tests::config_for(&[7])
+        };
+        c.attach(cfg, crate::telegram::Telegram::with_base(&base)).await;
+        let id = c
+            .open_session(
+                crate::session::Kind::TmuxAttached { pane_id: "%1".into(), location: "work:0.1".into() },
+                "proj".into(),
+                None,
+                None,
+                None,
+            )
+            .await;
+        (c, id, server)
+    }
+
+    #[tokio::test]
+    async fn a_telegram_read_of_a_tmux_pane_needs_shell_access() {
+        // reading a tmux screen is shell-equivalent: it's your own terminal
+        let (c, id, server) = tmux_core_shell_off().await;
+        let out = run_tool(&c, &call("read_output", json!({ "session": id })), Origin::Telegram).await;
+        assert!(out.contains("shell access is off"), "{out}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_telegram_kill_of_a_tmux_pane_needs_shell_access() {
+        // interrupting what's in a pane is typing at your terminal, too
+        let (c, id, server) = tmux_core_shell_off().await;
+        let out = run_tool(&c, &call("kill_agent", json!({ "session": id })), Origin::Telegram).await;
+        assert!(out.contains("shell access is off"), "{out}");
+        server.abort();
     }
 
     /// An anthropic-shaped endpoint that asks for one tool call per turn and
