@@ -87,7 +87,7 @@ impl Llm {
             http,
             provider: cfg.provider,
             model: cfg.model_or_default(),
-            base: cfg.base_url_or_default(),
+            base: cfg.try_base_url_or_default()?,
             key,
             max_tokens: if cfg.max_tokens == 0 { 4096 } else { cfg.max_tokens },
         })

@@ -103,6 +103,40 @@ impl Handle {
     }
 }
 
+/// Env vars scrubbed from every child telepager spawns, so a shell, worker agent
+/// or CLI master can't read the daemon's secrets via printenv or the config.
+/// Only these names are removed — PATH/HOME/TERM/NO_COLOR and the rest of the
+/// inherited env are left alone. Callers apply this before any explicit preset
+/// env, so a preset that deliberately sets one of these gets it back.
+pub const SECRET_ENV_DENYLIST: &[&str] = &[
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_ALLOWED_IDS",
+    "GITHUB_MCP_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GROQ_API_KEY",
+    "TOGETHER_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "CLAUDE_API_KEY",
+];
+
+/// Remove the denylisted secrets from a tokio child command.
+pub fn scrub_secret_env(cmd: &mut tokio::process::Command) {
+    for key in SECRET_ENV_DENYLIST {
+        cmd.env_remove(key);
+    }
+}
+
+/// Remove the denylisted secrets from a pty child command.
+pub fn scrub_secret_env_pty(cmd: &mut CommandBuilder) {
+    for key in SECRET_ENV_DENYLIST {
+        cmd.env_remove(key);
+    }
+}
+
 /// A task or model that starts with '-' would be read as a command-line flag
 /// by the agent binary (`--help` prints help, `--dangerously-skip-permissions`
 /// grants that permission), so refuse it before it ever becomes an argv entry.
@@ -337,6 +371,7 @@ fn launch_on_pty(
     cmd.env("TERM", "xterm-256color");
     cmd.env_remove("NO_COLOR");
     // removals first, so a preset's own env can put one back deliberately
+    scrub_secret_env_pty(&mut cmd);
     for key in &preset.unset {
         cmd.env_remove(key);
     }
@@ -380,6 +415,8 @@ fn launch_on_pipes(
     // holds the `Child`, so dropping the process table — or unwinding out of an
     // unrelated error — SIGKILLs every running agent with nothing to tell the
     // user why. agents end in one place, `kill_tree` from `kill_agent`.
+    // scrub first, so a preset's own env can put a secret back deliberately
+    scrub_secret_env(&mut cmd);
     for key in &preset.unset {
         cmd.env_remove(key);
     }
@@ -725,6 +762,106 @@ mod tests {
 
         let status = launched.child.wait().await.unwrap();
         assert!(status.success());
+    }
+
+    /// Sets one process env var for the duration of a test and restores the
+    /// previous value after, so a secret-scrub test can't leak into another.
+    struct EnvGuard {
+        name: String,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(name: &str, value: &str) -> Self {
+            let prev = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name: name.to_string(), prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(&self.name, v),
+                None => std::env::remove_var(&self.name),
+            }
+        }
+    }
+
+    #[test]
+    fn the_secret_env_denylist_covers_the_daemon_secrets() {
+        // every secret the daemon may carry must be on the list, including the
+        // bot token and the provider keys a shell could otherwise printenv
+        for name in [
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_ALLOWED_IDS",
+            "GITHUB_MCP_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "GROQ_API_KEY",
+            "TOGETHER_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "CLAUDE_API_KEY",
+        ] {
+            assert!(
+                SECRET_ENV_DENYLIST.contains(&name),
+                "{name} missing from the denylist: {SECRET_ENV_DENYLIST:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_launched_agent_does_not_inherit_secret_env() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let Some(_) = which("sh") else { return };
+        let _guard = EnvGuard::set("GROQ_API_KEY", "leaked-value-123");
+        let p = AgentPreset {
+            command: "sh".into(),
+            args: vec!["-c".into(), "printenv GROQ_API_KEY || echo gone".into()],
+            ..AgentPreset::default()
+        };
+        let mut launched = launch(&p, &std::env::temp_dir(), "", None).unwrap();
+
+        let Io::Pipes { stdout, .. } = &mut launched.io else {
+            panic!("a non-interactive preset should not get a pty");
+        };
+        let mut lines = BufReader::new(stdout.take().unwrap()).lines();
+        let out = lines.next_line().await.unwrap().unwrap();
+        assert_eq!(out, "gone", "the agent inherited GROQ_API_KEY: {out}");
+        let _ = launched.child.wait().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_preset_env_can_put_a_scrubbed_secret_back_deliberately() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let Some(_) = which("sh") else { return };
+        // inherited secret must be scrubbed first; the preset's own env then
+        // re-adds its deliberate value — order: scrub, then preset env
+        let _guard = EnvGuard::set("GROQ_API_KEY", "inherited-leak");
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("GROQ_API_KEY".to_string(), "preset-value".to_string());
+        let p = AgentPreset {
+            command: "sh".into(),
+            args: vec!["-c".into(), "printenv GROQ_API_KEY".into()],
+            env,
+            ..AgentPreset::default()
+        };
+        let mut launched = launch(&p, &std::env::temp_dir(), "", None).unwrap();
+
+        let Io::Pipes { stdout, .. } = &mut launched.io else {
+            panic!("a non-interactive preset should not get a pty");
+        };
+        let mut lines = BufReader::new(stdout.take().unwrap()).lines();
+        let out = lines.next_line().await.unwrap().unwrap();
+        assert_eq!(out, "preset-value", "preset env did not land after scrub: {out}");
+        let _ = launched.child.wait().await.unwrap();
     }
 
     #[cfg(unix)]

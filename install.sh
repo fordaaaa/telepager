@@ -1,5 +1,8 @@
 #!/bin/sh
-# curl -fsSL https://raw.githubusercontent.com/fordaaaa/telepager/main/install.sh | sh
+# curl -fsSL https://raw.githubusercontent.com/fordaaaa/telepager/v0.3.1/install.sh | TELEPAGER_VERSION=0.3.1 sh
+# TELEPAGER_VERSION pins the release to install; leave it unset for the latest.
+# The sha256 below is fetched from the same host as the binary (TOFU): it
+# only catches a truncated or corrupted download, it is not a signature.
 set -eu
 
 REPO="fordaaaa/telepager"

@@ -33,8 +33,12 @@ npm install -g telepager     # or: npx -y telepager, no install
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/fordaaaa/telepager/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/fordaaaa/telepager/v0.3.1/install.sh | TELEPAGER_VERSION=0.3.1 sh
 ```
+
+The script is pinned to the `v0.3.1` tag above; `TELEPAGER_VERSION` picks the
+release binary to install (unset means latest). Its sha256 comes from the
+same host as the binary — it only catches a truncated download.
 
 The script drops a prebuilt binary in `~/.local/bin`. On Windows use npm.
 telepager isn't on crates.io; from a checkout, `cargo build --release` puts a
@@ -344,13 +348,23 @@ To scope terminal access per repo, run `telepager init [--dir DIR] [--preset pag
   Messages from anyone else are ignored.
 - `allowed_dirs` is empty by default, so Telegram can't spawn agents anywhere
   until you set it. The local console is unrestricted — using it means you're
-  already at the machine.
+  already at the machine. `allowed_dirs` only gates the working directory
+  (cwd) an agent or shell starts in — it is cwd-only, not a filesystem jail.
 - Spawning or messaging an agent from Telegram requires `permissions.shell`
   (plus an allowed directory). The console stays exempt. Tasks and models
   that start with `-` are refused, so they can't be parsed as agent
   command-line flags.
+- Spawned processes (shell commands, worker agents, the CLI master) inherit
+  a scrubbed environment: secret variables like `TELEGRAM_BOT_TOKEN` and
+  `*_API_KEY` are removed before spawning, so a shell can't `printenv` the
+  daemon's secrets. `PATH`, `HOME` and other non-secret variables stay;
+  a preset's explicit `env` can still set one of the scrubbed names on
+  purpose.
 - `/key` only works in a private chat — in a group or supergroup chat it is
   refused, so a key never lands where everyone in the chat can see it.
+  The model endpoint must be `https`, except for localhost over `http`
+  (`127.0.0.1`, `localhost`, `::1`) — a remote `http://` `base_url` is
+  refused, so a key is never sent in cleartext to a remote server.
 - The console is loopback-only, on a fixed port (`47823` unless you set
   `ui_port`), behind a one-off key in the URL, and checks the `Host` header.
 - Prefer `TELEGRAM_BOT_TOKEN` over the plaintext config; the file is `0600`.

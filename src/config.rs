@@ -315,6 +315,15 @@ impl MasterConfig {
             .unwrap_or_else(|| self.provider.default_base_url().to_string())
     }
 
+    /// Like `base_url_or_default`, but refuses a remote `http://` address, so a
+    /// key is never sent in cleartext to someone else's server. Callers that
+    /// use the address (the LLM client, the save paths) go through here.
+    pub fn try_base_url_or_default(&self) -> Result<String> {
+        let url = self.base_url_or_default();
+        validate_base_url(&url)?;
+        Ok(url)
+    }
+
     /// The key, from config or from whichever env var is actually set.
     pub fn resolve_key(&self) -> Option<String> {
         if let Some(k) = self.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
@@ -640,8 +649,56 @@ pub fn save(explicit: Option<&Path>, token: &str, ids: &[i64]) -> Result<PathBuf
     Ok(path)
 }
 
+/// A remote model address must be https; http is only allowed to localhost,
+/// so a key the master sends is never cleartext to a remote server. An empty
+/// address means the provider default and is always fine here.
+pub fn validate_base_url(url: &str) -> Result<()> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Ok(());
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        bail!("base_url must start with https:// (http:// is only allowed to localhost): {url}");
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => Ok(()),
+        "http" => {
+            let host = base_url_host(rest);
+            if is_local_host(&host) {
+                Ok(())
+            } else {
+                bail!(
+                    "refusing to send an api key over http to {host} — use https://, \
+                     or a localhost address (127.0.0.1, localhost, ::1)"
+                )
+            }
+        }
+        _ => bail!("base_url must be https:// (http:// is only allowed to localhost): {url}"),
+    }
+}
+
+fn base_url_host(rest: &str) -> String {
+    let authority = rest.split('/').next().unwrap_or("");
+    // drop any userinfo in front of the host
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some(v6) = authority.strip_prefix('[') {
+        if let Some(end) = v6.find(']') {
+            return v6[..end].to_ascii_lowercase();
+        }
+        return authority.to_ascii_lowercase();
+    }
+    authority.split(':').next().unwrap_or(authority).to_ascii_lowercase()
+}
+
+fn is_local_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 /// Replace just the `master` block, leaving the rest of the file alone.
 pub fn save_master(explicit: Option<&Path>, master: &MasterConfig) -> Result<PathBuf> {
+    if let Some(url) = master.base_url.as_deref() {
+        validate_base_url(url)?;
+    }
     let path = target_path(explicit);
     let mut doc = read_doc(&path)?;
     let obj = doc
@@ -1220,6 +1277,57 @@ mod tests {
         };
         // the trailing slash would double up when paths get appended
         assert_eq!(custom.base_url_or_default(), "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn base_url_requires_https_for_remote_hosts() {
+        // remote http would send the key in cleartext, so it's refused
+        assert!(validate_base_url("http://evil.example/v1").is_err());
+        assert!(validate_base_url("http://10.0.0.1:8080/v1").is_err());
+        assert!(validate_base_url("http://127.0.0.1.evil.com/v1").is_err());
+        assert!(validate_base_url("ftp://api.example/v1").is_err());
+
+        // localhost http and https anywhere are fine
+        for url in [
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:8080",
+            "http://localhost",
+            "http://[::1]:8080/v1",
+            "https://api.example/v1",
+            "https://openrouter.ai/api/v1",
+            "http://127.0.0.1:11434/v1",
+            "",
+        ] {
+            assert!(validate_base_url(url).is_ok(), "wrongly refused: {url}");
+        }
+    }
+
+    #[test]
+    fn saving_master_refuses_cleartext_http_base_url() {
+        let dir = scratch("baseurl-http");
+        let path = dir.join("config.json");
+        save(Some(&path), "tok", &[1]).unwrap();
+
+        let bad = MasterConfig {
+            provider: Provider::Openai,
+            base_url: Some("http://evil.example/v1".into()),
+            ..MasterConfig::default()
+        };
+        let err = save_master(Some(&path), &bad).unwrap_err();
+        assert!(format!("{err:#}").contains("http"), "{err:#}");
+
+        // and a localhost address still saves fine
+        let good = MasterConfig {
+            provider: Provider::Openai,
+            base_url: Some("http://127.0.0.1:8080/v1".into()),
+            ..MasterConfig::default()
+        };
+        save_master(Some(&path), &good).unwrap();
+        assert_eq!(
+            load(Some(&path)).unwrap().master.base_url_or_default(),
+            "http://127.0.0.1:8080/v1"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

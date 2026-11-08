@@ -750,6 +750,8 @@ impl Core {
             .stderr(Stdio::piped())
             .env("NO_COLOR", "1")
             .env("TERM", "dumb");
+        // a shell must not read the daemon's secrets via inherited env
+        agents::scrub_secret_env(&mut cmd);
         // its own group, like every other child: so the timeout can take the
         // whole tree, and so a signal it sends can't reach the daemon
         agents::own_process_group(&mut cmd);
@@ -1775,5 +1777,32 @@ pub(crate) mod tests {
         core.kill_agent(&id).await.ok();
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_does_not_leak_secret_env_to_the_child() {
+        if crate::agents::which("sh").is_none() {
+            return;
+        }
+        // a denylisted secret must not reach a shell spawned via /sh;
+        // OPENROUTER_API_KEY stands in for TELEGRAM_BOT_TOKEN so this test
+        // can't race the config-load tests that read the bot token env
+        let prev = std::env::var("OPENROUTER_API_KEY").ok();
+        std::env::set_var("OPENROUTER_API_KEY", "leaked-value-123");
+
+        let c = core();
+        let run = c
+            .run_shell("printenv OPENROUTER_API_KEY || echo gone", &std::env::temp_dir(), Duration::from_secs(10), None)
+            .await
+            .unwrap();
+
+        match &prev {
+            Some(v) => std::env::set_var("OPENROUTER_API_KEY", v),
+            None => std::env::remove_var("OPENROUTER_API_KEY"),
+        }
+
+        assert!(run.output.contains("gone"), "secret leaked into shell: {}", run.output);
+        assert!(!run.output.contains("leaked-value-123"), "secret leaked into shell: {}", run.output);
     }
 }

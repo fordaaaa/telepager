@@ -175,6 +175,8 @@ fn build_command(program: &Path, plan: &Plan, workdir: &Path) -> tokio::process:
         .env("NO_COLOR", "1")
         .kill_on_drop(true);
     // removals first, so a plan can put something back deliberately
+    // (e.g. a key the config asked for by name in claude_plan)
+    agents::scrub_secret_env(&mut cmd);
     for key in &plan.unset {
         cmd.env_remove(key);
     }
@@ -1019,6 +1021,35 @@ mod tests {
         let dir = master_workdir().unwrap();
         assert!(dir.ends_with("telepager/master"));
         assert!(dir.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_master_cli_does_not_inherit_secret_env() {
+        let Some(sh) = agents::which("sh") else { return };
+        // ANTHROPIC_API_KEY stands in for the rest of the denylist (which the
+        // denylist unit test in agents.rs pins down); it proves build_command
+        // strips inherited secrets before the plan's env is applied
+        let prev = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::set_var("ANTHROPIC_API_KEY", "leaked-value-123");
+
+        let out = run_cli(
+            &sh,
+            &shell_plan("printenv ANTHROPIC_API_KEY || echo gone"),
+            &std::env::temp_dir(),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+
+        match &prev {
+            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(text.contains("gone"), "secret leaked into master cli: {text}");
+        assert!(!text.contains("leaked-value-123"), "secret leaked into master cli: {text}");
     }
 
     #[test]

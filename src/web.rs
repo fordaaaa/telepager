@@ -470,6 +470,11 @@ async fn save_master(core: &Arc<Core>, body: &Value) -> Result<Value> {
         requested_base_url
     };
 
+    // a key must never go out over cleartext http to a remote server
+    if let Some(url) = base_url.as_deref() {
+        config::validate_base_url(url)?;
+    }
+
     let switched = provider != existing.provider;
 
     // On a provider switch, api_key/api_key_env/command/args belong to the
@@ -1265,6 +1270,45 @@ mod tests {
         assert_eq!(
             config::load(Some(&path)).unwrap().master.api_key_env.as_deref(),
             Some("OPENROUTER_API_KEY")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn web_save_master_refuses_remote_http_base_url() {
+        let (c, _path, dir) = core_with_openai_base_url("baseurl-http-refuse");
+        let err = save_master(
+            &c,
+            &json!({ "provider": "openai", "model": "", "base_url": "http://evil.example/v1" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("http"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn web_save_master_allows_localhost_http_and_https_base_url() {
+        let (c, path, dir) = core_with_openai_base_url("baseurl-http-allow");
+        save_master(
+            &c,
+            &json!({ "provider": "openai", "model": "", "base_url": "http://127.0.0.1:8080/v1" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            config::load(Some(&path)).unwrap().master.base_url_or_default(),
+            "http://127.0.0.1:8080/v1"
+        );
+        save_master(
+            &c,
+            &json!({ "provider": "openai", "model": "", "base_url": "https://api.example/v1" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            config::load(Some(&path)).unwrap().master.base_url_or_default(),
+            "https://api.example/v1"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

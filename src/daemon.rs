@@ -703,6 +703,14 @@ async fn key_command(core: &Arc<Core>, rest: &str, where_said: Option<(i64, i64)
 
 /// Save a master block and pick the config back up, or say why not.
 async fn save(core: &Arc<Core>, master: &MasterConfig) -> std::result::Result<(), String> {
+    // /key carries a key, so the address it would be sent to must not be
+    // cleartext http to a remote server. save_master checks too; this keeps
+    // the refusal worded for telegram.
+    if let Some(url) = master.base_url.as_deref() {
+        if let Err(e) = crate::config::validate_base_url(url) {
+            return Err(format!("Could not save that: {e:#}"));
+        }
+    }
     if let Err(e) = crate::config::save_master(core.config_path.as_deref(), master) {
         return Err(format!("Could not save that: {e:#}"));
     }
@@ -1568,6 +1576,35 @@ mod tests {
             crate::config::load(Some(&path)).unwrap().master.api_key_env.as_deref(),
             Some("OPENROUTER_API_KEY")
         );
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn key_save_refuses_a_remote_http_base_url_already_in_the_config() {
+        // a hand-edited config may already carry a cleartext remote address;
+        // /key must refuse to save a key onto it rather than send it there
+        let (base, _seen, server) = crate::core::tests::fake_telegram(7).await;
+        let dir = std::env::temp_dir().join(format!("telepager-daemon-key-http-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        crate::config::save(Some(&path), "1:fake", &[7]).unwrap();
+        let c = Core::new(Some(path.clone()));
+        let cfg = crate::config::Config {
+            master: crate::config::MasterConfig {
+                provider: crate::config::Provider::Openai,
+                base_url: Some("http://evil.example/v1".into()),
+                ..Default::default()
+            },
+            permissions: crate::config::Permissions { remote_control: true, ..Default::default() },
+            ..crate::core::tests::config_for(&[7])
+        };
+        c.attach(cfg, crate::telegram::Telegram::with_base(&base)).await;
+
+        let refused = key_command(&c, "sk-secret", None).await;
+        assert!(refused.contains("http"), "{refused}");
+        assert!(crate::config::load(Some(&path)).unwrap().master.api_key.is_none());
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
