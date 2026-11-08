@@ -146,7 +146,7 @@ fn joined(done: Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
 /// The few lines a person sees when the console is up. On a tty the full url
 /// (key included) is fine — it's the local terminal. Captured to a service
 /// log file it would outlive the run, so non-tty output names the port only.
-fn console_display(url: &str, is_tty: bool) -> String {
+pub(crate) fn console_display(url: &str, is_tty: bool) -> String {
     if is_tty {
         return url.to_string();
     }
@@ -262,7 +262,7 @@ pub fn print(config: Option<PathBuf>) {
         Some(ep) => {
             println!("  app       running on 127.0.0.1:{}", ep.port);
             match ep.ui_url() {
-                Some(url) => println!("  console   {url}"),
+                Some(url) => println!("  console   {}", console_display(&url, std::io::stdout().is_terminal())),
                 None => println!("  console   not published"),
             }
         }

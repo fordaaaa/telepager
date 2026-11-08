@@ -80,13 +80,22 @@ pub fn parse(text: &str, wanted: &BTreeSet<String>) -> Vec<Pane> {
 
 /// The tail of a pane's screen.
 pub async fn capture(pane_id: &str, lines: usize) -> Option<String> {
+    if pane_is_shell(pane_id).await {
+        return None;
+    }
     let start = format!("-{lines}");
     run(&["capture-pane", "-p", "-t", pane_id, "-S", &start]).await
 }
 
 /// Type `text` at a pane and press enter. `-l` keeps tmux from reading the
 /// text as key names, and the argument vector keeps it away from a shell.
+/// Single-line only: newlines, carriage returns and Ctrl-C are refused, so
+/// one call cannot smuggle a second (or interrupting) line into a pane.
 pub async fn send_text(pane_id: &str, text: &str) -> Result<(), String> {
+    validate_send_text(text)?;
+    if pane_is_shell(pane_id).await {
+        return Err(format!("refusing: pane {pane_id} is running a shell, not an agent"));
+    }
     run_checked(&["send-keys", "-t", pane_id, "-l", "--", text]).await?;
     run_checked(&["send-keys", "-t", pane_id, "Enter"]).await
 }
@@ -95,7 +104,54 @@ pub async fn send_text(pane_id: &str, text: &str) -> Result<(), String> {
 /// telepager spawned, so interrupting the agent is the ceiling — we never
 /// close the pane or kill the process behind it.
 pub async fn interrupt(pane_id: &str) -> Result<(), String> {
+    if pane_is_shell(pane_id).await {
+        return Err(format!("refusing: pane {pane_id} is running a shell, not an agent"));
+    }
     run_checked(&["send-keys", "-t", pane_id, "C-c"]).await
+}
+
+/// Reject multi-line / control-character text for a tmux pane.
+pub fn validate_send_text(text: &str) -> Result<(), String> {
+    if text.contains('\n') || text.contains('\r') || text.contains('\x03') {
+        return Err("refusing: tmux send is single-line only (no newline, carriage return or Ctrl-C)".into());
+    }
+    Ok(())
+}
+
+const SHELL_COMMANDS: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh"];
+
+/// Whether a foreground command is a shell, not an agent.
+pub fn is_shell_command(command: &str) -> bool {
+    SHELL_COMMANDS.contains(&command.trim())
+}
+
+/// Re-verify, via a fresh `discover` against the configured presets, that
+/// `pane_id` is still running a known agent. `None` means the pane is gone
+/// or its foreground command is no longer an agent (e.g. it dropped to a
+/// shell) — callers must refuse rather than read/type/interrupt it.
+pub async fn verified_pane(
+    pane_id: &str,
+    presets: &std::collections::BTreeMap<String, AgentPreset>,
+) -> Option<Pane> {
+    discover(presets).await.into_iter().find(|p| p.id == pane_id)
+}
+
+/// The foreground command of one pane, if tmux can say.
+pub async fn pane_current_command(pane_id: &str) -> Option<String> {
+    run(&["display-message", "-p", "-t", pane_id, "#{pane_current_command}"])
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether the pane's foreground command is currently a shell. When tmux
+/// cannot answer (no server, no pane) this is false, so the subsequent
+/// capture/send fails in the usual way rather than with a shell refusal.
+async fn pane_is_shell(pane_id: &str) -> bool {
+    match pane_current_command(pane_id).await {
+        Some(cmd) => is_shell_command(&cmd),
+        None => false,
+    }
 }
 
 /// Bring the registry in line with what tmux is running: open a session for
@@ -240,5 +296,28 @@ mod tests {
     async fn discovery_never_errors_when_tmux_is_missing() {
         // whatever this machine has, discovery returns a list and not an error
         let _ = discover(&crate::config::builtin_agents()).await;
+    }
+
+    #[test]
+    fn multi_line_send_is_rejected() {
+        assert!(validate_send_text("hello\nrm -rf /").is_err());
+        assert!(validate_send_text("hello\rworld").is_err());
+        assert!(validate_send_text("hello\x03").is_err());
+        assert!(validate_send_text("hello world").is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_multi_line_send_text_is_rejected_before_tmux() {
+        let err = send_text("%999", "a\nb").await.unwrap_err();
+        assert!(err.contains("single-line"), "{err}");
+    }
+
+    #[test]
+    fn a_shell_pane_is_not_an_agent() {
+        assert!(is_shell_command("zsh"));
+        assert!(is_shell_command("bash"));
+        assert!(is_shell_command("sh"));
+        assert!(!is_shell_command("claude"));
+        assert!(!is_shell_command("codex"));
     }
 }

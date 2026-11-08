@@ -155,6 +155,16 @@ async fn poll_updates(core: Arc<Core>, tg: Arc<Telegram>) {
             offset = update.update_id + 1;
 
             if let Some(msg) = update.message {
+                // Drop replayed updates: a message older than 120s is not a
+                // fresh command, however it arrived.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if msg.is_stale(now) {
+                    log::warn!("ignoring stale message {} (date {:?}, now {now})", msg.message_id, msg.date);
+                    continue;
+                }
                 // off the poll loop: a message that blocks — shell command,
                 // master turn, anything that asks — must not stop us reading
                 // the tap that answers it
@@ -252,6 +262,16 @@ fn as_answer(text: &str, options: &[String]) -> Option<Answer> {
 
 async fn handle_message(core: Arc<Core>, msg: IncomingMessage) {
     let core = &core;
+    // Defence in depth for the poll_updates stale check: a stale message
+    // reaching here (direct call, future caller) is still dropped.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if msg.is_stale(now) {
+        log::warn!("ignoring stale message {} (date {:?}, now {now})", msg.message_id, msg.date);
+        return;
+    }
     let Some(from) = &msg.from else { return };
     if !allowed(core, from.id).await {
         log::warn!("ignoring a message from {}", from.id);
@@ -414,6 +434,15 @@ async fn handle_command(
         "kill" => {
             if rest.is_empty() {
                 "Say which session, e.g. /kill s3.".into()
+            } else if matches!(core.config().await, Some(ref cfg) if !cfg.permissions.shell) {
+                // Killing is shell-equivalent (it tears down a process tree),
+                // so from Telegram it needs shell access, mirroring spawn.
+                // The console stays exempt.
+                format!(
+                    "shell access is off. killing from telegram needs it. turn it on in the \
+                     console's Settings, or set permissions.shell to true in {}.",
+                    crate::config::first_candidate()
+                )
             } else {
                 match core.kill_agent(rest).await {
                     Ok(()) => format!("Killed {rest}."),
@@ -623,6 +652,9 @@ async fn key_command(core: &Arc<Core>, rest: &str, where_said: Option<(i64, i64)
         if remainder.is_empty() {
             return "Say which variable, e.g. /key env OPENROUTER_API_KEY.".into();
         }
+        if let Err(e) = master.provider.validate_api_key_env(remainder) {
+            return format!("{e:#}");
+        }
         let updated = MasterConfig {
             api_key: None,
             api_key_env: Some(remainder.to_string()),
@@ -733,8 +765,10 @@ async fn settings_command(core: &Arc<Core>) -> String {
         toggle_label("remote control", cfg.permissions.remote_control),
         "leave it".to_string(),
     ];
-    let answer = core.ask(SETTINGS_SESSION, "change what?", &options).await;
-    apply_setting(core, cfg.permissions, &answer).await
+    // Short window (60s, not the 300s ask default): a settings tap is a
+    // live console action, and a long window is a long race.
+    let answer = core.ask_with_timeout(SETTINGS_SESSION, "change what?", &options, Some(60)).await;
+    apply_setting(core, &answer).await
 }
 
 fn settings_summary(cfg: &crate::config::Config, work_dir: Option<&std::path::Path>) -> String {
@@ -777,11 +811,17 @@ fn toggle_label(what: &str, on: bool) -> String {
 }
 
 /// Apply whichever toggle the tap picked, and say what everything is now.
-async fn apply_setting(
-    core: &Arc<Core>,
-    mut permissions: crate::config::Permissions,
-    answer: &str,
-) -> String {
+/// Re-reads fresh permissions after the ask: if remote_control was revoked
+/// in the console during the window, the tap is dropped, not applied to a
+/// stale snapshot.
+async fn apply_setting(core: &Arc<Core>, answer: &str) -> String {
+    let Some(fresh) = core.config().await else {
+        return "changed in the console, ignoring".into();
+    };
+    if !fresh.permissions.remote_control {
+        return "changed in the console, ignoring".into();
+    }
+    let mut permissions = fresh.permissions;
     let answer = answer.to_lowercase();
     if answer.contains("shell access") {
         permissions.shell = !permissions.shell;
@@ -928,10 +968,28 @@ mod tests {
     fn message(text: &str, reply_to: Option<i64>) -> IncomingMessage {
         IncomingMessage {
             message_id: 0,
+            date: None,
             chat: None,
             from: None,
             text: Some(text.to_string()),
             reply_to_message: reply_to.map(|message_id| SentMessage { message_id }),
+            photo: None,
+            voice: None,
+            audio: None,
+            video_note: None,
+            document: None,
+            caption: None,
+        }
+    }
+
+    fn message_at(text: &str, date: i64) -> IncomingMessage {
+        IncomingMessage {
+            message_id: 42,
+            date: Some(date),
+            chat: Some(crate::telegram::Chat { id: 7, typ: Some("private".into()) }),
+            from: Some(crate::telegram::User { id: 7, username: None, first_name: None }),
+            text: Some(text.to_string()),
+            reply_to_message: None,
             photo: None,
             voice: None,
             audio: None,
@@ -1356,7 +1414,7 @@ mod tests {
         };
         let (c, dir, server) = configured("settings-leave", permissions, vec![]).await;
 
-        let out = apply_setting(&c, Default::default(), "leave it").await;
+        let out = apply_setting(&c, "leave it").await;
         assert_eq!(out, "Left them alone.");
         assert!(!crate::config::load(Some(&dir.join("config.json"))).unwrap().permissions.shell);
 
@@ -1475,6 +1533,100 @@ mod tests {
 
         server.abort();
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn key_env_telegram_bot_token_is_refused() {
+        let permissions = crate::config::Permissions { remote_control: true, ..Default::default() };
+        let (c, dir, server) = configured("key-env-refuse", permissions.clone(), vec![]).await;
+        let path = dir.join("config.json");
+        crate::config::save_permissions(Some(&path), &permissions).unwrap();
+        // switch to openai first so OPENROUTER would be allowed
+        key_command(&c, "openrouter sk-or-secret", None).await;
+        let refused = key_command(&c, "env TELEGRAM_BOT_TOKEN", None).await;
+        assert!(refused.contains("refusing to use TELEGRAM_BOT_TOKEN as api key"), "{refused}");
+        // file unchanged by the refused attempt
+        assert_ne!(
+            crate::config::load(Some(&path)).unwrap().master.api_key_env.as_deref(),
+            Some("TELEGRAM_BOT_TOKEN")
+        );
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn key_env_openrouter_is_allowed_for_openai() {
+        let permissions = crate::config::Permissions { remote_control: true, ..Default::default() };
+        let (c, dir, server) = configured("key-env-allow", permissions.clone(), vec![]).await;
+        let path = dir.join("config.json");
+        crate::config::save_permissions(Some(&path), &permissions).unwrap();
+        key_command(&c, "openrouter sk-or-secret", None).await;
+        let out = key_command(&c, "env OPENROUTER_API_KEY", None).await;
+        assert!(out.contains("$OPENROUTER_API_KEY"), "{out}");
+        assert_eq!(
+            crate::config::load(Some(&path)).unwrap().master.api_key_env.as_deref(),
+            Some("OPENROUTER_API_KEY")
+        );
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn revoking_remote_control_mid_window_drops_the_tap() {
+        let permissions = crate::config::Permissions { remote_control: true, ..Default::default() };
+        let (c, dir, server) = configured("settings-revoke", permissions.clone(), vec![]).await;
+        let path = dir.join("config.json");
+        crate::config::save_permissions(Some(&path), &permissions).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let asked = {
+            let c = c.clone();
+            tokio::spawn(async move { settings_command(&c).await })
+        };
+        let qid = crate::core::tests::waiting_question(&c).await;
+        // revoke in the console during the window: fresh config has it off
+        let revoked = crate::config::Config {
+            permissions: Default::default(),
+            ..crate::core::tests::config_for(&[7])
+        };
+        let (base, _seen, _s) = crate::core::tests::fake_telegram(7).await;
+        c.attach(revoked, crate::telegram::Telegram::with_base(&base)).await;
+        c.answer(&qid, Answer::Tapped(0)).await;
+
+        let out = asked.await.unwrap();
+        assert!(out.contains("changed in the console, ignoring"), "{out}");
+        // file unchanged from before the tap (shell still off)
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(!crate::config::load(Some(&path)).unwrap().permissions.shell);
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_stale_sh_is_dropped_and_a_fresh_one_runs() {
+        // stale: date 1h ago => handle_message drops it, nothing broadcast
+        let (c, _dir, server) = configured("stale", Default::default(), vec![]).await;
+        let (base, seen, _s) = crate::core::tests::fake_telegram(7).await;
+        // re-attach with a recording telegram so broadcasts are visible
+        let cfg = crate::core::tests::config_for(&[7]);
+        c.attach(cfg, crate::telegram::Telegram::with_base(&base)).await;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        handle_message(c.clone(), message_at("/sh echo hi", now - 3600)).await;
+        assert!(seen.lock().unwrap().is_empty(), "stale message was not dropped");
+        // fresh: date now => it runs (shell off reply is still a broadcast)
+        handle_message(c.clone(), message_at("/sh echo hi", now)).await;
+        assert!(!seen.lock().unwrap().is_empty(), "fresh message did not run");
+        server.abort();
+        let _ = std::fs::remove_dir_all(&_dir);
+    }
+
+    #[tokio::test]
+    async fn kill_from_telegram_needs_shell_access() {
+        let (c, dir, server) = configured("kill-gate", Default::default(), vec![]).await;
+        let out = handle_command(&c, "kill s1", None, None).await;
+        assert!(out.contains("shell access is off"), "{out}");
+        server.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

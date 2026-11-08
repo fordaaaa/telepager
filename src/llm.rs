@@ -105,10 +105,15 @@ impl Llm {
             return e;
         };
         let text = format!("{e:#}");
-        if !text.contains(key) {
+        let encoded = crate::telegram::percent_encode(key);
+        if !text.contains(key) && (encoded.is_empty() || !text.contains(&encoded)) {
             return e;
         }
-        anyhow::anyhow!(text.replace(key, "<redacted>"))
+        let mut out = text.replace(key, "<redacted>");
+        if !encoded.is_empty() && encoded != key {
+            out = out.replace(&encoded, "<redacted>");
+        }
+        anyhow::anyhow!(out)
     }
 
     pub async fn turn(&self, system: &str, history: &[Msg], tools: &[ToolDef]) -> Result<Turn> {

@@ -41,6 +41,10 @@ pub struct Update {
 pub struct IncomingMessage {
     #[serde(default)]
     pub message_id: i64,
+    /// Telegram's unix timestamp for when the message was sent. Used to drop
+    /// replayed/stale updates (see `is_stale`).
+    #[serde(default)]
+    pub date: Option<i64>,
     pub chat: Option<Chat>,
     pub from: Option<User>,
     pub text: Option<String>,
@@ -60,6 +64,18 @@ pub struct IncomingMessage {
     pub document: Option<Document>,
     #[serde(default)]
     pub caption: Option<String>,
+}
+
+/// Messages older than this are replay, not news: drop them.
+pub const MAX_MESSAGE_AGE_SECS: i64 = 120;
+
+/// Whether a message dated `date` is stale at `now` (both unix seconds).
+/// Missing/zero dates (old payloads, hand-built test messages) are never stale.
+pub fn is_stale(date: Option<i64>, now: i64) -> bool {
+    match date {
+        Some(d) if d > 0 => now - d > MAX_MESSAGE_AGE_SECS,
+        _ => false,
+    }
 }
 
 #[allow(dead_code)] // parsed for shape/validation; width/height aren't read yet
@@ -95,6 +111,12 @@ impl IncomingMessage {
     pub fn location(&self) -> Option<(i64, i64)> {
         let chat = self.chat.as_ref().map(|c| c.id).or_else(|| self.from.as_ref().map(|u| u.id))?;
         (self.message_id != 0).then_some((chat, self.message_id))
+    }
+
+    /// Whether this message is a replay: sent more than
+    /// `MAX_MESSAGE_AGE_SECS` before `now`.
+    pub fn is_stale(&self, now: i64) -> bool {
+        is_stale(self.date, now)
     }
 
     /// The largest photo variant — telegram sends them smallest-first, so the
@@ -178,10 +200,15 @@ impl Telegram {
     // reqwest prints the request url in its errors and the token is in the url
     fn scrub(&self, e: anyhow::Error) -> anyhow::Error {
         let text = format!("{e:#}");
-        if !text.contains(&self.token) {
+        let encoded = percent_encode(&self.token);
+        if !text.contains(&self.token) && (encoded.is_empty() || !text.contains(&encoded)) {
             return e;
         }
-        anyhow::anyhow!(text.replace(&self.token, "<redacted>"))
+        let mut out = text.replace(&self.token, "<redacted>");
+        if !encoded.is_empty() && encoded != self.token {
+            out = out.replace(&encoded, "<redacted>");
+        }
+        anyhow::anyhow!(out)
     }
 
     async fn call<T: for<'de> Deserialize<'de>>(&self, method: &str, body: Value) -> Result<T> {
@@ -350,6 +377,24 @@ impl Telegram {
 
 fn is_unmodified(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("message is not modified")
+}
+
+/// Percent-encode every non-alphanumeric byte, so a token that appears in an
+/// error as `123%3ASECRET` (the `:` encoded) is scrubbed too, not just the
+/// raw form.
+pub fn percent_encode(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xF) as usize] as char);
+        }
+    }
+    out
 }
 
 /// One bot token gets one poller: a second `getUpdates` terminates the first and
@@ -1016,5 +1061,35 @@ mod tests {
         assert!(write_inbox_file(&dir, 124, "bin", &big).is_err());
         assert!(!dir.join("124.bin").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn message_dates_decide_staleness_at_120_seconds() {
+        let now = 1_700_000_000i64;
+        assert!(is_stale(Some(now - 121), now));
+        assert!(is_stale(Some(now - 3600), now));
+        assert!(!is_stale(Some(now - 120), now));
+        assert!(!is_stale(Some(now), now));
+        assert!(!is_stale(None, now));
+        assert!(!is_stale(Some(0), now));
+        // parsed from a real payload
+        let upd: Update = serde_json::from_str(
+            r#"{"update_id":1,"message":{"message_id":1,"date":1700000000,"text":"/sh echo hi"}}"#,
+        )
+        .unwrap();
+        let msg = upd.message.unwrap();
+        assert_eq!(msg.date, Some(1700000000));
+        assert!(msg.is_stale(1700000000 + 121));
+        assert!(!msg.is_stale(1700000000 + 60));
+    }
+
+    #[test]
+    fn percent_encoded_tokens_are_scrubbed_too() {
+        let tg = Telegram::new("123456:SECRET-TOKEN").unwrap();
+        assert_eq!(percent_encode("123456:SECRET-TOKEN"), "123456%3ASECRET%2DTOKEN");
+        let leaky = anyhow::anyhow!("calling https://api.telegram.org/bot123456%3ASECRET%2DTOKEN/send");
+        let scrubbed = format!("{:#}", tg.scrub(leaky));
+        assert!(!scrubbed.contains("SECRET"), "{scrubbed}");
+        assert!(scrubbed.contains("<redacted>"), "{scrubbed}");
     }
 }

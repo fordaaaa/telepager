@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 /// The launchd label / filename stem used by the service.
+// TODO: SLSA provenance for the binary is out of scope for this round.
 pub const LABEL: &str = "com.telepager.daemon";
 
 fn xml_escape(s: &str) -> String {
@@ -25,7 +26,11 @@ fn log_path() -> PathBuf {
 /// A macOS launch agent that runs `telepager start --no-open` at login.
 ///
 /// Pure so tests can check the unit without touching a real LaunchAgents dir.
-pub fn launch_agent_plist(exe: &Path, config: Option<&Path>) -> String {
+pub fn launch_agent_plist(exe: &Path, config: Option<&Path>) -> Result<String> {
+    check_no_newline(exe, "executable path")?;
+    if let Some(config) = config {
+        check_no_newline(config, "config path")?;
+    }
     let mut argv = vec![
         exe.to_string_lossy().into_owned(),
         "start".to_string(),
@@ -41,7 +46,7 @@ pub fn launch_agent_plist(exe: &Path, config: Option<&Path>) -> String {
         .collect();
     let log = plist_string(&log_path().to_string_lossy());
 
-    format!(
+    Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -63,22 +68,49 @@ pub fn launch_agent_plist(exe: &Path, config: Option<&Path>) -> String {
 </plist>
 "#,
         label = plist_string(LABEL),
-    )
+    ))
 }
 
-/// Quote an argument for a systemd `ExecStart=` line.
+/// A newline in a service path would inject extra unit/plist lines, so it is
+/// a hard error, not something to quote around.
+fn check_no_newline(path: &Path, what: &str) -> Result<()> {
+    let s = path.to_string_lossy();
+    if s.contains('\n') || s.contains('\r') {
+        anyhow::bail!("{what} contains a newline: refusing to install the service");
+    }
+    Ok(())
+}
+
+/// Quote an argument for a systemd `ExecStart=` line. `$` and `%` are systemd
+/// specifier/expansion characters, so they are escaped as `$$` and `%%`
+/// (before quoting, so a `$HOME`-style value cannot expand in the unit).
 fn systemd_quote(text: &str) -> String {
-    if text.contains([' ', '"', '\\']) {
-        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+    let escaped = text
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "$$")
+        .replace('%', "%%");
+    if escaped.contains([' ', '"', '\\']) || escaped != text {
+        // Quote when the original needed it, or when escaping changed it
+        // ($/%): an unquoted `$$`/`%%` is still special to systemd.
+        if text.contains([' ', '"', '\\', '$', '%']) {
+            format!("\"{escaped}\"")
+        } else {
+            escaped
+        }
     } else {
-        text.to_string()
+        escaped
     }
 }
 
 /// A systemd user unit that runs `telepager start --no-open` at login.
 ///
 /// Pure for the same reason as [`launch_agent_plist`].
-pub fn systemd_unit(exe: &Path, config: Option<&Path>) -> String {
+pub fn systemd_unit(exe: &Path, config: Option<&Path>) -> Result<String> {
+    check_no_newline(exe, "executable path")?;
+    if let Some(config) = config {
+        check_no_newline(config, "config path")?;
+    }
     let mut exec = format!(
         "{} start --no-open",
         systemd_quote(&exe.to_string_lossy())
@@ -88,7 +120,7 @@ pub fn systemd_unit(exe: &Path, config: Option<&Path>) -> String {
         exec.push_str(&systemd_quote(&config.to_string_lossy()));
     }
 
-    format!(
+    Ok(format!(
         r#"[Unit]
 Description=telepager daemon
 After=network-online.target
@@ -102,7 +134,22 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 "#
-    )
+    ))
+}
+
+/// Make `--config` absolute (canonicalised when it exists) so the service
+/// does not resolve it against whatever cwd systemd/launchd start it in.
+fn absolutize_config(config: Option<PathBuf>) -> Option<PathBuf> {
+    config.map(|p| {
+        if let Ok(canon) = std::fs::canonicalize(&p) {
+            return canon;
+        }
+        if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir().map(|cwd| cwd.join(&p)).unwrap_or(p)
+        }
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -132,11 +179,16 @@ fn uid() -> u32 {
 /// `telepager start --no-open`. Idempotent — an existing unit is replaced.
 pub fn install(config: Option<PathBuf>) -> Result<()> {
     let exe = std::env::current_exe().context("finding our own binary")?;
+    check_no_newline(&exe, "executable path")?;
+    if let Some(c) = &config {
+        check_no_newline(c, "config path")?;
+    }
+    let config = absolutize_config(config);
 
     #[cfg(target_os = "macos")]
     {
         let path = plist_path().context("finding your LaunchAgents directory")?;
-        write_unit(&path, &launch_agent_plist(&exe, config.as_deref()))?;
+        write_unit(&path, &launch_agent_plist(&exe, config.as_deref())?)?;
 
         // unload any previous copy so the new one is what runs
         let _ = std::process::Command::new("launchctl")
@@ -164,7 +216,7 @@ pub fn install(config: Option<PathBuf>) -> Result<()> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let path = unit_path();
-        write_unit(&path, &systemd_unit(&exe, config.as_deref()))?;
+        write_unit(&path, &systemd_unit(&exe, config.as_deref())?)?;
 
         run_status("systemctl", &["--user", "daemon-reload"])?;
         run_status("systemctl", &["--user", "enable", "--now", "telepager.service"])?;
@@ -264,7 +316,7 @@ mod tests {
 
     #[test]
     fn the_plist_starts_the_daemon_at_login() {
-        let plist = launch_agent_plist(&exe(), None);
+        let plist = launch_agent_plist(&exe(), None).unwrap();
         assert!(plist.contains(LABEL), "{plist}");
         assert!(plist.contains("/opt/tele pager/bin/telepager"), "{plist}");
         assert!(plist.contains("<string>start</string>"), "{plist}");
@@ -275,17 +327,17 @@ mod tests {
 
     #[test]
     fn the_plist_carries_a_config_path() {
-        let plist = launch_agent_plist(&exe(), Some(Path::new("/tmp/cfg.json")));
+        let plist = launch_agent_plist(&exe(), Some(Path::new("/tmp/cfg.json"))).unwrap();
         assert!(plist.contains("<string>--config</string>"), "{plist}");
         assert!(plist.contains("/tmp/cfg.json"), "{plist}");
         // paths with & must not break the xml
-        let odd = launch_agent_plist(Path::new("/tmp/a&b"), None);
+        let odd = launch_agent_plist(Path::new("/tmp/a&b"), None).unwrap();
         assert!(odd.contains("/tmp/a&amp;b"), "{odd}");
     }
 
     #[test]
     fn the_systemd_unit_starts_the_daemon_at_login() {
-        let unit = systemd_unit(&exe(), None);
+        let unit = systemd_unit(&exe(), None).unwrap();
         assert!(unit.contains("ExecStart="), "{unit}");
         assert!(unit.contains("/opt/tele pager/bin/telepager"), "{unit}");
         assert!(unit.contains(" start --no-open"), "{unit}");
@@ -296,8 +348,33 @@ mod tests {
 
     #[test]
     fn the_systemd_unit_carries_a_config_path() {
-        let unit = systemd_unit(&exe(), Some(Path::new("/tmp/cfg.json")));
+        let unit = systemd_unit(&exe(), Some(Path::new("/tmp/cfg.json"))).unwrap();
         assert!(unit.contains("--config"), "{unit}");
         assert!(unit.contains("/tmp/cfg.json"), "{unit}");
+    }
+
+    #[test]
+    fn a_newline_in_a_service_path_is_rejected() {
+        assert!(systemd_unit(Path::new("/tmp/a\nb"), None).is_err());
+        assert!(systemd_unit(Path::new("/tmp/a\rb"), None).is_err());
+        assert!(systemd_unit(&exe(), Some(Path::new("/tmp/cfg\n.json"))).is_err());
+        assert!(launch_agent_plist(Path::new("/tmp/a\nb"), None).is_err());
+    }
+
+    #[test]
+    fn systemd_quote_escapes_dollar_and_percent() {
+        assert_eq!(systemd_quote("/tmp/a$b"), "\"/tmp/a$$b\"");
+        assert_eq!(systemd_quote("/tmp/a%b"), "\"/tmp/a%%b\"");
+        let unit = systemd_unit(Path::new("/tmp/a$b%c"), None).unwrap();
+        assert!(unit.contains("$$"), "{unit}");
+        assert!(unit.contains("%%"), "{unit}");
+        assert!(!unit.contains("/tmp/a$b%c"), "{unit}");
+    }
+
+    #[test]
+    fn install_absolutizes_a_relative_config() {
+        let abs = absolutize_config(Some(PathBuf::from("rel/cfg.json"))).unwrap();
+        assert!(abs.is_absolute(), "{abs:?}");
+        assert!(abs.ends_with("rel/cfg.json"), "{abs:?}");
     }
 }

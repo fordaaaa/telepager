@@ -418,6 +418,19 @@ impl Core {
     /// Ask the user something and block until either front end answers. Returns
     /// the answer, or why there isn't one.
     pub async fn ask(&self, session: &str, question: &str, options: &[String]) -> String {
+        let timeout = self.config().await.map(|c| c.ask_timeout_seconds);
+        self.ask_with_timeout(session, question, options, timeout).await
+    }
+
+    /// `ask` with an explicit timeout in seconds, for short-window questions
+    /// like `/settings` that must not inherit the 300s default.
+    pub async fn ask_with_timeout(
+        &self,
+        session: &str,
+        question: &str,
+        options: &[String],
+        timeout_seconds: Option<u64>,
+    ) -> String {
         if options.is_empty() {
             return "need at least one option".into();
         }
@@ -464,7 +477,8 @@ impl Core {
             },
         );
 
-        let wait = Duration::from_secs(cfg.ask_timeout_seconds);
+        let wait_secs = timeout_seconds.unwrap_or(cfg.ask_timeout_seconds);
+        let wait = Duration::from_secs(wait_secs);
         let picked = tokio::time::timeout(wait, rx).await;
         let entry = self.pending.lock().await.remove(&qid);
         let tg_messages = entry.map(|p| p.tg_messages).unwrap_or(tg_messages);
@@ -482,8 +496,8 @@ impl Core {
                 format!("{text}\n\n⏹ cancelled"),
             ),
             Err(_) => (
-                format!("no answer — the user did not pick an option within {}s", cfg.ask_timeout_seconds),
-                format!("{text}\n\n⏱ no answer after {}s", cfg.ask_timeout_seconds),
+                format!("no answer — the user did not pick an option within {}s", wait_secs),
+                format!("{text}\n\n⏱ no answer after {}s", wait_secs),
             ),
         };
 
@@ -933,6 +947,20 @@ impl Core {
     }
 }
 
+/// Cap on one pumped output line. A chatty agent printing a single huge line
+/// must not balloon the session log (and every phone it pages).
+pub const MAX_PUMP_LINE: usize = 64 * 1024;
+
+/// Truncate a pumped line at 64KiB, with a note so the cut is visible.
+pub fn cap_pump_line(line: String) -> String {
+    if line.len() <= MAX_PUMP_LINE {
+        return line;
+    }
+    let mut capped: String = line.chars().take(MAX_PUMP_LINE).collect();
+    capped.push_str("… [line truncated at 64KiB]");
+    capped
+}
+
 /// Copy one of a child's streams into the session log, line by line.
 async fn pump<R>(core: Arc<Core>, id: SessionId, stream: &'static str, reader: R)
 where
@@ -944,6 +972,7 @@ where
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
+                let line = cap_pump_line(line);
                 core.record(
                     Some(&id),
                     EventKind::Output { stream: stream.to_string(), line },
@@ -1199,6 +1228,16 @@ pub(crate) mod tests {
     #[test]
     fn label_goes_above_the_text() {
         assert_eq!(decorate("telepager", "hello"), "📁 telepager\nhello");
+    }
+
+    #[test]
+    fn a_pumped_line_is_capped_at_64kib_with_a_note() {
+        let short = cap_pump_line("hi".into());
+        assert_eq!(short, "hi");
+        let long = cap_pump_line("a".repeat(70 * 1024));
+        assert!(long.len() <= MAX_PUMP_LINE + 40, "{}", long.len());
+        assert!(long.contains("truncated"), "{long}");
+        assert!(long.contains("64KiB"), "{long}");
     }
 
     #[tokio::test]

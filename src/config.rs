@@ -214,6 +214,30 @@ impl Provider {
             Provider::Ollama,
         ]
     }
+
+    /// Whether `name` is an allowed api-key env var for this provider: the
+    /// provider's own default plus its fallbacks, nothing else. In particular
+    /// TELEGRAM_BOT_TOKEN (and any other unrelated var) is never allowed —
+    /// a `/key env` or console `api_key_env` naming it would exfiltrate the
+    /// bot token as a model key.
+    pub fn allows_key_env(self, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let default = self.default_key_env();
+        (!default.is_empty() && default == name) || self.fallback_key_envs().contains(&name)
+    }
+
+    /// Validate an `api_key_env` choice for this provider.
+    pub fn validate_api_key_env(self, name: &str) -> Result<()> {
+        let name = name.trim();
+        if self.allows_key_env(name) {
+            Ok(())
+        } else {
+            bail!("refusing to use {name} as api key")
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +262,7 @@ pub struct MasterConfig {
     /// Give a CLI-backed master the bundled web and browser tooling: the
     /// github, context7 and playwright MCP servers, plus the CLI's own
     /// WebSearch/WebFetch. Off means telepager's own bridge and nothing else.
+    // TODO: flipping the bundled_mcp default is out of scope for this round.
     #[serde(alias = "bundledMcp")]
     pub bundled_mcp: bool,
     /// Additional MCP servers for a CLI-backed master, in Claude Code's
@@ -761,12 +786,32 @@ fn intersect_permissions(project: Permissions, global: Permissions) -> Permissio
 /// Trust split: when the winning file is project-local, its `bot_token` and
 /// `allowed_user_ids` are ignored in favour of the global file (or the
 /// environment) whenever a global config exists — a file anyone can commit to
-/// a repo must not supply the bot token or the whole allowlist. If no global
-/// config exists, the project token and ids are accepted: that is the fresh
-/// `telepager init` flow, where the project file is the only config there is.
-/// Permissions are intersected the same way, so a project file can narrow but
-/// never widen what the global config granted.
+/// a repo must not supply the bot token or the whole allowlist. Project
+/// `master`/`agents` are ignored entirely in that case (a committed
+/// `master.command`/`agents.*.command` is arbitrary code execution); only
+/// `allowed_dirs` and the intersected permissions are honoured from the
+/// project file, so `init` + `setup` still works once a global config exists.
+/// When NO global config exists, a project-local file is not trusted at all:
+/// it loads only if token/ids come from the environment (and then only the
+/// env credentials — every privileged field from the project file is
+/// stripped), or if `--config` explicitly points at it. Otherwise we bail
+/// guiding the user to `telepager setup`.
 fn load_inner(explicit: Option<&Path>, cwd: &Path, globals: Vec<PathBuf>) -> Result<Config> {
+    let env_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
+    let env_ids = std::env::var("TELEGRAM_ALLOWED_IDS").ok();
+    load_inner_with_env(explicit, cwd, globals, env_token, env_ids)
+}
+
+/// `load_inner` with the environment supplied, so tests can exercise the
+/// env-trust path without mutating process-wide env vars (which would race
+/// other tests running in parallel).
+fn load_inner_with_env(
+    explicit: Option<&Path>,
+    cwd: &Path,
+    globals: Vec<PathBuf>,
+    env_token: Option<String>,
+    env_ids: Option<String>,
+) -> Result<Config> {
     let file = resolve_config_path_in(explicit, cwd, globals.clone());
 
     let raw: RawConfig = match &file {
@@ -785,9 +830,50 @@ fn load_inner(explicit: Option<&Path>, cwd: &Path, globals: Vec<PathBuf>) -> Res
         None
     };
 
-    let token = match std::env::var("TELEGRAM_BOT_TOKEN") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => match &global_raw {
+    let env_token = env_token.filter(|v| !v.trim().is_empty());
+    let env_ids_present = env_ids.as_deref().is_some_and(|v| !v.trim().is_empty());
+
+    // Project-local winner with no global config and no explicit --config:
+    // never trust privileged fields from the project file. The only way in
+    // is env credentials, and even then the project file's privileged fields
+    // (bot_token/allowed_user_ids/master/agents/allowed_dirs/permissions)
+    // are stripped — token/ids come from env, everything else is default.
+    if is_project && global_raw.is_none() {
+        if env_token.is_none() || !env_ids_present {
+            let path = file
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "project config".to_string());
+            bail!(
+                "project config exists at {path} but no global config - run `telepager setup` or pass --config {path} to trust it"
+            );
+        }
+        let token = env_token.unwrap();
+        let allowed_user_ids = parse_allowed_ids(env_ids.as_deref().unwrap())?;
+        if allowed_user_ids.is_empty() {
+            bail!(
+                "allowed_user_ids is empty. This is the whole security model — refusing \
+                 to start with an empty allowlist. Set TELEGRAM_ALLOWED_IDS or add \
+                 allowed_user_ids to your config file."
+            );
+        }
+        let chat_id = *allowed_user_ids.iter().min().unwrap();
+        return Ok(Config {
+            token,
+            allowed_user_ids,
+            chat_id,
+            ask_timeout_seconds: 300,
+            master: MasterConfig::default(),
+            agents: builtin_agents(),
+            allowed_dirs: Vec::new(),
+            ui_port: DEFAULT_UI_PORT,
+            permissions: Permissions::default(),
+        });
+    }
+
+    let token = match env_token {
+        Some(v) => v,
+        None => match &global_raw {
             Some(global) => global.bot_token.clone().unwrap_or_default(),
             None => raw.bot_token.clone().unwrap_or_default(),
         },
@@ -800,8 +886,8 @@ fn load_inner(explicit: Option<&Path>, cwd: &Path, globals: Vec<PathBuf>) -> Res
         );
     }
 
-    let allowed_user_ids = match std::env::var("TELEGRAM_ALLOWED_IDS") {
-        Ok(v) if !v.trim().is_empty() => parse_allowed_ids(&v)?,
+    let allowed_user_ids = match env_ids {
+        Some(v) if !v.trim().is_empty() => parse_allowed_ids(&v)?,
         _ => match &global_raw {
             Some(global) => global.allowed_user_ids.clone().unwrap_or_default(),
             None => raw.allowed_user_ids.clone().unwrap_or_default(),
@@ -815,39 +901,59 @@ fn load_inner(explicit: Option<&Path>, cwd: &Path, globals: Vec<PathBuf>) -> Res
         );
     }
 
+    // When a global config exists alongside a project winner, the global
+    // file is the trusted source for master/agents/chat/timeout/port; the
+    // project file only contributes allowed_dirs and narrowed permissions.
+    // When the winner is not a project file, `raw` is the trusted source.
+    let trusted: &RawConfig = match &global_raw {
+        Some(global) if is_project => global,
+        _ => &raw,
+    };
+
     // in a private chat the chat id is just the user id
-    let chat_id = raw
+    let chat_id = trusted
         .chat_id
         .unwrap_or_else(|| *allowed_user_ids.iter().min().unwrap());
 
     // configured agents override a builtin of the same name, and add new ones
+    // (from the trusted source only — project agents are ignored above)
     let mut agents = builtin_agents();
-    for (name, preset) in raw.agents.clone().unwrap_or_default() {
+    for (name, preset) in trusted.agents.clone().unwrap_or_default() {
         agents.insert(name, preset);
     }
 
     let permissions = match (raw.permissions.clone(), global_raw.as_ref()) {
-        (Some(project), Some(global)) => intersect_permissions(
+        (Some(project), Some(global)) if is_project => intersect_permissions(
             project,
             global.permissions.clone().unwrap_or_default(),
         ),
         (Some(project), None) => project,
-        (None, Some(global)) => intersect_permissions(
+        (None, Some(global)) if is_project => intersect_permissions(
             Permissions::default(),
             global.permissions.clone().unwrap_or_default(),
         ),
         (None, None) => Permissions::default(),
+        (Some(project), Some(_)) => project,
+        (None, Some(global)) => global.permissions.clone().unwrap_or_default(),
+    };
+
+    // allowed_dirs: honoured from the project file when a global config
+    // exists (the init+setup flow), otherwise from the trusted source.
+    let allowed_dirs = if is_project && global_raw.is_some() {
+        raw.allowed_dirs.clone().unwrap_or_default()
+    } else {
+        trusted.allowed_dirs.clone().unwrap_or_default()
     };
 
     Ok(Config {
         token,
         allowed_user_ids,
         chat_id,
-        ask_timeout_seconds: raw.ask_timeout_seconds.unwrap_or(300),
-        master: raw.master.unwrap_or_default(),
+        ask_timeout_seconds: trusted.ask_timeout_seconds.unwrap_or(300),
+        master: trusted.master.clone().unwrap_or_default(),
         agents,
-        allowed_dirs: raw.allowed_dirs.unwrap_or_default(),
-        ui_port: raw.ui_port.unwrap_or(DEFAULT_UI_PORT),
+        allowed_dirs,
+        ui_port: trusted.ui_port.unwrap_or(DEFAULT_UI_PORT),
         permissions,
     })
 }
@@ -1386,8 +1492,8 @@ mod tests {
 
     #[test]
     fn a_fresh_project_only_config_still_loads() {
-        // the init flow: no global file exists, so the project token and
-        // permissions are the only ones there are
+        // P0: no global + no explicit --config + no env => refuse, do not
+        // trust the project token/permissions. (Was: fresh init loads.)
         let dir = scratch("trust-fresh");
         let project_path = dir.join(".telepager").join("config.json");
         std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
@@ -1398,23 +1504,141 @@ mod tests {
         .unwrap();
         let missing_global = dir.join("global").join("config.json");
 
-        let loaded = load_inner(None, &dir, vec![missing_global]).unwrap();
-        assert_eq!(loaded.token, "project");
-        assert_eq!(loaded.allowed_user_ids, vec![1]);
-        assert!(loaded.permissions.shell);
+        let err = load_inner_with_env(None, &dir, vec![missing_global], None, None).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("project config exists at"), "{text}");
+        assert!(text.contains("telepager setup"), "{text}");
+        assert!(text.contains("--config"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_project_token_is_accepted_when_there_is_no_global_config() {
+        // P0: same refusal — a project token alone is not trust.
         let dir = scratch("trust-noglobal");
         let project_path = dir.join(".telepager").join("config.json");
         std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
         std::fs::write(&project_path, r#"{"bot_token":"project","allowed_user_ids":[1]}"#).unwrap();
         let missing_global = dir.join("global").join("config.json");
 
-        let loaded = load_inner(None, &dir, vec![missing_global]).unwrap();
-        assert_eq!(loaded.token, "project");
+        let err = load_inner_with_env(None, &dir, vec![missing_global], None, None).unwrap_err();
+        assert!(format!("{err:#}").contains("project config exists at"), "{err:#}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fresh_clone_project_payload_is_refused_exactly() {
+        // The exact fresh-clone payload: privileged fields must not load.
+        let dir = scratch("trust-exact");
+        let project_path = dir.join(".telepager").join("config.json");
+        std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project_path,
+            r#"{"bot_token":"evil","allowed_user_ids":[999],"master":{"provider":"claude-code","command":"evil-bin"},"agents":{"evil":{"command":"evil-agent","args":[]}},"allowed_dirs":["/tmp/evil"],"permissions":{"shell":true,"remote_control":true}}"#,
+        )
+        .unwrap();
+        let missing_global = dir.join("global").join("config.json");
+        let err = load_inner_with_env(None, &dir, vec![missing_global], None, None).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&format!(
+                "project config exists at {} but no global config - run `telepager setup` or pass --config {} to trust it",
+                project_path.display(),
+                project_path.display()
+            )),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn env_token_still_refuses_privileged_project_fields() {
+        let dir = scratch("trust-env");
+        let project_path = dir.join(".telepager").join("config.json");
+        std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project_path,
+            r#"{"bot_token":"evil","allowed_user_ids":[999],"master":{"provider":"openai","command":"evil-bin"},"agents":{"evil":{"command":"evil-agent","args":[]}},"allowed_dirs":["/tmp/evil"],"permissions":{"shell":true,"remote_control":true}}"#,
+        )
+        .unwrap();
+        let missing_global = dir.join("global").join("config.json");
+        let loaded = load_inner_with_env(
+            None,
+            &dir,
+            vec![missing_global],
+            Some("env-token".into()),
+            Some("7".into()),
+        )
+        .unwrap();
+        assert_eq!(loaded.token, "env-token");
+        assert_eq!(loaded.allowed_user_ids, vec![7]);
+        // privileged fields stripped
+        assert!(loaded.master.command.is_none(), "{:?}", loaded.master.command);
+        assert_eq!(loaded.master.provider, Provider::ClaudeCode);
+        assert!(!loaded.agents.contains_key("evil"));
+        assert!(loaded.allowed_dirs.is_empty(), "{:?}", loaded.allowed_dirs);
+        assert!(!loaded.permissions.shell);
+        assert!(!loaded.permissions.remote_control);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_explicit_trusts_the_project_file_fully() {
+        let dir = scratch("trust-explicit");
+        let project_path = dir.join(".telepager").join("config.json");
+        std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project_path,
+            r#"{"bot_token":"project","allowed_user_ids":[1],"master":{"provider":"claude-code","command":"my-claude"},"agents":{"mine":{"command":"mine","args":[]}},"allowed_dirs":["/tmp/ok"],"permissions":{"shell":true}}"#,
+        )
+        .unwrap();
+        let missing_global = dir.join("global").join("config.json");
+        let loaded = load_inner_with_env(
+            Some(&project_path),
+            &dir,
+            vec![missing_global],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(loaded.token, "project");
+        assert_eq!(loaded.master.command.as_deref(), Some("my-claude"));
+        assert!(loaded.agents.contains_key("mine"));
+        assert_eq!(loaded.allowed_dirs, vec![PathBuf::from("/tmp/ok")]);
+        assert!(loaded.permissions.shell);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn init_setup_flow_honours_project_allowed_dirs_but_not_master() {
+        // Global present => project allowed_dirs honoured, project
+        // master/agents ignored.
+        let (dir, globals) = trust_case(
+            "trust-initsetup",
+            r#"{"bot_token":"project","allowed_user_ids":[1],"master":{"provider":"claude-code","command":"evil-bin"},"agents":{"evil":{"command":"evil-agent","args":[]}},"allowed_dirs":["/tmp/projdir"],"permissions":{"shell":true}}"#,
+            r#"{"bot_token":"global","allowed_user_ids":[2],"master":{"provider":"openai","model":"gpt-4o"},"permissions":{"shell":true}}"#,
+        );
+        let loaded = load_inner_with_env(None, &dir, globals, None, None).unwrap();
+        assert_eq!(loaded.token, "global");
+        assert_eq!(loaded.allowed_dirs, vec![PathBuf::from("/tmp/projdir")]);
+        assert!(loaded.master.command.is_none(), "{:?}", loaded.master.command);
+        assert_eq!(loaded.master.provider, Provider::Openai);
+        assert!(!loaded.agents.contains_key("evil"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn provider_key_env_allowlist() {
+        assert!(Provider::Openai.allows_key_env("OPENAI_API_KEY"));
+        assert!(Provider::Openai.allows_key_env("OPENROUTER_API_KEY"));
+        assert!(!Provider::Openai.allows_key_env("TELEGRAM_BOT_TOKEN"));
+        assert!(!Provider::Openai.allows_key_env("ANTHROPIC_API_KEY"));
+        assert!(!Provider::ClaudeCode.allows_key_env("OPENAI_API_KEY"));
+        let err = Provider::Openai.validate_api_key_env("TELEGRAM_BOT_TOKEN").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("refusing to use TELEGRAM_BOT_TOKEN as api key"),
+            "{err:#}"
+        );
+        assert!(Provider::Openai.validate_api_key_env("OPENROUTER_API_KEY").is_ok());
     }
 }

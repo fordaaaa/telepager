@@ -430,23 +430,43 @@ fn setpgid_to_self() {
 /// SIGTERM a whole process group, given its leader's pid. Doesn't wait — the
 /// caller either has the `Child` or just wants the strays gone.
 pub fn signal_process_group(pid: u32) {
+    signal_group(pid, 15);
+}
+
+/// SIGKILL a whole process group. For `kill_tree`'s hard stop: a grandchild
+/// that traps SIGTERM survives a leader-only kill, so the group is what has
+/// to be SIGKILLed.
+pub fn signal_process_group_kill(pid: u32) {
+    signal_group(pid, 9);
+}
+
+fn signal_group(pid: u32, sig: i32) {
     #[cfg(unix)]
     {
         unsafe extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
         }
-        const SIGTERM: i32 = 15;
         // a negative pid means the group, which own_process_group made it lead
         unsafe {
-            kill(-(pid as i32), SIGTERM);
+            kill(-(pid as i32), sig);
         }
     }
     #[cfg(not(unix))]
-    let _ = pid;
+    let _ = (pid, sig);
+}
+
+#[cfg(unix)]
+fn process_group_exists(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe { kill(-(pid as i32), 0) == 0 }
 }
 
 /// Kill a whole process group on unix, or just the child elsewhere. Agents
 /// shell out constantly, so signalling only the parent leaves builds running.
+/// SIGTERM the group, give it 3s, then SIGKILL the group (not just the
+/// leader) so a SIGTERM-trapping grandchild cannot outlive the kill.
 pub async fn kill_tree(child: &mut Handle) -> Result<()> {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
@@ -455,8 +475,16 @@ pub async fn kill_tree(child: &mut Handle) -> Result<()> {
         let graceful =
             tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
         if graceful.is_ok() {
+            // The leader went down, but a grandchild that trapped SIGTERM may
+            // still be in the group — SIGKILL the group if it still exists.
+            if process_group_exists(pid) {
+                signal_process_group_kill(pid);
+            }
             return Ok(());
         }
+        // Still up after the grace period: SIGKILL the whole group, then
+        // fall through to the leader kill as a belt-and-braces.
+        signal_process_group_kill(pid);
     }
 
     child.kill().context("killing the agent process")?;
@@ -863,5 +891,41 @@ mod tests {
         )
         .await;
         assert!(status.is_ok(), "the agent survived being killed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sigterm_trapping_grandchild_dies_after_sigkill_group() {
+        let Some(_) = which("sh") else { return };
+        let dir = std::env::temp_dir().join(format!("telepager-killtrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ticks");
+        // leader: sh; grandchild traps SIGTERM and keeps ticking; leader
+        // itself stays up (wait) so the grace timeout path is exercised.
+        let script = format!(
+            "trap '' TERM; (i=0; while [ $i -lt 60 ]; do echo $i >> {}; i=$((i+1)); sleep 1; done) & wait",
+            marker.display()
+        );
+        let p = AgentPreset {
+            command: "sh".into(),
+            args: vec!["-c".into(), script],
+            ..AgentPreset::default()
+        };
+        let mut launched = launch(&p, &dir, "", None).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let before = std::fs::read_to_string(&marker).map(|t| t.lines().count()).unwrap_or(0);
+        assert!(before > 0, "the grandchild never started");
+
+        kill_tree(&mut launched.child).await.unwrap();
+
+        // The grandchild ticks during the 3s SIGTERM grace period, so only
+        // count after the kill has returned: it must not tick further.
+        let after_kill = std::fs::read_to_string(&marker).map(|t| t.lines().count()).unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let after = std::fs::read_to_string(&marker).map(|t| t.lines().count()).unwrap_or(0);
+        assert_eq!(after, after_kill, "a SIGTERM-trapping grandchild survived the group SIGKILL");
+        let _ = before;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

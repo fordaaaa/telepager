@@ -483,6 +483,9 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
                         crate::config::first_candidate()
                     );
                 }
+                if let Err(e) = tmux_verified(core, &session, &pane, origin).await {
+                    return e;
+                }
                 return match crate::tmux::capture(&pane, crate::tmux::CAPTURE_LINES).await {
                     Some(text) if text.trim().is_empty() => {
                         format!("{session}'s tmux pane is empty.")
@@ -518,6 +521,13 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
                 );
             }
             if let Some(pane) = crate::tmux::pane_of(core, &session).await {
+                // single-line only, checked before the pane is verified or typed at
+                if let Err(e) = crate::tmux::validate_send_text(&text) {
+                    return format!("Could not: {e}");
+                }
+                if let Err(e) = tmux_verified(core, &session, &pane, origin).await {
+                    return e;
+                }
                 return match crate::tmux::send_text(&pane, &text).await {
                     Ok(()) => format!("Typed it into {session}'s tmux pane."),
                     Err(e) => format!("Could not: {e}"),
@@ -543,6 +553,9 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
                         crate::config::first_candidate()
                     );
                 }
+                if let Err(e) = tmux_verified(core, &session, &pane, origin).await {
+                    return e;
+                }
                 return match crate::tmux::interrupt(&pane).await {
                     Ok(()) => format!(
                         "Sent Ctrl-C to {session}'s tmux pane. It's their own terminal, \
@@ -550,6 +563,15 @@ pub(crate) async fn run_tool(core: &Arc<Core>, call: &ToolCall, origin: Origin) 
                     ),
                     Err(e) => format!("Could not: {e}"),
                 };
+            }
+            // Killing a spawned agent tears down its process tree, so from
+            // Telegram it needs shell access — mirroring spawn. UI stays allowed.
+            if origin.is_telegram() && !matches!(core.config().await, Some(ref cfg) if cfg.permissions.shell) {
+                return format!(
+                    "shell access is off. killing from telegram needs it. turn it on in the \
+                     console's Settings, or set permissions.shell to true in {}.",
+                    crate::config::first_candidate()
+                );
             }
             match core.kill_agent(&session).await {
                 Ok(()) => format!("Killed {session}."),
@@ -611,6 +633,7 @@ pub async fn shell(
 
     // telegram is remote, so allowlisted dirs only. the console isn't gated —
     // opening it means being at the machine. same rule spawning uses.
+    // TODO: a bwrap/sandbox jail for /sh is out of scope for this round.
     if origin.is_telegram() && !crate::agents::dir_is_allowed(&path, &cfg.allowed_dirs) {
         if cfg.allowed_dirs.is_empty() {
             return format!(
@@ -669,6 +692,8 @@ pub(crate) fn looks_destructive(command: &str) -> bool {
 
 /// Things that damage a database, wherever they turn up in the line.
 const SQL_DAMAGE: &[&str] = &["drop table", "drop database", "truncate table", "delete from"];
+// TODO: curl/wget signing or verification is out of scope for this round;
+// the fetcher-pipeline check above is only a confirmation seatbelt.
 const FETCHERS: &[&str] = &["curl", "wget", "fetch"];
 const INTERPRETERS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "python", "python3", "perl", "ruby", "node"];
 /// Commands with no harmless use of their own.
@@ -837,6 +862,68 @@ fn command_name(words: &[String]) -> String {
         .next()
         .unwrap_or(first)
         .to_lowercase()
+}
+
+/// The cwd a tmux session was registered with, if any.
+async fn session_cwd(core: &Arc<Core>, session: &str) -> Option<std::path::PathBuf> {
+    core.sessions()
+        .await
+        .into_iter()
+        .find(|s| s["id"].as_str() == Some(session))
+        .and_then(|s| s["cwd"].as_str().map(std::path::PathBuf::from))
+}
+
+/// Gate a tmux-pane operation: for Telegram the pane's cwd must be in
+/// `allowed_dirs` (empty allowlist refuses), and the pane must still be
+/// running a known agent on a fresh `discover` — a pane that dropped to a
+/// shell is refused. Returns the verified pane, or the refusal to send back.
+async fn tmux_verified(
+    core: &Arc<Core>,
+    session: &str,
+    pane: &str,
+    origin: Origin,
+) -> Result<crate::tmux::Pane, String> {
+    if origin.is_telegram() {
+        let cfg = core.config().await;
+        let allowed = cfg.as_ref().map(|c| c.allowed_dirs.clone()).unwrap_or_default();
+        match session_cwd(core, session).await {
+            Some(cwd) if crate::agents::dir_is_allowed(&cwd, &allowed) => {}
+            _ => {
+                if allowed.is_empty() {
+                    return Err(format!(
+                        "running in a tmux pane from telegram is off until you allow some \
+                         directories. add them in the console, or set allowed_dirs in {}.",
+                        crate::config::first_candidate()
+                    ));
+                }
+                return Err("that tmux pane is not in allowed_dirs.".into());
+            }
+        }
+    }
+    let Some(cfg) = core.config().await else {
+        return Err("telepager isn't set up yet.".into());
+    };
+    match crate::tmux::verified_pane(pane, &cfg.agents).await {
+        Some(p) => Ok(p),
+        None => {
+            // The local console is trusted: if tmux itself cannot answer
+            // (no server in a test, for example) there is no shell pane to
+            // refuse, so let the operation fail in the usual way. A pane
+            // tmux *can* answer for is strictly checked above.
+            if !origin.is_telegram() && crate::tmux::pane_current_command(pane).await.is_none() {
+                Ok(crate::tmux::Pane {
+                    id: pane.to_string(),
+                    command: String::new(),
+                    cwd: session_cwd(core, session).await,
+                    location: pane.to_string(),
+                })
+            } else {
+                Err(format!(
+                    "refusing: pane {pane} is no longer running an agent (it may now be a shell)"
+                ))
+            }
+        }
+    }
 }
 
 fn str_arg(args: &Value, name: &str) -> String {
@@ -1051,6 +1138,107 @@ mod tests {
         let (c, id, server) = tmux_core_shell_off().await;
         let out = run_tool(&c, &call("kill_agent", json!({ "session": id })), Origin::Telegram).await;
         assert!(out.contains("shell access is off"), "{out}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_telegram_kill_of_a_spawned_agent_needs_shell_access() {
+        let (base, _seen, server) = crate::core::tests::fake_telegram(7).await;
+        let c = core();
+        let cfg = crate::config::Config {
+            permissions: crate::config::Permissions { shell: false, ..Default::default() },
+            ..crate::core::tests::config_for(&[7])
+        };
+        c.attach(cfg, crate::telegram::Telegram::with_base(&base)).await;
+        let out = run_tool(&c, &call("kill_agent", json!({ "session": "s99" })), Origin::Telegram).await;
+        assert!(out.contains("shell access is off"), "{out}");
+        // UI stays allowed: it reaches the real kill (and fails on unknown id)
+        let out_ui = run_tool(&c, &call("kill_agent", json!({ "session": "s99" })), Origin::Ui).await;
+        assert!(out_ui.contains("Could not"), "{out_ui}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_multi_line_send_to_a_tmux_pane_is_rejected() {
+        let (c, id, server) = tmux_core_shell_off().await;
+        // shell off would also refuse; use a shell-on core for the multiline check.
+        // Here shell-off takes precedence, so just check the validator via send path
+        // on a shell-on core below.
+        drop((c, id));
+        server.abort();
+        // shell-on tmux core
+        let (base, _seen, server2) = crate::core::tests::fake_telegram(7).await;
+        let c2 = core();
+        let cfg = crate::config::Config {
+            master: crate::config::MasterConfig { tmux_attach: true, ..Default::default() },
+            permissions: crate::config::Permissions { shell: true, ..Default::default() },
+            allowed_dirs: vec![std::env::temp_dir()],
+            ..crate::core::tests::config_for(&[7])
+        };
+        c2.attach(cfg, crate::telegram::Telegram::with_base(&base)).await;
+        let id2 = c2
+            .open_session(
+                crate::session::Kind::TmuxAttached { pane_id: "%1".into(), location: "work:0.1".into() },
+                "proj".into(),
+                Some(std::env::temp_dir()),
+                None,
+                None,
+            )
+            .await;
+        let out = run_tool(&c2, &call("send_to_agent", json!({ "session": id2, "text": "a\nb" })), Origin::Telegram).await;
+        assert!(out.contains("single-line"), "{out}");
+        server2.abort();
+    }
+
+    #[tokio::test]
+    async fn a_telegram_tmux_pane_outside_allowed_dirs_is_refused() {
+        let (base, _seen, server) = crate::core::tests::fake_telegram(7).await;
+        let c = core();
+        let cfg = crate::config::Config {
+            master: crate::config::MasterConfig { tmux_attach: true, ..Default::default() },
+            permissions: crate::config::Permissions { shell: true, ..Default::default() },
+            allowed_dirs: vec![std::env::temp_dir().join("telepager-allowed-only")],
+            ..crate::core::tests::config_for(&[7])
+        };
+        c.attach(cfg, crate::telegram::Telegram::with_base(&base)).await;
+        let id = c
+            .open_session(
+                crate::session::Kind::TmuxAttached { pane_id: "%1".into(), location: "work:0.1".into() },
+                "proj".into(),
+                Some(std::path::PathBuf::from("/etc")),
+                None,
+                None,
+            )
+            .await;
+        let out = run_tool(&c, &call("read_output", json!({ "session": id })), Origin::Telegram).await;
+        assert!(out.contains("allowed_dirs"), "{out}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_shell_pane_is_refused_by_the_discover_recheck() {
+        // No real tmux pane is running %1 as an agent, so the fresh discover
+        // finds nothing and the operation is refused rather than attempted.
+        let (base, _seen, server) = crate::core::tests::fake_telegram(7).await;
+        let c = core();
+        let cfg = crate::config::Config {
+            master: crate::config::MasterConfig { tmux_attach: true, ..Default::default() },
+            permissions: crate::config::Permissions { shell: true, ..Default::default() },
+            allowed_dirs: vec![std::env::temp_dir()],
+            ..crate::core::tests::config_for(&[7])
+        };
+        c.attach(cfg, crate::telegram::Telegram::with_base(&base)).await;
+        let id = c
+            .open_session(
+                crate::session::Kind::TmuxAttached { pane_id: "%1".into(), location: "work:0.1".into() },
+                "proj".into(),
+                Some(std::env::temp_dir()),
+                None,
+                None,
+            )
+            .await;
+        let out = run_tool(&c, &call("read_output", json!({ "session": id })), Origin::Telegram).await;
+        assert!(out.contains("no longer running an agent"), "{out}");
         server.abort();
     }
 

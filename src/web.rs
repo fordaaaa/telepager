@@ -104,6 +104,12 @@ pub async fn start(core: Arc<Core>, open_browser: bool, port_override: u16) -> R
     Ok(info)
 }
 
+/// What the standalone console prints: the full url on a tty, port-only
+/// otherwise (a captured log must not outlive the run with the key in it).
+fn display_url(info: &UiInfo, is_tty: bool) -> String {
+    crate::status::console_display(&info.url(), is_tty)
+}
+
 /// Run the console in the foreground, for `telepager setup` where no daemon
 /// should be left behind.
 pub fn run_standalone(config: Option<std::path::PathBuf>, port: u16, open: bool) -> Result<()> {
@@ -119,7 +125,7 @@ pub fn run_standalone(config: Option<std::path::PathBuf>, port: u16, open: bool)
 
         println!("telepager console:");
         println!();
-        println!("  {}", info.url());
+        println!("  {}", display_url(&info, std::io::IsTerminal::is_terminal(&std::io::stdout())));
         println!();
         println!("leave this running while you use it. ctrl-c when you're done.");
 
@@ -464,12 +470,42 @@ async fn save_master(core: &Arc<Core>, body: &Value) -> Result<Value> {
         requested_base_url
     };
 
+    let switched = provider != existing.provider;
+
+    // On a provider switch, api_key/api_key_env/command/args belong to the
+    // old provider — clear them unless explicitly re-supplied in the body.
+    let api_key = match optional("api_key") {
+        Some(k) => Some(k),
+        None if switched => None,
+        None => existing.api_key.clone(),
+    };
+    let api_key_env = match optional("api_key_env") {
+        Some(k) => Some(k),
+        None if switched => None,
+        None => existing.api_key_env.clone(),
+    };
+    // validate the effective api_key_env against the (new) provider's
+    // allowlist before anything is written
+    if let Some(name) = api_key_env.as_deref() {
+        provider.validate_api_key_env(name)?;
+    }
+    let command = match optional("command") {
+        Some(k) => Some(k),
+        None if switched => None,
+        None => existing.command.clone(),
+    };
+    let args = match body.get("args").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        None if switched => Vec::new(),
+        None => existing.args.clone(),
+    };
+
     let master = MasterConfig {
         provider,
         model,
         // an empty key field means "leave what's there", not "erase it"
-        api_key: optional("api_key").or(existing.api_key),
-        api_key_env: optional("api_key_env").or(existing.api_key_env),
+        api_key,
+        api_key_env,
         base_url,
         system: optional("system"),
         max_tokens: body
@@ -477,8 +513,8 @@ async fn save_master(core: &Arc<Core>, body: &Value) -> Result<Value> {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32)
             .unwrap_or(existing.max_tokens),
-        command: optional("command").or(existing.command),
-        args: existing.args,
+        command,
+        args,
         bundled_mcp: body
             .get("bundled_mcp")
             .and_then(|v| v.as_bool())
@@ -1149,5 +1185,97 @@ mod tests {
         let loaded = config::load(Some(&path)).unwrap();
         assert_eq!(loaded.master.base_url.as_deref(), Some("https://new.example"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn switching_provider_clears_key_env_command_and_args() {
+        let dir = std::env::temp_dir().join(format!("telepager-web-switch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        config::save(Some(&path), "1:fake", &[7]).unwrap();
+        config::save_master(
+            Some(&path),
+            &MasterConfig {
+                provider: Provider::Openai,
+                api_key: Some("sk-old".into()),
+                api_key_env: Some("OPENAI_API_KEY".into()),
+                command: Some("old-cmd".into()),
+                args: vec!["--old".into()],
+                ..MasterConfig::default()
+            },
+        )
+        .unwrap();
+        let c = Core::new(Some(path.clone()));
+        save_master(&c, &json!({ "provider": "anthropic", "model": "" })).await.unwrap();
+        let loaded = config::load(Some(&path)).unwrap();
+        assert_eq!(loaded.master.provider, Provider::Anthropic);
+        assert!(loaded.master.api_key.is_none(), "{:?}", loaded.master.api_key);
+        assert!(loaded.master.api_key_env.is_none(), "{:?}", loaded.master.api_key_env);
+        assert!(loaded.master.command.is_none(), "{:?}", loaded.master.command);
+        assert!(loaded.master.args.is_empty(), "{:?}", loaded.master.args);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_resupplied_key_survives_a_provider_switch() {
+        let dir = std::env::temp_dir().join(format!("telepager-web-switch2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        config::save(Some(&path), "1:fake", &[7]).unwrap();
+        config::save_master(
+            Some(&path),
+            &MasterConfig { provider: Provider::Openai, api_key: Some("sk-old".into()), ..MasterConfig::default() },
+        )
+        .unwrap();
+        let c = Core::new(Some(path.clone()));
+        save_master(
+            &c,
+            &json!({ "provider": "anthropic", "model": "", "api_key": "sk-new" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(config::load(Some(&path)).unwrap().master.api_key.as_deref(), Some("sk-new"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn web_save_master_refuses_telegram_bot_token_as_key_env() {
+        let (c, _path, dir) = core_with_openai_base_url("keyenv-refuse");
+        let err = save_master(
+            &c,
+            &json!({ "provider": "openai", "model": "", "api_key_env": "TELEGRAM_BOT_TOKEN" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("refusing to use TELEGRAM_BOT_TOKEN as api key"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn web_save_master_allows_openrouter_key_env_for_openai() {
+        let (c, path, dir) = core_with_openai_base_url("keyenv-allow");
+        save_master(
+            &c,
+            &json!({ "provider": "openai", "model": "", "api_key_env": "OPENROUTER_API_KEY" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            config::load(Some(&path)).unwrap().master.api_key_env.as_deref(),
+            Some("OPENROUTER_API_KEY")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standalone_display_is_port_only_when_not_a_tty() {
+        let info = UiInfo { port: 46375, key: "sekret".into() };
+        let line = display_url(&info, false);
+        assert!(line.contains("46375"), "{line}");
+        assert!(!line.contains("k="), "{line}");
+        assert!(!line.contains("sekret"), "{line}");
+        assert_eq!(display_url(&info, true), info.url());
     }
 }
